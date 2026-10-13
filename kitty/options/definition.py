@@ -69,7 +69,8 @@ opt(
     option_type='to_bool',
     ctype='bool',
     long_text="""
-kitty does not support BIDI (bidirectional text), however, for RTL scripts,
+With :opt:`bidi_rendering` disabled, kitty does not perform full bidirectional
+layout. However, for RTL scripts,
 words are automatically displayed in RTL. That is to say, in an RTL script, the
 words "HELLO WORLD" display in kitty as "WORLD HELLO", and if you try to select
 a substring of an RTL-shaped string, you will get the character that would be
@@ -83,6 +84,34 @@ command line program :link:`GNU FriBidi
 <https://github.com/fribidi/fribidi#executable>` to get BIDI support, because it
 will force kitty to always treat the text as LTR, which FriBidi expects for
 terminals.
+""",
+)
+
+opt(
+    'bidi_rendering',
+    'no',
+    option_type='to_bool',
+    ctype='bool',
+    long_text="""
+Enable experimental bidirectional rendering of Persian, Arabic and other RTL
+text mixed with English. Each physical terminal row is laid out independently,
+with a left-to-right base direction. This applies to shell output, scrollback
+and full-screen applications such as Neovim. :opt:`force_ltr` overrides this
+option.
+
+Arabic presentation forms emitted by applications are reshaped for display
+while preserving the application's cell widths. Use a font with Arabic support,
+such as Vazir Code Hack, either as :opt:`font_family` or through :opt:`symbol_map`.
+Neovim can display readable mixed text with its default settings, without
+enabling :code:`:set arabic`.
+
+This option improves readability. Cursor positions, selection, mouse reporting
+and application highlights still use logical grid coordinates and can disagree
+with the displayed letters. Terminal output does not identify application pane
+boundaries, so Neovim splits and floating windows can be reordered together.
+Wrapped paragraphs are processed one row at a time. Rows with image placeholders
+or scaled text use the existing renderer. Keep this option disabled when an
+application already supplies text in visual order.
 """,
 )
 

@@ -1013,7 +1013,13 @@ class Line:
 def test_shape(line: Line, path: Optional[str] = None, index: int = 0) -> List[Tuple[int, int, int, Tuple[int, ...]]]:
     pass
 
-def test_render_line(line: Line) -> None:
+def test_render_line(line: Line, visual: bool = False) -> Optional[List[Tuple[int, int, int, int]]]:
+    pass
+
+def test_bidi_layout(line: Line) -> Optional[Tuple[str, List[Tuple[int, int, int, int, int, int, int]]]]:
+    pass
+
+def test_render_screen(screen: Screen) -> List[List[Tuple[int, int, int, int]]]:
     pass
 
 def sprite_map_set_limits(w: int, h: int) -> None:

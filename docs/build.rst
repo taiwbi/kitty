@@ -84,6 +84,7 @@ Run-time dependencies:
 
 * ``python``
 * ``harfbuzz`` >= 2.2.0
+* ``fribidi`` >= 1.0.0
 * ``zlib``
 * ``libpng``
 * ``liblcms2``
@@ -115,6 +116,7 @@ Build-time dependencies:
 
   - ``liblcms2-dev``
   - ``libfontconfig-dev``
+  - ``libfribidi-dev``
   - ``libssl-dev``
   - ``libpython3-dev``
   - ``libxxhash-dev``

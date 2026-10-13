@@ -3940,9 +3940,9 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
 
 
 static void
-update_line_data(Line *line, unsigned int dest_y, uint8_t *data) {
+update_line_data(Line *line, unsigned int dest_y, uint8_t *data, FONTS_DATA_HANDLE fonts_data, DisableLigature disable_ligatures, int cursor_x) {
     size_t base = sizeof(GPUCell) * dest_y * line->xnum;
-    memcpy(data + base, line->gpu_cells, line->xnum * sizeof(GPUCell));
+    memcpy(data + base, render_visual_line(fonts_data, line, disable_ligatures, cursor_x), line->xnum * sizeof(GPUCell));
 }
 
 static void
@@ -4124,7 +4124,13 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                     if (linebuf->line->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, linebuf->line, &self->as_ansi_buf);
                     linebuf_mark_line_clean(linebuf, y);
                 }
-                update_line_data(linebuf->line, y, address);
+                update_line_data(
+                    linebuf->line,
+                    y,
+                    address,
+                    fonts_data,
+                    self->disable_ligatures,
+                    y == self->paused_rendering.cursor.y ? (int)self->paused_rendering.cursor.x : -1);
             }
         }
         return;
@@ -4166,7 +4172,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                 linebuf_mark_line_clean(self->linebuf, lnum);
             }
         }
-        update_line_data(linep, render_row, address);
+        update_line_data(linep, render_row, address, fonts_data, self->disable_ligatures, !is_history && self->cursor->y == lnum ? (int)self->cursor->x : -1);
     }
     if (is_overlay_active && self->overlay_line.ynum + self->scrolled_by < self->lines) {
         if (self->overlay_line.is_dirty) {

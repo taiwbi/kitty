@@ -113,6 +113,9 @@ class Parser:
     def bell_path(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['bell_path'] = config_or_absolute_path(val)
 
+    def bidi_rendering(self, val: str, ans: dict[str, typing.Any]) -> None:
+        ans['bidi_rendering'] = to_bool(val)
+
     def bold_font(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['bold_font'] = parse_font_spec(val)
 

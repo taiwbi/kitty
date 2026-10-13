@@ -122,6 +122,7 @@ typedef struct Options {
     int tab_title_max_length;
     DisableLigature disable_ligatures;
     bool force_ltr;
+    bool bidi_rendering;
     bool resize_in_steps;
     bool sync_to_monitor;
     bool close_on_child_death;

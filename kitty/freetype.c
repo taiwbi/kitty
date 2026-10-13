@@ -1203,6 +1203,13 @@ place_bitmap_in_canvas(
 
 static const ProcessedBitmap EMPTY_PBM = {.factor = 1};
 
+double
+glyph_run_advance(PyObject UNUSED *f, const hb_glyph_position_t *positions, unsigned int num_glyphs) {
+    double advance = 0;
+    for (unsigned int i = 0; i < num_glyphs; i++) advance += roundf((float)positions[i].x_advance / 64.f);
+    return advance;
+}
+
 bool
 render_glyphs_in_cells(
     PyObject *f,

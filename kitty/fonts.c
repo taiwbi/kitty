@@ -14,6 +14,8 @@
 #include "decorations.h"
 #include "glyph-cache.h"
 #include "shaped-run-cache.h"
+#include "bidi.h"
+#include "screen.h"
 #include "print-graphics.h"
 #include "simd-string.h"
 
@@ -24,6 +26,7 @@
 
 static PyObject *python_send_to_gpu_impl = NULL;
 extern PyTypeObject Line_Type;
+extern PyTypeObject Screen_Type;
 
 enum { NO_FONT = -3, MISSING_FONT = -2, BLANK_FONT = -1, BOX_FONT = 0 };
 typedef enum { LIGATURE_UNKNOWN, INFINITE_LIGATURE_START, INFINITE_LIGATURE_MIDDLE, INFINITE_LIGATURE_END } LigatureType;
@@ -68,6 +71,7 @@ typedef struct {
     PyObject *face;
     // Map glyphs to sprite map co-ords
     SPRITE_POSITION_MAP_HANDLE sprite_position_hash_table;
+    SPRITE_POSITION_MAP_HANDLE bidi_sprite_position_hash_table;
     hb_feature_t *ffs_hb_features;
     size_t num_ffs_hb_features;
     GLYPH_PROPERTIES_MAP_HANDLE glyph_properties_hash_table;
@@ -146,6 +150,9 @@ typedef struct {
     fallback_font_map_t fallback_font_map;
     scaled_font_map_t scaled_font_map;
     decorations_index_map_t decorations_index_map;
+    BidiCachedRow bidi_rows[BIDI_CACHED_ROWS];
+    size_t bidi_cache_bytes;
+    uint64_t bidi_cache_clock;
 } FontGroup;
 
 static inline unsigned int
@@ -254,6 +261,7 @@ font_group_is_unused(FontGroup *fg) {
 void
 free_maps(Font *font) {
     free_sprite_position_hash_table(&font->sprite_position_hash_table);
+    free_sprite_position_hash_table(&font->bidi_sprite_position_hash_table);
     free_glyph_properties_hash_table(&font->glyph_properties_hash_table);
     free_shaped_run_hash_table(&font->shaped_run_hash_table);
 }
@@ -270,6 +278,10 @@ del_font(Font *f) {
 
 static void
 del_font_group(FontGroup *fg) {
+    for (size_t i = 0; i < BIDI_CACHED_ROWS; i++) {
+        free(fg->bidi_rows[i].key);
+        free(fg->bidi_rows[i].cells);
+    }
     free(fg->canvas.buf);
     free(fg->canvas.alpha_mask);
     fg->canvas = (Canvas){0};
@@ -588,6 +600,11 @@ static bool
 init_hash_tables(Font *f) {
     f->sprite_position_hash_table = create_sprite_position_hash_table();
     if (!f->sprite_position_hash_table) {
+        PyErr_NoMemory();
+        return false;
+    }
+    f->bidi_sprite_position_hash_table = create_sprite_position_hash_table();
+    if (!f->bidi_sprite_position_hash_table) {
         PyErr_NoMemory();
         return false;
     }
@@ -2410,6 +2427,8 @@ render_line(FONTS_DATA_HANDLE fg_, Line *line, index_type lnum, Cursor *cursor, 
 #undef RENDER
 }
 
+#include "bidi-render.h"
+
 StringCanvas
 render_simple_text(FONTS_DATA_HANDLE fg_, const char *text) {
     FontGroup *fg = (FontGroup *)fg_;
@@ -2673,16 +2692,96 @@ set_send_sprite_to_gpu(PyObject UNUSED *self, PyObject *func) {
 }
 
 static PyObject *
+gpu_cells_as_python(const GPUCell *cells, index_type count) {
+    PyObject *ans = PyList_New(count);
+    if (!ans) return NULL;
+    for (index_type x = 0; x < count; x++) {
+        PyObject *cell = Py_BuildValue("IIII", cells[x].sprite_idx, cells[x].fg, cells[x].bg, cells[x].attrs.val);
+        if (!cell) {
+            Py_DECREF(ans);
+            return NULL;
+        }
+        PyList_SET_ITEM(ans, x, cell);
+    }
+    return ans;
+}
+
+static PyObject *
 test_render_line(PyObject UNUSED *self, PyObject *args) {
     PyObject *line;
-    if (!PyArg_ParseTuple(args, "O!", &Line_Type, &line)) return NULL;
+    int visual = 0;
+    if (!PyArg_ParseTuple(args, "O!|p", &Line_Type, &line, &visual)) return NULL;
     if (!num_font_groups) {
         PyErr_SetString(PyExc_RuntimeError, "must create font group first");
         return NULL;
     }
     RAII_ListOfChars(lc);
     render_line((FONTS_DATA_HANDLE)font_groups, (Line *)line, 0, NULL, DISABLE_LIGATURES_NEVER, &lc);
+    if (visual) {
+        Line *l = (Line *)line;
+        const GPUCell *cells = render_visual_line((FONTS_DATA_HANDLE)font_groups, l, DISABLE_LIGATURES_NEVER, -1);
+        return gpu_cells_as_python(cells, l->xnum);
+    }
     Py_RETURN_NONE;
+}
+
+static PyObject *
+test_render_screen(PyObject UNUSED *self, PyObject *args) {
+    Screen *screen;
+    if (!PyArg_ParseTuple(args, "O!", &Screen_Type, &screen)) return NULL;
+    if (!num_font_groups) {
+        PyErr_SetString(PyExc_RuntimeError, "must create font group first");
+        return NULL;
+    }
+    const unsigned rows = render_lines_for_screen(screen);
+    GPUCell *data = calloc((size_t)rows * screen->columns, sizeof(GPUCell));
+    PyObject *ans = PyList_New(rows);
+    if (!data || !ans) {
+        free(data);
+        Py_XDECREF(ans);
+        return PyErr_NoMemory();
+    }
+    screen_update_cell_data(screen, data, (FONTS_DATA_HANDLE)font_groups, true);
+    for (unsigned y = 0; y < rows; y++) {
+        PyObject *row = gpu_cells_as_python(data + y * screen->columns, screen->columns);
+        if (!row) {
+            free(data);
+            Py_DECREF(ans);
+            return NULL;
+        }
+        PyList_SET_ITEM(ans, y, row);
+    }
+    free(data);
+    return ans;
+}
+
+static PyObject *
+test_bidi_layout(PyObject UNUSED *self, PyObject *args) {
+    Line *line;
+    if (!PyArg_ParseTuple(args, "O!", &Line_Type, &line)) return NULL;
+    BidiLayout layout;
+    if (!bidi_layout(line, &layout)) Py_RETURN_NONE;
+    PyObject *text = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, layout.text, layout.count);
+    PyObject *cells = PyList_New(layout.num_cells);
+    if (!text || !cells) {
+        Py_XDECREF(text);
+        Py_XDECREF(cells);
+        free_bidi_layout(&layout);
+        return NULL;
+    }
+    for (unsigned i = 0; i < layout.num_cells; i++) {
+        const BidiCell *c = layout.cells + i;
+        PyObject *cell = Py_BuildValue("IIIIIII", c->x, c->width, c->visual_x, c->first, c->count, c->level, c->script);
+        if (!cell) {
+            Py_DECREF(text);
+            Py_DECREF(cells);
+            free_bidi_layout(&layout);
+            return NULL;
+        }
+        PyList_SET_ITEM(cells, i, cell);
+    }
+    free_bidi_layout(&layout);
+    return Py_BuildValue("NN", text, cells);
 }
 
 static uint32_t
@@ -2993,6 +3092,8 @@ static PyMethodDef module_methods[] = {
     METHODB(test_shape, METH_VARARGS),
     METHODB(current_fonts, METH_VARARGS),
     METHODB(test_render_line, METH_VARARGS),
+    METHODB(test_render_screen, METH_VARARGS),
+    METHODB(test_bidi_layout, METH_VARARGS),
     METHODB(get_fallback_font, METH_VARARGS),
     {"specialize_font_descriptor", (PyCFunction)pyspecialize_font_descriptor, METH_VARARGS, ""},
     {"render_box_char", (PyCFunction)pyrender_box_char, METH_VARARGS, ""},

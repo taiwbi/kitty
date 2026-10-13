@@ -762,6 +762,7 @@ def kitty_env(args: Options) -> Env:
 
     xxhash = xxhash_flags()
     at_least_version('harfbuzz', 1, 5)
+    at_least_version('fribidi', 1, 0)
     cflags.extend(pkg_config('libpng', '--cflags-only-I'))
     cflags.extend(pkg_config('lcms2', '--cflags-only-I'))
     cflags.extend(xxhash[0])
@@ -800,6 +801,8 @@ def kitty_env(args: Options) -> Env:
         platform_libs.extend(pkg_config('cairo-fc', '--libs'))
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
     platform_libs.extend(pkg_config('harfbuzz', '--libs'))
+    cflags.extend(pkg_config('fribidi', '--cflags-only-I'))
+    platform_libs.extend(pkg_config('fribidi', '--libs'))
     pylib = get_python_flags(args, cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
     libpng = pkg_config('libpng', '--libs')

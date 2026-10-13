@@ -43,6 +43,7 @@ unsigned int glyph_id_for_codepoint(const PyObject *, char_type);
 int get_glyph_width(PyObject *, glyph_index);
 bool is_glyph_empty(PyObject *, glyph_index);
 hb_font_t *harfbuzz_font_for_face(PyObject *);
+double glyph_run_advance(PyObject *, const hb_glyph_position_t *, unsigned int num_glyphs);
 bool set_size_for_face(PyObject *, unsigned int, bool, FONTS_DATA_HANDLE);
 FontCellMetrics cell_metrics(PyObject *);
 bool render_glyphs_in_cells(
@@ -73,6 +74,7 @@ void sprite_tracker_current_layout(FONTS_DATA_HANDLE data, unsigned int *x, unsi
 void render_alpha_mask(
     const uint8_t *alpha_mask, pixel *dest, const Region *src_rect, const Region *dest_rect, size_t src_stride, size_t dest_stride, pixel color_rgb);
 void render_line(FONTS_DATA_HANDLE, Line *line, index_type lnum, Cursor *cursor, DisableLigature, ListOfChars *);
+const GPUCell *render_visual_line(FONTS_DATA_HANDLE, Line *, DisableLigature, int cursor_x);
 void sprite_tracker_set_limits(size_t max_texture_size, size_t max_array_len);
 typedef void (*free_extra_data_func)(void *);
 StringCanvas render_simple_text_impl(PyObject *s, const char *text, unsigned int baseline);

@@ -1251,6 +1251,15 @@ do_render(
     return true;
 }
 
+double
+glyph_run_advance(PyObject *f, const hb_glyph_position_t *positions, unsigned int num_glyphs) {
+    const CTFace *face = (CTFace *)f;
+    const CGFloat scale = CTFontGetSize(face->ct_font) / face->units_per_em;
+    CGFloat advance = 0;
+    for (unsigned int i = 0; i < num_glyphs; i++) advance += positions[i].x_advance * scale;
+    return ceil(advance);
+}
+
 bool
 render_glyphs_in_cells(
     PyObject *s,
