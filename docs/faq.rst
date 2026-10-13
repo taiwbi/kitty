@@ -28,12 +28,11 @@ As of version 0.40 kitty has innovated a :doc:`new protocol
 how many cells a character is rendered in thereby solving the issue of
 character width once and for all.
 
-Similarly, some monospaced font families are buggy and have bold or italic
-faces that have characters wider than the width of the normal face, these
-will also result in clipping. Such issues should be reported to the font
-developer. Monospaced font families must have all their characters rendered
-within a fixed width across all faces of the font, otherwise they aren't really
-monospaced.
+Similarly, some monospaced font families have bold or italic faces with
+characters wider than the normal face. Italic and bold-italic glyphs can extend
+slightly into neighboring cells so their edges are not cut off. This can cover
+part of the neighboring text. Monospaced font families should keep all faces
+metric-compatible; report faces with excessive overhang to the font developer.
 
 
 I get errors about the terminal being unknown or opening the terminal failing or functional keys like arrow keys don't work?

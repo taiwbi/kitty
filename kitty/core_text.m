@@ -1177,11 +1177,12 @@ do_render(
     unsigned int cell_height,
     unsigned int num_cells,
     unsigned int baseline,
+    unsigned int horizontal_padding,
     bool *was_colored,
     bool allow_resize,
     FONTS_DATA_HANDLE fg,
     GlyphRenderInfo *ri) {
-    unsigned int canvas_width = cell_width * num_cells;
+    unsigned int canvas_width = cell_width * num_cells + 2 * horizontal_padding;
     ensure_render_space(canvas_width, cell_height, num_glyphs);
     CGRect br = CTFontGetBoundingRectsForGlyphs(ct_font, kCTFontOrientationHorizontal, buffers.glyphs, buffers.boxes, num_glyphs);
     const bool debug_rendering = false;
@@ -1207,6 +1208,7 @@ do_render(
                 cell_height,
                 num_cells,
                 baseline,
+                horizontal_padding,
                 was_colored,
                 false,
                 fg,
@@ -1215,7 +1217,7 @@ do_render(
             return ret;
         }
     }
-    CGFloat x = 0, y = 0;
+    CGFloat x = horizontal_padding, y = 0;
     CGFloat scale = CTFontGetSize(ct_font) / units_per_em;
     for (unsigned i = 0; i < num_glyphs; i++) {
         buffers.positions[i].x = x + hb_positions[i].x_offset * scale;
@@ -1262,6 +1264,7 @@ render_glyphs_in_cells(
     unsigned int cell_height,
     unsigned int num_cells,
     unsigned int baseline,
+    unsigned int horizontal_padding,
     bool *was_colored,
     FONTS_DATA_HANDLE fg,
     GlyphRenderInfo *ri) {
@@ -1281,6 +1284,7 @@ render_glyphs_in_cells(
         cell_height,
         num_cells,
         baseline,
+        horizontal_padding,
         was_colored,
         true,
         fg,

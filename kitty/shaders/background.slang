@@ -33,6 +33,7 @@ public struct CellRenderData {
     public uint default_fg, url_style, inverted, main_cursor_is_special, extra_cursor_fg, extra_cursor_bg;
 
     public uint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
+    public uint sprite_width, sprite_padding;
     public uint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
     public float cursor_opacity, inactive_text_alpha, fg_override_threshold, row_offset, dim_opacity, blink_opacity;
 

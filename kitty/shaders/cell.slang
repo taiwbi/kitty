@@ -48,6 +48,8 @@ struct VertexOutput {
     float4 cursor_color_premult;
     float3 decoration_fg;
     float colored_sprite;
+    nointerpolation float2 overdraw_bounds;
+    nointerpolation uint italic_cell;
 };
 
 // Foreground utility functions {{{
@@ -62,14 +64,26 @@ to_sprite_coords(uint idx) {
 }
 
 float3
-to_sprite_pos(uint2 pos, uint idx) {
+to_sprite_pos(uint2 pos, uint idx, bool include_padding) {
     uint3 c = to_sprite_coords(idx);
-    float2 s_xpos = float2(float(c.x), float(c.x) + 1.0f) * (1.0f / float(crd.sprites_xnum));
+    float slot_left = float(c.x * crd.sprite_width);
+    float sprite_left = slot_left + (include_padding ? 0.0f : float(crd.sprite_padding));
+    float sprite_pixel_width = include_padding ? float(crd.sprite_width) : float(crd.cell_width);
+    float texture_width = float(crd.sprites_xnum * crd.sprite_width);
+    float2 s_xpos = float2(sprite_left, sprite_left + sprite_pixel_width) * (1.0f / texture_width);
     float2 s_ypos = float2(float(c.y), float(c.y) + 1.0f) * (1.0f / float(crd.sprites_ynum));
     uint texture_height_px = (crd.cell_height + 1u) * crd.sprites_ynum;
     float row_height = 1.0f / float(texture_height_px);
     s_ypos[1] -= row_height; // skip the decorations_exclude row
     return float3(s_xpos[pos.x], s_ypos[pos.y], float(c.z));
+}
+
+float2
+to_overdraw_bounds(uint idx) {
+    uint3 c = to_sprite_coords(idx);
+    float texture_width = float(crd.sprites_xnum * crd.sprite_width);
+    float slot_left = float(c.x * crd.sprite_width);
+    return float2(slot_left + float(crd.sprite_padding), slot_left + float(crd.sprite_padding + crd.cell_width)) / texture_width;
 }
 
 uint
@@ -148,6 +162,7 @@ vertex_main(
     [[vk::location(2)]] uint is_selected,
     uint vertex_id: SV_VertexID,
     uint instance_id: SV_InstanceID,
+    uniform bool italic_overdraw_only,
     uniform uint draw_bg_bitfield, ) {
     VertexOutput vo;
 
@@ -158,11 +173,18 @@ vertex_main(
     uint fg_as_uint = bo.fg_as_uint;
     uint text_attrs = bo.text_attrs;
     CellData cell_data = bo.cell_data;
+    uint is_italic = (text_attrs >> 4u) & BIT_MASK;
+    vo.italic_cell = is_italic;
+    vo.overdraw_bounds = to_overdraw_bounds(sprite_idx[0] & SPRITE_INDEX_MASK);
+    if (ONLY_FOREGROUND && italic_overdraw_only && is_italic != 0u) {
+        float expand = float(crd.sprite_padding) / float(crd.cell_width) * (2.0f / float(crd.columns));
+        vo.position.x += cell_data.pos.x == 0u ? -expand : expand;
+    }
 
     // Foreground {{{
     if (!ONLY_BACKGROUND) { // background does not depend on foreground
         // The character sprite being rendered
-        vo.sprite_pos = to_sprite_pos(cell_data.pos, sprite_idx[0] & SPRITE_INDEX_MASK);
+        vo.sprite_pos = to_sprite_pos(cell_data.pos, sprite_idx[0] & SPRITE_INDEX_MASK, is_italic != 0u && italic_overdraw_only);
         vo.colored_sprite = float((sprite_idx[0] & SPRITE_COLORED_MASK) >> SPRITE_COLORED_SHIFT);
 
         float has_dim = float((text_attrs >> DIM_SHIFT) & BIT_MASK), has_blink = float((text_attrs >> BLINK_SHIFT) & BIT_MASK);
@@ -180,8 +202,8 @@ vertex_main(
         vo.decoration_fg = if_one_then(float(is_selected & BIT_MASK), selection_color, vo.decoration_fg);
         // Underline and strike through (rendered via sprites)
         uint2 decs = get_decorations_indices(sprite_idx, uint(in_url), text_attrs);
-        vo.strike_pos = to_sprite_pos(cell_data.pos, decs[0]);
-        vo.underline_pos = to_sprite_pos(cell_data.pos, decs[1]);
+        vo.strike_pos = to_sprite_pos(cell_data.pos, decs[0], false);
+        vo.underline_pos = to_sprite_pos(cell_data.pos, decs[1], false);
 
         // Cursor
         vo.cursor_color_premult = float4(cell_data.cursor.bg * crd.cursor_opacity, crd.cursor_opacity);
@@ -189,7 +211,7 @@ vertex_main(
         foreground = if_one_then(cell_data.has_block_cursor, final_cursor_text_color, foreground);
         vo.decoration_fg = if_one_then(cell_data.has_block_cursor, final_cursor_text_color, vo.decoration_fg);
         uint cursor_sprite = cell_data.cursor_fg_sprite_idx * uint(cell_data.has_cursor);
-        vo.cursor_pos = to_sprite_pos(cell_data.pos, cursor_sprite);
+        vo.cursor_pos = to_sprite_pos(cell_data.pos, cursor_sprite, false);
         uint skip_text = uint((sprite_idx[0] & SPRITE_INDEX_MASK) == 0u && decs[0] == 0u && decs[1] == 0u && cursor_sprite == 0u);
         vo.underline_exclusion_pos = to_underline_exclusion_pos(sprite_idx) | (skip_text * SKIP_TEXT_FLAG);
     }
@@ -306,9 +328,12 @@ adjust_foreground_contrast_with_background(float4 text_fg, float3 bg, float text
 
 [shader("fragment")]
 float4
-fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_gamma_adjustment, )
+fragment_main(VertexOutput vo, uniform bool italic_overdraw_only, uniform float text_contrast, uniform float text_gamma_adjustment, )
     : SV_Target {
     float4 ans_premul = 0;
+    if (italic_overdraw_only) {
+        if (vo.italic_cell == 0u || (vo.sprite_pos.x >= vo.overdraw_bounds.x && vo.sprite_pos.x < vo.overdraw_bounds.y)) discard;
+    }
     if (!ONLY_FOREGROUND) ans_premul = vo.effective_background_premul;
 
     // The sprite samples below use SampleLevel() as this branch is not uniform

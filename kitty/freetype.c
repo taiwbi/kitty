@@ -1216,31 +1216,32 @@ render_glyphs_in_cells(
     unsigned int cell_height,
     unsigned int num_cells,
     unsigned int baseline,
+    unsigned int horizontal_padding,
     bool *was_colored,
     FONTS_DATA_HANDLE fg,
     GlyphRenderInfo *ri) {
     Face *self = (Face *)f;
     bool is_emoji = *was_colored;
     *was_colored = is_emoji && self->has_color;
-    float x = 0.f, y = 0.f;
+    float x = (float)horizontal_padding, y = 0.f;
     ProcessedBitmap bm;
-    unsigned int canvas_width = cell_width * num_cells;
+    unsigned int canvas_width = cell_width * num_cells + 2 * horizontal_padding;
     GlyphColorType colored;
     for (unsigned int i = 0; i < num_glyphs; i++) {
         bm = EMPTY_PBM;
         // dont load the space glyph since loading it fails for some fonts/sizes and it is anyway to be rendered as a blank
         if (info[i].codepoint != self->space_glyph_id) {
             if (*was_colored && (colored = glyph_color_type(self, info[i].codepoint)) != NOT_COLORED) {
-                if (!render_color_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells, baseline)) {
+                if (!render_color_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells + (horizontal_padding ? 1 : 0), baseline)) {
                     if (PyErr_Occurred()) PyErr_Print();
-                    if (!render_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells, bold, italic, true, fg)) {
+                    if (!render_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells + (horizontal_padding ? 1 : 0), bold, italic, true, fg)) {
                         free_processed_bitmap(&bm);
                         return false;
                     }
                     *was_colored = false;
                 }
             } else {
-                if (!render_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells, bold, italic, true, fg)) {
+                if (!render_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells + (horizontal_padding ? 1 : 0), bold, italic, true, fg)) {
                     free_processed_bitmap(&bm);
                     return false;
                 }

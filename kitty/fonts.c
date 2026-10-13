@@ -142,10 +142,16 @@ typedef struct {
     Font *fonts;
     Canvas canvas;
     GPUSpriteTracker sprite_tracker;
+    unsigned int sprite_padding;
     fallback_font_map_t fallback_font_map;
     scaled_font_map_t scaled_font_map;
     decorations_index_map_t decorations_index_map;
 } FontGroup;
+
+static inline unsigned int
+sprite_cell_width(const FontGroup *fg) {
+    return fg->fcm.cell_width + 2 * fg->sprite_padding;
+}
 
 static FontGroup *font_groups = NULL;
 static size_t font_groups_capacity = 0;
@@ -173,6 +179,16 @@ python_send_to_gpu(FontGroup *fg, sprite_index idx, pixel *buf) {
     unsigned int x, y, z;
     sprite_index_to_pos(idx, fg->sprite_tracker.xnum, fg->sprite_tracker.ynum, &x, &y, &z);
     const size_t sprite_size = (size_t)fg->fcm.cell_width * fg->fcm.cell_height;
+    PyObject *ret = PyObject_CallFunction(python_send_to_gpu_impl, "IIIy#", x, y, z, buf, sprite_size * sizeof(buf[0]));
+    if (ret == NULL) PyErr_Print();
+    else Py_DECREF(ret);
+}
+
+static void
+python_send_padded_to_gpu(FontGroup *fg, sprite_index idx, pixel *buf) {
+    unsigned int x, y, z;
+    sprite_index_to_pos(idx, fg->sprite_tracker.xnum, fg->sprite_tracker.ynum, &x, &y, &z);
+    size_t sprite_size = (size_t)sprite_cell_width(fg) * fg->fcm.cell_height;
     PyObject *ret = PyObject_CallFunction(python_send_to_gpu_impl, "IIIy#", x, y, z, buf, sprite_size * sizeof(buf[0]));
     if (ret == NULL) PyErr_Print();
     else Py_DECREF(ret);
@@ -330,7 +346,7 @@ sprite_tracker_set_limits(size_t max_texture_size_, size_t max_array_len_) {
         FontGroup *fg = font_groups + i;
         GPUSpriteTracker *st = &fg->sprite_tracker;
         if (!st->x && !st->y && !st->z && st->ynum <= 1 && fg->fcm.cell_width && fg->fcm.cell_height)
-            sprite_tracker_set_layout(st, fg->fcm.cell_width, fg->fcm.cell_height);
+            sprite_tracker_set_layout(st, sprite_cell_width(fg), fg->fcm.cell_height);
     }
 }
 
@@ -431,6 +447,30 @@ calculate_underline_exclusion_zones(pixel *buf, const FontGroup *fg, DecorationG
     if (0) dump_sprite(ans, fg->fcm.cell_width, 1);
 }
 
+static void
+calculate_padded_underline_exclusion_zones(pixel *buf, const FontGroup *fg, DecorationGeometry dg, FontCellMetrics scaled_metrics) {
+    const unsigned width = sprite_cell_width(fg), height = fg->fcm.cell_height;
+    pixel *exclusion = buf + height * width;
+    unsigned thickness = scaled_metrics.underline_thickness;
+    switch (OPT(underline_exclusion.unit)) {
+        case 2: thickness = (unsigned)round(OPT(underline_exclusion).thickness * (fg->logical_dpi_x / 72.0)); break;
+        case 1: thickness = (unsigned)OPT(underline_exclusion).thickness; break;
+        default: thickness = (unsigned)(OPT(underline_exclusion).thickness * thickness); break;
+    }
+    thickness = MAX(1u, thickness);
+    const unsigned bottom = MIN(dg.top + dg.height, height);
+    for (unsigned x = 0; x < width; x++) {
+        for (unsigned y = dg.top; y < bottom; y++) {
+            if ((buf[y * width + x] & 0xff) > 0) {
+                unsigned start = x > thickness ? x - thickness : 0;
+                unsigned end = MIN(x + thickness, width);
+                for (unsigned dx = start; dx < end; dx++) exclusion[dx] = 0xffffffff;
+                break;
+            }
+        }
+    }
+}
+
 static sprite_index
 current_send_sprite_to_gpu(FontGroup *fg, pixel *buf, DecorationMetadata dec, FontCellMetrics scaled_metrics) {
     sprite_index ans = current_sprite_index(&fg->sprite_tracker);
@@ -446,6 +486,20 @@ current_send_sprite_to_gpu(FontGroup *fg, pixel *buf, DecorationMetadata dec, Fo
         printf("Sprite: %u dec_idx: %u\n", ans, dec.start_idx);
         display_glyph(buf, fg->fcm.cell_width, fg->fcm.cell_height);
         printf("\n");
+    }
+    return ans;
+}
+
+static sprite_index
+current_send_padded_sprite_to_gpu(FontGroup *fg, pixel *buf, DecorationMetadata dec, FontCellMetrics scaled_metrics) {
+    sprite_index ans = current_sprite_index(&fg->sprite_tracker);
+    if (!do_increment(fg)) return 0;
+    if (python_send_to_gpu_impl) {
+        python_send_padded_to_gpu(fg, ans, buf);
+    } else {
+        if (dec.underline_region.height && OPT(underline_exclusion).thickness > 0)
+            calculate_padded_underline_exclusion_zones(buf, fg, dec.underline_region, scaled_metrics);
+        send_padded_sprite_to_gpu((FONTS_DATA_HANDLE)fg, ans, buf, dec.start_idx);
     }
     return ans;
 }
@@ -1040,6 +1094,17 @@ extract_cell_from_canvas(FontGroup *fg, unsigned int i, unsigned int num_cells) 
     return ans;
 }
 
+static pixel *
+extract_padded_cell_from_canvas(FontGroup *fg, unsigned int i, unsigned int canvas_width) {
+    const unsigned int cw = fg->fcm.cell_width, ch = fg->fcm.cell_height;
+    const unsigned int sw = sprite_cell_width(fg);
+    pixel *ans = calloc((size_t)sw * (ch + 1), sizeof(pixel));
+    if (!ans) fatal("Out of memory allocating padded glyph sprite");
+    for (unsigned y = 0; y < ch; y++)
+        memcpy(ans + y * sw, fg->canvas.buf + y * canvas_width + i * cw, sizeof(pixel) * sw);
+    return ans;
+}
+
 static void
 calculate_regions_for_line(RunFont rf, unsigned cell_height, Region *src, Region *dest) {
     unsigned src_height = src->bottom;
@@ -1369,7 +1434,6 @@ render_group(
 
     ensure_canvas_can_fit(fg, MAX(num_cells, num_scaled_cells) + 1, rf.scale);
     if (rendering_in_smaller_area) ensure_canvas_can_fit(fg, 2 * num_cells + 1, (unsigned)ceil(scale)); // scratch space
-    pixel *scratch = fg->canvas.buf + canvas_width * unscaled_metrics.cell_height;
     text_in_cell(cpu_cells, tc, global_glyph_render_scratch.lc);
     bool is_only_filled_boxes = false;
     if (global_glyph_render_scratch.lc->chars[0] == 0x2588) {
@@ -1378,6 +1442,9 @@ render_group(
         for (unsigned i = 1; i < num_glyphs && is_only_filled_boxes; i++)
             if (global_glyph_render_scratch.glyphs[i] != box_glyph_id) is_only_filled_boxes = false;
     }
+    const unsigned int horizontal_padding = font->italic && !is_only_filled_boxes && scale == 1.f && !rendering_in_smaller_area ? fg->sprite_padding : 0;
+    const unsigned int render_canvas_width = canvas_width + 2 * horizontal_padding;
+    pixel *scratch = fg->canvas.buf + render_canvas_width * unscaled_metrics.cell_height;
     bool was_colored = !is_only_filled_boxes && has_emoji_presentation(cpu_cells, global_glyph_render_scratch.lc);
     GlyphRenderInfo ri = {0};
     pixel *canvas = rendering_in_smaller_area && canvas_width != scaled_canvas_width ? scratch : fg->canvas.buf;
@@ -1399,6 +1466,7 @@ render_group(
             scaled_metrics.cell_height,
             num_scaled_cells,
             scaled_metrics.baseline,
+            horizontal_padding,
             &was_colored,
             (FONTS_DATA_HANDLE)fg,
             &ri);
@@ -1419,7 +1487,8 @@ render_group(
         } else memcpy(fg->canvas.buf, canvas, sizeof(pixel) * canvas_width * scaled_metrics.cell_height);
         canvas = fg->canvas.buf;
     }
-    apply_horizontal_alignment(canvas, rf, center_glyph, ri, canvas_width, scaled_metrics.cell_height, num_scaled_cells, num_glyphs, was_colored);
+    if (!horizontal_padding)
+        apply_horizontal_alignment(canvas, rf, center_glyph, ri, canvas_width, scaled_metrics.cell_height, num_scaled_cells, num_glyphs, was_colored);
     if (PyErr_Occurred()) PyErr_Print();
     // display_glyph(canvas, canvas_width, scaled_metrics.cell_height); printf("\n");
 
@@ -1432,8 +1501,14 @@ render_group(
             if (!sp[i]->rendered) {
                 bool is_repeat_sprite = is_infinite_ligature && i > 0 && sp[i]->idx == sp[i - 1]->idx;
                 if (!is_repeat_sprite) {
-                    pixel *b = num_cells == 1 ? canvas : extract_cell_from_canvas(fg, i, num_cells);
-                    sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics);
+                    if (horizontal_padding) {
+                        pixel *b = extract_padded_cell_from_canvas(fg, i, render_canvas_width);
+                        sp[i]->idx = current_send_padded_sprite_to_gpu(fg, b, dm, scaled_metrics);
+                        free(b);
+                    } else {
+                        pixel *b = num_cells == 1 ? canvas : extract_cell_from_canvas(fg, i, num_cells);
+                        sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics);
+                    }
                     if (!sp[i]->idx) failed;
                 } else sp[i]->idx = sp[i - 1]->idx;
                 sp[i]->rendered = true;
@@ -2493,8 +2568,9 @@ initialize_font_group(FontGroup *fg) {
     }
 #undef I
     calc_cell_metrics(fg, fg->fonts[fg->medium_font_idx].face);
+    fg->sprite_padding = MAX(1u, fg->fcm.cell_width / 2);
     ensure_canvas_can_fit(fg, 8, 1);
-    sprite_tracker_set_layout(&fg->sprite_tracker, fg->fcm.cell_width, fg->fcm.cell_height);
+    sprite_tracker_set_layout(&fg->sprite_tracker, sprite_cell_width(fg), fg->fcm.cell_height);
     // rescale the symbol_map faces for the desired cell height, this is how fallback fonts are sized as well
     for (size_t i = 0; i < descriptor_indices.num_symbol_fonts; i++) {
         Font *font = fg->fonts + i + fg->first_symbol_font_idx;

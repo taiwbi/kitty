@@ -323,7 +323,8 @@ realloc_sprite_texture(FONTS_DATA_HANDLE fg) {
     sprite_tracker_current_layout(fg, &xnum, &ynum, &z);
     znum = z + 1;
     SpriteMap *sprite_map = (SpriteMap *)fg->sprite_map;
-    width = xnum * fg->fcm.cell_width;
+    const unsigned int sprite_width = fg->fcm.cell_width + 2 * MAX(1u, fg->fcm.cell_width / 2);
+    width = xnum * sprite_width;
     height = ynum * (fg->fcm.cell_height + 1);
     const GLenum texture_type = GL_TEXTURE_2D_ARRAY;
     GLuint tex = setup_new_sprites_texture(texture_type);
@@ -351,8 +352,8 @@ ensure_sprite_map(FONTS_DATA_HANDLE fg) {
     glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->texture_id);
 }
 
-void
-send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_index decoration_idx) {
+static void
+send_sprite_to_gpu_internal(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_index decoration_idx, bool is_padded) {
     SpriteMap *sprite_map = (SpriteMap *)fg->sprite_map;
     unsigned int xnum, ynum, znum, x, y, z;
 #define dm (sprite_map->decorations_map)
@@ -375,9 +376,31 @@ send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_in
     glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->texture_id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     sprite_index_to_pos(idx, xnum, ynum, &x, &y, &z);
-    x *= fg->fcm.cell_width;
+    const unsigned int padding = MAX(1u, fg->fcm.cell_width / 2);
+    const unsigned int sprite_width = fg->fcm.cell_width + 2 * padding;
+    x *= sprite_width;
     y *= (fg->fcm.cell_height + 1);
-    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, fg->fcm.cell_width, fg->fcm.cell_height + 1, 1, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, buf);
+    if (is_padded) {
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, sprite_width, fg->fcm.cell_height + 1, 1, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, buf);
+    } else {
+        pixel *padded = calloc((size_t)sprite_width * (fg->fcm.cell_height + 1), sizeof(pixel));
+        if (!padded) fatal("Out of memory allocating padded glyph sprite");
+        for (unsigned row = 0; row < fg->fcm.cell_height; row++)
+            memcpy(padded + row * sprite_width + padding, buf + row * fg->fcm.cell_width, sizeof(pixel) * fg->fcm.cell_width);
+        memcpy(padded + fg->fcm.cell_height * sprite_width + padding, buf + fg->fcm.cell_height * fg->fcm.cell_width, sizeof(pixel) * fg->fcm.cell_width);
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, sprite_width, fg->fcm.cell_height + 1, 1, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, padded);
+        free(padded);
+    }
+}
+
+void
+send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_index decoration_idx) {
+    send_sprite_to_gpu_internal(fg, idx, buf, decoration_idx, false);
+}
+
+void
+send_padded_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_index decoration_idx) {
+    send_sprite_to_gpu_internal(fg, idx, buf, decoration_idx, true);
 }
 
 void
@@ -950,6 +973,7 @@ cell_update_uniform_block(
         GLuint default_fg, url_style, inverted, main_cursor_is_special, extra_cursor_fg, extra_cursor_bg;
 
         GLuint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
+        GLuint sprite_width, sprite_padding;
         GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
         GLfloat cursor_opacity, inactive_text_alpha, fg_override_threshold, row_offset, dim_opacity, blink_opacity;
 
@@ -1109,6 +1133,8 @@ cell_update_uniform_block(
     rd->inverted = screen_invert_colors(screen) ? 1 : 0;
     rd->cell_width = os_window->fonts_data->fcm.cell_width;
     rd->cell_height = os_window->fonts_data->fcm.cell_height;
+    rd->sprite_padding = MAX(1u, rd->cell_width / 2);
+    rd->sprite_width = rd->cell_width + 2 * rd->sprite_padding;
     rd->inactive_text_alpha = inactive_text_alpha;
     rd->dim_opacity = OPT(dim_opacity);
 
@@ -1922,20 +1948,30 @@ current_framebuffer_is_ok(void) {
 enum { DRAW_NEITHER_BG = 0, DRAW_DEFAULT_BG = 1, DRAW_NON_DEFAULT_BG = 2, DRAW_BOTH_BG = 3 };
 
 static void
-call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for_final_output, unsigned draw_bg_bitfield) {
+call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for_final_output, unsigned draw_bg_bitfield, bool overdraw_only) {
     bind_program(program);
     CELL_BUFFERS;
     bind_vao_uniform_buffer(vao_idx, uniform_buffer, CELL_RENDER_DATA_BINDING_POINT);
     bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
     glUniform1ui(program_uniform_location(program, "draw_bg_bitfield"), draw_bg_bitfield);
+    glUniform1i(program_uniform_location(program, "italic_overdraw_only"), overdraw_only);
     if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
     draw_quad(!for_final_output, render_lines_for_screen(ui->screen) * ui->screen->columns);
     if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
 }
 
 static void
+draw_italic_overhang(const UIRenderData *ui, ssize_t vao_idx) {
+    const bool final_output = !ui->os_window->needs_layers;
+    if (final_output) glEnable(GL_FRAMEBUFFER_SRGB);
+    call_cell_program(CELL_FG_PROGRAM, ui, vao_idx, false, DRAW_NEITHER_BG, true);
+    if (final_output) glDisable(GL_FRAMEBUFFER_SRGB);
+}
+
+static void
 draw_cells_without_layers(const UIRenderData *ui, ssize_t vao_idx) {
-    call_cell_program(CELL_PROGRAM, ui, vao_idx, true, DRAW_BOTH_BG);
+    call_cell_program(CELL_PROGRAM, ui, vao_idx, true, DRAW_BOTH_BG, false);
+    draw_italic_overhang(ui, vao_idx);
 }
 
 static void
@@ -2173,14 +2209,19 @@ draw_cells_with_layers(const UIRenderData *ui, ssize_t vao_idx) {
     if (ui->has_background_image && OPT(background_tint) > 0) draw_tint(ui);
     const bool has_content_between_background_and_foreground = ui->window_logo != NULL || ui->grd.num_of_below_refs > 0 || ui->grd.num_of_negative_refs > 0;
     if (has_content_between_background_and_foreground) {
-        if (!ui->has_background_image) call_cell_program(CELL_BG_PROGRAM, ui, vao_idx, false, DRAW_DEFAULT_BG);
+        if (!ui->has_background_image) call_cell_program(CELL_BG_PROGRAM, ui, vao_idx, false, DRAW_DEFAULT_BG, false);
         if (ui->window_logo != NULL) draw_window_logo(ui);
         if (ui->grd.num_of_below_refs > 0) draw_graphics(GRAPHICS_PROGRAM, ui->grd.images, 0, ui->grd.num_of_below_refs, ui->inactive_text_alpha);
-        call_cell_program(CELL_BG_PROGRAM, ui, vao_idx, false, DRAW_NON_DEFAULT_BG);
+        call_cell_program(CELL_BG_PROGRAM, ui, vao_idx, false, DRAW_NON_DEFAULT_BG, false);
         if (ui->grd.num_of_negative_refs)
             draw_graphics(GRAPHICS_PROGRAM, ui->grd.images, ui->grd.num_of_below_refs, ui->grd.num_of_negative_refs, ui->inactive_text_alpha);
-        call_cell_program(CELL_FG_PROGRAM, ui, vao_idx, false, DRAW_NEITHER_BG);
-    } else call_cell_program(CELL_PROGRAM, ui, vao_idx, false, ui->has_background_image ? DRAW_NON_DEFAULT_BG : DRAW_BOTH_BG);
+        call_cell_program(CELL_FG_PROGRAM, ui, vao_idx, false, DRAW_NEITHER_BG, false);
+        draw_italic_overhang(ui, vao_idx);
+    } else {
+        call_cell_program(CELL_BG_PROGRAM, ui, vao_idx, false, ui->has_background_image ? DRAW_NON_DEFAULT_BG : DRAW_BOTH_BG, false);
+        call_cell_program(CELL_FG_PROGRAM, ui, vao_idx, false, DRAW_NEITHER_BG, false);
+        draw_italic_overhang(ui, vao_idx);
+    }
 
     if (ui->grd.num_of_positive_refs > 0)
         draw_graphics(

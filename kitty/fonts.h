@@ -57,6 +57,7 @@ bool render_glyphs_in_cells(
     unsigned int cell_height,
     unsigned int num_cells,
     unsigned int baseline,
+    unsigned int horizontal_padding,
     bool *was_colored,
     FONTS_DATA_HANDLE,
     GlyphRenderInfo *);

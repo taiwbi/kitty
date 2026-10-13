@@ -439,6 +439,14 @@ class Rendering(FontBaseTest):
         cells = render_string(text)[-1]
         self.ae(len(cells), sz)
 
+    def test_italic_glyph_sprites_have_horizontal_overhang_space(self):
+        for bold in (False, True):
+            width, height, cells = render_string('////', italic=True, bold=bold)
+            padded_width = width + 2 * max(1, width // 2)
+            self.assertTrue(cells)
+            for cell in cells:
+                self.ae(len(cell), padded_width * height * 4)
+
     @unittest.skipIf(is_macos, 'COLRv1 is only supported on Linux')
     def test_rendering_colrv1(self):
         f = create_face(self.path_for_font('twemoji_smiley-cff2_colr_1.otf'))

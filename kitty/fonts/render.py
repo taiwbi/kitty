@@ -269,10 +269,14 @@ class setup_for_testing:
         set_send_sprite_to_gpu(None)
 
 
-def render_string(text: str, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0) -> tuple[int, int, list[bytes]]:
+def render_string(
+    text: str, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0, italic: bool = False, bold: bool = False
+) -> tuple[int, int, list[bytes]]:
     with setup_for_testing(family, size, dpi) as (sprites, cell_width, cell_height):
         s = Screen(None, 1, len(text) * 2)
         line = s.line(0)
+        s.cursor.italic = italic
+        s.cursor.bold = bold
         s.draw(text)
         test_render_line(line)
     cells = []
