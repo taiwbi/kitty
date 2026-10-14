@@ -816,11 +816,11 @@ collect_cursor_info(CursorRenderInfo *ans, Window *w, monotonic_t now, OSWindow 
     if (screen_is_overlay_active(rd->screen)) {
         // Do not force the cursor to be visible here for the sake of some programs that prefer it hidden
         cursor = &(rd->screen->overlay_line.original_line.cursor);
-        ans->x = rd->screen->overlay_line.cursor_x;
+        ans->x = screen_visual_cursor_x(rd->screen, rd->screen->overlay_line.cursor_x, rd->screen->overlay_line.ynum);
         ans->y = rd->screen->overlay_line.ynum;
     } else {
         cursor = rd->screen->paused_rendering.expires_at ? &rd->screen->paused_rendering.cursor : rd->screen->cursor;
-        ans->x = cursor->x;
+        ans->x = screen_visual_cursor_x(rd->screen, cursor->x, cursor->y);
         ans->y = cursor->y;
     }
     ans->is_visible = false;

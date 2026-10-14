@@ -335,6 +335,7 @@ void screen_history_scroll_to_absolute(Screen *self, double target_scrolled_by);
 bool screen_apply_pixel_scroll(Screen *self, double delta_pixels);
 PyObject *as_text_history_buf(HistoryBuf *self, PyObject *args, ANSIBuf *output);
 Line *screen_visual_line(Screen *self, index_type y);
+index_type screen_visual_cursor_x(Screen *self, index_type x, index_type y);
 void screen_mark_url(Screen *self, index_type start_x, index_type start_y, index_type end_x, index_type end_y);
 void set_active_hyperlink(Screen *, char *, char *);
 hyperlink_id_type screen_mark_hyperlink(Screen *, index_type, index_type);

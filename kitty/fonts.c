@@ -2784,6 +2784,18 @@ test_bidi_layout(PyObject UNUSED *self, PyObject *args) {
     return Py_BuildValue("NN", text, cells);
 }
 
+static PyObject *
+test_bidi_coordinates(PyObject UNUSED *self, PyObject *args) {
+    Line *line;
+    unsigned logical_x, visual_x;
+    int visual_left_half;
+    if (!PyArg_ParseTuple(args, "O!IIp", &Line_Type, &line, &logical_x, &visual_x, &visual_left_half)) return NULL;
+    index_type mapped_x = 0;
+    bool mapped_left_half = false;
+    if (!bidi_visual_to_logical_x(line, visual_x, visual_left_half, &mapped_x, &mapped_left_half)) Py_RETURN_NONE;
+    return Py_BuildValue("III", bidi_logical_to_visual_x(line, logical_x), mapped_x, mapped_left_half);
+}
+
 static uint32_t
 alpha_blend(uint32_t fg, uint32_t bg) {
     uint32_t r1 = (fg >> 16) & 0xFF, g1 = (fg >> 8) & 0xFF, b1 = fg & 0xFF, a = (fg >> 24) & 0xff;
@@ -3094,6 +3106,7 @@ static PyMethodDef module_methods[] = {
     METHODB(test_render_line, METH_VARARGS),
     METHODB(test_render_screen, METH_VARARGS),
     METHODB(test_bidi_layout, METH_VARARGS),
+    METHODB(test_bidi_coordinates, METH_VARARGS),
     METHODB(get_fallback_font, METH_VARARGS),
     {"specialize_font_descriptor", (PyCFunction)pyspecialize_font_descriptor, METH_VARARGS, ""},
     {"render_box_char", (PyCFunction)pyrender_box_char, METH_VARARGS, ""},

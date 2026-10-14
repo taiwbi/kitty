@@ -35,3 +35,5 @@ typedef struct {
 bool line_needs_bidi(const Line *line);
 bool bidi_layout(const Line *line, BidiLayout *layout);
 void free_bidi_layout(BidiLayout *layout);
+index_type bidi_logical_to_visual_x(const Line *line, index_type logical_x);
+bool bidi_visual_to_logical_x(const Line *line, index_type visual_x, bool visual_left_half, index_type *logical_x, bool *logical_left_half);

@@ -37,6 +37,7 @@
 #include "unicode-data.h"
 #include "modes.h"
 #include "char-props.h"
+#include "bidi.h"
 #include "simd-string.h"
 #include "wcswidth.h"
 #include <stdalign.h>
@@ -105,7 +106,7 @@ init_overlay_line(Screen *self, index_type columns, bool keep_active) {
 static void deactivate_overlay_line(Screen *self);
 static void update_overlay_position(Screen *self);
 static void render_overlay_line(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data);
-static void update_overlay_line_data(Screen *self, uint8_t *data);
+static void update_overlay_line_data(Screen *self, uint8_t *data, FONTS_DATA_HANDLE fonts_data);
 
 #define CALLBACK(...)                                                               \
     if (self->callbacks != Py_None) {                                               \
@@ -4179,7 +4180,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
             linebuf_init_line(self->linebuf, self->overlay_line.ynum);
             render_overlay_line(self, self->linebuf->line, fonts_data);
         }
-        update_overlay_line_data(self, address);
+        update_overlay_line_data(self, address, fonts_data);
     }
 }
 
@@ -4439,6 +4440,45 @@ screen_apply_selection(Screen *self, void *address_, size_t size) {
         apply_selection(self, address, s, 2, offset, scrolled_by);
     }
     sel->last_rendered_count = sel->count;
+    if (OPT(bidi_rendering) && !OPT(force_ltr) && self->columns) {
+        const size_t rows = size / self->columns;
+        uint8_t *scratch = malloc(self->columns);
+        if (scratch) {
+            Line scratch_line = {.text_cache = self->text_cache};
+            for (size_t r = 0; r < rows; r++) {
+                Line *line = NULL;
+                const bool is_overlay_row = screen_is_overlay_active(self) && r == self->overlay_line.ynum + self->scrolled_by + offset;
+                Line overlay_line = {0};
+                if (is_overlay_row) {
+                    overlay_line = (Line){
+                        .xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
+                    line = &overlay_line;
+                } else if (self->paused_rendering.expires_at) {
+                    if (r < self->lines) {
+                        linebuf_init_line(self->paused_rendering.linebuf, r);
+                        line = self->paused_rendering.linebuf->line;
+                    }
+                } else {
+                    const int virtual_y = (int)r - (int)offset;
+                    bool is_history = false;
+                    index_type lnum = 0;
+                    line = render_line_for_virtual_y(self, virtual_y, &scratch_line, &lnum, &is_history);
+                }
+                if (!line || !line_needs_bidi(line)) continue;
+                BidiLayout layout;
+                if (!bidi_layout(line, &layout)) continue;
+                uint8_t *row = address + r * self->columns;
+                memset(scratch, 0, self->columns);
+                for (unsigned i = 0; i < layout.num_cells; i++) {
+                    const BidiCell *cell = layout.cells + i;
+                    memcpy(scratch + cell->visual_x, row + cell->x, cell->width);
+                }
+                memcpy(row, scratch, self->columns);
+                free_bidi_layout(&layout);
+            }
+            free(scratch);
+        }
+    }
     address += (size_t)offset * self->columns;
     size -= (size_t)offset * self->columns;
     ExtraCursors *ec = self->paused_rendering.expires_at ? &self->paused_rendering.extra_cursors : &self->extra_cursors;
@@ -5186,10 +5226,15 @@ render_overlay_line(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data) {
 }
 
 static void
-update_overlay_line_data(Screen *self, uint8_t *data) {
+update_overlay_line_data(Screen *self, uint8_t *data, FONTS_DATA_HANDLE fonts_data) {
     const int render_row_offset = pixel_scroll_enabled(self);
     const size_t base = sizeof(GPUCell) * (self->overlay_line.ynum + self->scrolled_by + render_row_offset) * self->columns;
-    memcpy(data + base, self->overlay_line.gpu_cells, self->columns * sizeof(GPUCell));
+    Line overlay = {
+        .xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
+    memcpy(
+        data + base,
+        render_visual_line(fonts_data, &overlay, self->disable_ligatures, (int)self->overlay_line.cursor_x),
+        self->columns * sizeof(GPUCell));
 }
 
 // }}}
@@ -5633,6 +5678,19 @@ Line *
 screen_visual_line(Screen *self, index_type y) {
     if (y >= self->lines) return NULL;
     return visual_line_(self, y);
+}
+
+index_type
+screen_visual_cursor_x(Screen *self, index_type x, index_type y) {
+    if (!OPT(bidi_rendering) || OPT(force_ltr) || y >= self->lines) return MIN(x, self->columns);
+    if (screen_is_overlay_active(self) && self->overlay_line.ynum == y && self->overlay_line.cpu_cells) {
+        Line overlay = {.xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
+        return bidi_logical_to_visual_x(&overlay, x);
+    }
+    LineBuf *linebuf = self->paused_rendering.expires_at ? self->paused_rendering.linebuf : self->linebuf;
+    if (!linebuf) return MIN(x, self->columns);
+    linebuf_init_line(linebuf, y);
+    return bidi_logical_to_visual_x(linebuf->line, x);
 }
 
 static PyObject *

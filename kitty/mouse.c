@@ -13,6 +13,7 @@
 #include <math.h>
 #include "glfw-wrapper.h"
 #include "control-codes.h"
+#include "bidi.h"
 
 extern PyTypeObject Screen_Type;
 
@@ -332,6 +333,15 @@ cell_for_pos(Window *w, unsigned int *x, unsigned int *y, bool *in_left_half_of_
     }
     if (mouse_y >= g->bottom) qy = screen->lines - 1;
     else if (mouse_y >= g->top) { qy = (unsigned int)((double)(mouse_y - g->top - screen->pixel_scroll_offset_y) / os_window->fonts_data->fcm.cell_height); }
+    if (qx < screen->columns && qy < screen->lines && OPT(bidi_rendering) && !OPT(force_ltr)) {
+        Line *line = screen_visual_line(screen, qy);
+        index_type logical_x;
+        bool logical_left_half;
+        if (line && bidi_visual_to_logical_x(line, qx, in_left_half, &logical_x, &logical_left_half)) {
+            qx = logical_x;
+            in_left_half = logical_left_half;
+        }
+    }
     if (qx < screen->columns && qy < screen->lines) {
         *x = qx;
         *y = qy;

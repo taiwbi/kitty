@@ -1019,6 +1019,9 @@ def test_render_line(line: Line, visual: bool = False) -> Optional[List[Tuple[in
 def test_bidi_layout(line: Line) -> Optional[Tuple[str, List[Tuple[int, int, int, int, int, int, int]]]]:
     pass
 
+def test_bidi_coordinates(line: Line, logical_x: int, visual_x: int, visual_left_half: bool) -> Optional[Tuple[int, int, int]]:
+    pass
+
 def test_render_screen(screen: Screen) -> List[List[Tuple[int, int, int, int]]]:
     pass
 

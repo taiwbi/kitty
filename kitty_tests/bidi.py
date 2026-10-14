@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2026
 
-from kitty.fast_data_types import Screen, sprite_idx_to_pos, test_bidi_layout, test_render_line, test_render_screen
+from kitty.fast_data_types import Screen, sprite_idx_to_pos, test_bidi_coordinates, test_bidi_layout, test_render_line, test_render_screen
 from kitty.fonts.render import setup_for_testing
 
 from .base import BaseTest, draw_multicell, parse_bytes
@@ -46,6 +46,20 @@ class BidiLayout(BaseTest):
             if normalized[first : first + count] in ('😀', '界'):
                 self.ae(width, 2)
         self.ae(sorted(positions), list(range(screen.columns)))
+
+    def test_bidi_coordinate_mapping(self):
+        for text in ('سلام', 'abc سلام 123', 'a 😀 אבג'):
+            screen, result = self.layout(text)
+            normalized, cells = result
+            for x, width, visual_x, first, count, level, script in cells:
+                visual, logical, left = test_bidi_coordinates(screen.line(0), x, visual_x, True)
+                self.ae(visual, visual_x)
+                self.ae(logical, x)
+                self.ae(left, not bool(level & 1))
+                if width > 1:
+                    visual, logical, left = test_bidi_coordinates(screen.line(0), x, visual_x + width - 1, False)
+                    self.ae(logical, x + width - 1)
+                    self.ae(left, bool(level & 1))
 
     def test_bidi_presentation_forms(self):
         original = 'hello ﺱﻼﻣ ﺪﻨﯾﺍ end'

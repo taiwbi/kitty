@@ -149,3 +149,38 @@ fail:
     free_bidi_layout(layout);
     return false;
 }
+
+index_type
+bidi_logical_to_visual_x(const Line *line, index_type logical_x) {
+    if (logical_x >= line->xnum) return line->xnum;
+    BidiLayout layout;
+    if (!bidi_layout(line, &layout)) return MIN(logical_x, line->xnum);
+    index_type ans = logical_x;
+    for (unsigned i = 0; i < layout.num_cells; i++) {
+        const BidiCell *cell = layout.cells + i;
+        if (logical_x >= cell->x && logical_x < cell->x + cell->width) {
+            ans = cell->visual_x;
+            break;
+        }
+    }
+    free_bidi_layout(&layout);
+    return ans;
+}
+
+bool
+bidi_visual_to_logical_x(const Line *line, index_type visual_x, bool visual_left_half, index_type *logical_x, bool *logical_left_half) {
+    BidiLayout layout;
+    if (!bidi_layout(line, &layout)) return false;
+    bool found = false;
+    for (unsigned i = 0; i < layout.num_cells; i++) {
+        const BidiCell *cell = layout.cells + i;
+        if (visual_x >= cell->visual_x && visual_x < cell->visual_x + cell->width) {
+            *logical_x = cell->x + (visual_x - cell->visual_x);
+            *logical_left_half = (visual_left_half != FRIBIDI_LEVEL_IS_RTL(cell->level));
+            found = true;
+            break;
+        }
+    }
+    free_bidi_layout(&layout);
+    return found;
+}
