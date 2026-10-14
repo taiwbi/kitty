@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Freeze the builder interfaces used by .github/release/build.py.
+  BYPY_REVISION: 5062c1f6e58fd8c62786f45e561cf96f9477ff67
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            static: '1'
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            static: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # documentation includes commit links
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # builds run inside Docker
+      - name: Check out the pinned upstream freezer
+        run: |
+          git init "$RUNNER_TEMP/bypy"
+          git -C "$RUNNER_TEMP/bypy" remote add origin https://github.com/kovidgoyal/bypy.git
+          git -C "$RUNNER_TEMP/bypy" fetch --depth=1 origin "$BYPY_REVISION"
+          git -C "$RUNNER_TEMP/bypy" checkout --detach FETCH_HEAD
+      - name: Build and verify portable Linux release
+        env:
+          RELEASE_STATIC_KITTENS: ${{ matrix.static }}
+        run: |
+          docker build --tag kitty-release .github/release
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/src" \
+            --volume "$RUNNER_TEMP/bypy:/bypy:ro" \
+            --volume "$(go env GOROOT):/opt/go:ro" \
+            --env RELEASE_STATIC_KITTENS \
+            --env GITHUB_REPOSITORY \
+            kitty-release
+          # A fresh container has no /sw/sw, source checkout, or build toolchain.
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/dist:/dist:ro" \
+            --volume "$GITHUB_WORKSPACE/.github/release:/checks:ro" \
+            kitty-release bash -euc '
+              mkdir /tmp/kitty
+              tar -xf /dist/kitty-*.txz -C /tmp/kitty
+              /tmp/kitty/bin/kitty +launch /checks/smoke.py
+            '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 7
+
+  macos:
+    name: macOS universal (amd64 + arm64)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Check out the pinned upstream freezer
+        run: |
+          git init "$RUNNER_TEMP/bypy"
+          git -C "$RUNNER_TEMP/bypy" remote add origin https://github.com/kovidgoyal/bypy.git
+          git -C "$RUNNER_TEMP/bypy" fetch --depth=1 origin "$BYPY_REVISION"
+          git -C "$RUNNER_TEMP/bypy" checkout --detach FETCH_HEAD
+      - name: Build and verify universal application and DMG
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          export BYPY_SOURCE="$RUNNER_TEMP/bypy"
+          bash .github/release/bootstrap.sh macos
+          hdiutil verify dist/kitty-*.dmg
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-macos
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Verify all assets and publish GitHub release
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Check complete asset matrix and write SHA256SUMS
+        run: python3 .github/release/verify.py
+      - name: Upload all assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # New releases stay drafts until every asset has uploaded successfully.
+          # An interrupted upload can be retried using "Re-run failed jobs".
+          if ! gh release view -- "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create --verify-tag --draft \
+              --title "$RELEASE_TAG" --notes-file .github/release/notes.md -- "$RELEASE_TAG"
+          fi
+          gh release upload --clobber -- "$RELEASE_TAG" dist/*
+          gh release edit --draft=false -- "$RELEASE_TAG"

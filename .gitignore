@@ -12,6 +12,7 @@
 /dependencies
 /tags
 /build/
+/dist/
 /fonts/
 /shaders/
 /linux-package/
