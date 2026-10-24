@@ -43,7 +43,7 @@ render_bidi_glyph_group(
     // advance. Measure using the same conversion as the font's rasterizer.
     const double advance = glyph_run_advance(font->face, positions, num_glyphs);
     if (advance < 0 || advance > UINT_MAX) return false;
-    const unsigned native_width = advance ? (unsigned)advance : num_cells * cw;
+    const unsigned native_width = advance != 0.0 ? (unsigned)advance : num_cells * cw;
     const unsigned native_cells = MAX(1u, (native_width + cw - 1u) / cw);
     SpritePosition **sprites = global_glyph_render_scratch.sprite_positions;
     bool all_rendered = true;
