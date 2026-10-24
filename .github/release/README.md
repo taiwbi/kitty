@@ -27,8 +27,8 @@ Asset versions come from `kitty/constants.py`; the GitHub release name is the ta
 1. Check out the tag with history for documentation commit links. Install the
    exact Go toolchain declared in `go.mod` using `actions/setup-go`.
 2. Fetch the pinned `kovidgoyal/bypy` commit. GitHub Actions are pinned to commits
-   as well. Linux uses native amd64/arm64 runners and an Ubuntu 22.04 container,
-   matching the upstream glibc baseline. macOS uses the macOS 26 runner's Xcode.
+   as well. Linux uses native amd64/arm64 runners and an Ubuntu 24.04 container
+   with GTK 4 and libadwaita 1.4 or newer. macOS uses the macOS 26 runner's Xcode.
 3. Extract upstream's exported dependency bundles into their original prefixes
    (`/sw/sw` or `/Users/Shared/kitty-build/sw/sw`). This preserves library paths,
    Python configuration, and macOS framework install names. Download the Nerd

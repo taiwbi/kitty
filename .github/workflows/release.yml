@@ -54,7 +54,7 @@ jobs:
         env:
           RELEASE_STATIC_KITTENS: ${{ matrix.static }}
         run: |
-          docker build --tag kitty-release .github/release
+          docker build --build-arg RELEASE_GTK=1 --tag kitty-release .github/release
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/src" \
             --volume "$RUNNER_TEMP/bypy:/bypy:ro" \
