@@ -280,8 +280,8 @@ gtk_backend_run_main_loop(tick_callback_fun callback, void *callback_data) {
     gtk_tick_callback = callback;
     gtk_tick_callback_data = callback_data;
     gtk_main_loop = g_main_loop_new(NULL, false);
-    // GLFW still supplies kitty's Wayland clipboard and selection backend. Poll
-    // its separate Wayland connection from the GTK-owned main context.
+    // Keep GLFW's hidden windows and platform events serviced while GTK owns
+    // the main context. Clipboard transfers use GDK's display connection.
     gtk_glfw_poll_source_id = g_timeout_add(8, gtk_poll_glfw_events, NULL);
     gtk_schedule_tick();
     g_main_loop_run(gtk_main_loop);

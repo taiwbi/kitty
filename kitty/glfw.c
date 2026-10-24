@@ -4143,7 +4143,20 @@ get_clipboard_data(const char *mime_type, void *iter, GLFWClipboardType ct) {
 }
 
 static PyObject *
+call_gtk_clipboard(const char *method, PyObject *args) {
+    PyObject *module = PyImport_ImportModule("kitty.gtk_clipboard");
+    if (!module) return NULL;
+    PyObject *func = PyObject_GetAttrString(module, method);
+    Py_DECREF(module);
+    if (!func) return NULL;
+    PyObject *result = PyObject_CallObject(func, args);
+    Py_DECREF(func);
+    return result;
+}
+
+static PyObject *
 set_clipboard_data_types(PyObject *self UNUSED, PyObject *args) {
+    if (is_gtk_backend_enabled()) return call_gtk_clipboard("set_clipboard_data_types", args);
     PyObject *mta;
     int ctype;
     if (!PyArg_ParseTuple(args, "iO!", &ctype, &PyTuple_Type, &mta)) return NULL;
@@ -4176,6 +4189,7 @@ write_clipboard_data(void *callback, const char *data, size_t sz) {
 
 static PyObject *
 get_clipboard_mime(PyObject *self UNUSED, PyObject *args) {
+    if (is_gtk_backend_enabled()) return call_gtk_clipboard("get_clipboard_mime", args);
     int ctype;
     const char *mime;
     PyObject *callback;
