@@ -29,6 +29,19 @@ def run(*cmd: str, cwd: Path = SOURCE, env: dict[str, str] | None = None) -> Non
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
+def check_gtk_fallback() -> None:
+    # Linux builders with GTK installed would otherwise never compile these
+    # stubs. Reuse setup.py's compiler/headers and keep warnings fatal, as on
+    # macOS and on systems without the optional GTK development packages.
+    commands = json.loads((SOURCE / 'build/compile_commands.json').read_text())
+    entry, = (c for c in commands if c['file'] == 'kitty/gtk_backend.c')
+    args = [a for a in entry['arguments'] if a != '-MMD']
+    args.insert(args.index('-c'), '-UKITTY_WITH_GTK')
+    with tempfile.TemporaryDirectory() as tmp:
+        args[args.index('-o') + 1] = str(Path(tmp) / 'gtk_backend.o')
+        run(*args, cwd=Path(entry['directory']))
+
+
 def build_fribidi() -> None:
     # This dependency is newer than the upstream CI bundles. Static linking also
     # avoids introducing a system FriBidi dependency into the portable archives.
@@ -217,6 +230,7 @@ def main() -> None:
     OUTPUT.mkdir(exist_ok=True)
     build_fribidi()
     run(sys.executable, 'setup.py', 'build')
+    check_gtk_fallback()
     docs_env = dict(os.environ, PYTHONPATH=os.environ['RELEASE_DOCS_DEPS'])
     run('make', 'docs', f'SPHINXBUILD={shlex.quote(sys.executable)} -m sphinx', env=docs_env)
     ext_dir = freeze()

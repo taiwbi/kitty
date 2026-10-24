@@ -60,7 +60,7 @@ gtk_backend_initialize(PyObject UNUSED *self, PyObject UNUSED *args) {
 }
 
 PyObject *
-gtk_backend_set_enabled(PyObject UNUSED *self, PyObject *args) {
+gtk_backend_set_enabled(PyObject UNUSED *self, PyObject UNUSED *args) {
 #ifdef KITTY_WITH_GTK
     int enabled = 0;
     if (!PyArg_ParseTuple(args, "p", &enabled)) return NULL;
@@ -102,7 +102,7 @@ gtk_backend_is_active(PyObject UNUSED *self, PyObject UNUSED *args) {
 }
 
 PyObject *
-gtk_backend_register_window(PyObject UNUSED *self, PyObject *args) {
+gtk_backend_register_window(PyObject UNUSED *self, PyObject UNUSED *args) {
 #ifdef KITTY_WITH_GTK
     unsigned long long window_id = 0;
     PyObject *window = NULL;
@@ -136,7 +136,7 @@ gtk_backend_register_window(PyObject UNUSED *self, PyObject *args) {
 }
 
 PyObject *
-gtk_backend_main_context_iteration(PyObject UNUSED *self, PyObject *args) {
+gtk_backend_main_context_iteration(PyObject UNUSED *self, PyObject UNUSED *args) {
 #ifdef KITTY_WITH_GTK
     int may_block = 0;
     if (!gtk_backend_initialized) {
@@ -304,9 +304,9 @@ gtk_backend_stop_main_loop(void) {
 bool is_gtk_backend_active(void) { return false; }
 bool is_gtk_backend_enabled(void) { return false; }
 void gtk_backend_wakeup(void) {}
-id_type gtk_backend_add_main_loop_timer(monotonic_t UNUSED interval, bool UNUSED repeats, timer_callback_fun UNUSED callback, void *UNUSED callback_data, timer_callback_fun UNUSED free_callback) { return 0; }
+id_type gtk_backend_add_main_loop_timer(monotonic_t UNUSED interval, bool UNUSED repeats, timer_callback_fun UNUSED callback, void UNUSED *callback_data, timer_callback_fun UNUSED free_callback) { return 0; }
 void gtk_backend_update_main_loop_timer(id_type UNUSED timer_id, monotonic_t UNUSED interval, bool UNUSED enabled) {}
 void gtk_backend_remove_main_loop_timer(id_type UNUSED timer_id) {}
-void gtk_backend_run_main_loop(tick_callback_fun UNUSED callback, void *UNUSED callback_data) {}
+void gtk_backend_run_main_loop(tick_callback_fun UNUSED callback, void UNUSED *callback_data) {}
 void gtk_backend_stop_main_loop(void) {}
 #endif

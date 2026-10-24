@@ -38,8 +38,11 @@ Asset versions come from `kitty/constants.py`; the GitHub release name is the ta
 4. Build checksum-verified FriBidi 1.0.16 statically because this checkout needs
    it and the exported bundles do not include it. On macOS, compile both slices
    and combine the static library with `lipo`.
-5. Build native kitty/kitten to generate Go code and shaders. Generate HTML/man
-   documentation. Run kitty's existing `bypy` build/freezing hooks to bundle the
+5. Build native kitty/kitten to generate Go code and shaders. Compile the GTK
+   backend again with GTK disabled and warnings treated as errors, so Linux
+   builders also check the fallback used on macOS and systems without GTK.
+   Generate HTML/man documentation. Run kitty's existing `bypy` build/freezing
+   hooks to bundle the
    Python runtime, native libraries, resources, and launchers. Preserve shared
    library aliases needed by Python extensions, including SQLite's unversioned
    library name. These hooks are
