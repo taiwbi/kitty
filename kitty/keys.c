@@ -170,7 +170,13 @@ update_ime_position(Window *w UNUSED, Screen *screen UNUSED) {
 #ifndef __APPLE__
     prepare_ime_position_update_event(global_state.callback_os_window, w, screen, &ev);
 #endif
-    glfwUpdateIMEState(global_state.callback_os_window->handle, &ev);
+    if (global_state.callback_os_window->gtk_window) {
+        PyObject *args = Py_BuildValue("Kiiii", global_state.callback_os_window->id, ev.cursor.left, ev.cursor.top, ev.cursor.width, ev.cursor.height);
+        PyObject *ret = args ? gtk_input_ime_cursor(NULL, args) : NULL;
+        Py_XDECREF(args);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+    } else glfwUpdateIMEState(global_state.callback_os_window->handle, &ev);
 }
 
 const char *

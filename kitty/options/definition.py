@@ -3674,6 +3674,19 @@ config is not supported.
 )
 
 opt(
+    'linux_use_gtk_window',
+    'no',
+    option_type='to_bool',
+    ctype='bool',
+    long_text="""
+Use GTK 4 and libadwaita for GNOME Wayland window decorations and the tab
+header bar. This requires kitty to be built with GTK 4 and libadwaita
+development libraries, and only applies to GNOME on Wayland. The default is
+the native kitty window backend.
+""",
+)
+
+opt(
     'wayland_enable_ime',
     'yes',
     option_type='to_bool',

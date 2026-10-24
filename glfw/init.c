@@ -298,6 +298,12 @@ glfwSetErrorCallback(GLFWerrorfun cbfun) {
 
 
 GLFWAPI void
+glfwPollEvents(void) {
+    _GLFW_REQUIRE_INIT();
+    _glfwPlatformPollEvents();
+}
+
+GLFWAPI void
 glfwRunMainLoop(GLFWtickcallback callback, void *data) {
     _GLFW_REQUIRE_INIT();
     _glfwPlatformRunMainLoop(callback, data);

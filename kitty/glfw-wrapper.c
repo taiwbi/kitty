@@ -20,6 +20,9 @@ load_glfw(const char* path) {
     *(void **) (&glfwInit_impl) = dlsym(handle, "glfwInit");
     if (glfwInit_impl == NULL) fail("Failed to load glfw function glfwInit with error: %s", dlerror());
 
+    *(void **) (&glfwPollEvents_impl) = dlsym(handle, "glfwPollEvents");
+    if (glfwPollEvents_impl == NULL) fail("Failed to load glfw function glfwPollEvents with error: %s", dlerror());
+
     *(void **) (&glfwRunMainLoop_impl) = dlsym(handle, "glfwRunMainLoop");
     if (glfwRunMainLoop_impl == NULL) fail("Failed to load glfw function glfwRunMainLoop with error: %s", dlerror());
 

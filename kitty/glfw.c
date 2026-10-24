@@ -10,6 +10,7 @@
 #include "dnd.h"
 #include "charsets.h"
 #include "control-codes.h"
+#include "gl.h"
 #include <structmember.h>
 #include "glfw-wrapper.h"
 #ifdef __APPLE__
@@ -168,7 +169,8 @@ update_menu_bar_title(PyObject *title UNUSED) {
 
 void
 request_tick_callback(void) {
-    glfwPostEmptyEvent();
+    if (is_gtk_backend_active()) gtk_backend_wakeup();
+    else glfwPostEmptyEvent();
 }
 
 static void
@@ -198,11 +200,10 @@ set_layer_shell_config_for(OSWindow *w, GLFWLayerShellConfig *lsc) {
 void
 update_os_window_viewport(OSWindow *window, bool notify_boss) {
     int w, h, fw, fh;
-    glfwGetFramebufferSize(window->handle, &fw, &fh);
-    glfwGetWindowSize(window->handle, &w, &h);
+    get_os_window_size(window, &w, &h, &fw, &fh);
     double xdpi = window->fonts_data->logical_dpi_x, ydpi = window->fonts_data->logical_dpi_y, new_xdpi, new_ydpi;
     float xscale, yscale;
-    get_window_content_scale(window->handle, &xscale, &yscale, &new_xdpi, &new_ydpi);
+    get_os_window_content_scale(window, &new_xdpi, &new_ydpi, &xscale, &yscale);
 
     if (fw == window->viewport_width && fh == window->viewport_height && w == window->window_width && h == window->window_height && xdpi == new_xdpi &&
         ydpi == new_ydpi) {
@@ -282,6 +283,14 @@ is_window_ready_for_callbacks(void) {
 
 static void
 show_mouse_cursor(GLFWwindow *w) {
+    OSWindow *osw = os_window_for_glfw_window(w);
+    if (osw && osw->gtk_window) {
+        osw->gtk_pointer_hidden = false;
+        PyObject *ret = PyObject_CallMethod(osw->gtk_window, "show_pointer", NULL);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+        return;
+    }
     glfwSetInputMode(w, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 }
 
@@ -723,7 +732,7 @@ cursor_pos_callback(GLFWwindow *w, double x, double y) {
 static void
 scroll_callback(GLFWwindow *w, const GLFWScrollEvent *ev) {
     if (!set_callback_window(w)) return;
-    if (global_state.callback_os_window->is_focused) refresh_mouse_position_for_hit_test(w, global_state.callback_os_window);
+    if (global_state.callback_os_window->is_focused && !global_state.callback_os_window->gtk_window) refresh_mouse_position_for_hit_test(w, global_state.callback_os_window);
     monotonic_t now = monotonic();
     if (OPT(mouse_hide.scroll_unhide)) cursor_active_callback(now);
     global_state.callback_os_window->last_mouse_activity_at = now;
@@ -938,6 +947,21 @@ static id_type focus_counter = 0;
 
 static void
 set_os_window_visibility(OSWindow *w, int set_visible, bool move_to_active_screen) {
+    if (w->gtk_window) {
+        const char *method = set_visible ? "present" : "hide";
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, method, NULL);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+        w->gtk_window_mapped = set_visible != 0;
+        if (set_visible) {
+            w->needs_render = true;
+            w->render_state = RENDER_FRAME_NOT_REQUESTED;
+            w->keep_rendering_till_swap = 256;
+            request_tick_callback();
+        }
+        update_os_window_visibility_reports(w);
+        return;
+    }
     if (set_visible) {
         glfwShowWindow(w->handle, move_to_active_screen);
         w->needs_render = true;
@@ -989,11 +1013,178 @@ window_focus_callback(GLFWwindow *w, int focused) {
         }
     }
     request_tick_callback();
-    if (osw && osw->handle && !focused && focus_changed && osw->hide_on_focus_loss && glfwGetWindowAttrib(osw->handle, GLFW_VISIBLE)) {
+    if (osw && osw->handle && !focused && focus_changed && osw->hide_on_focus_loss && (osw->gtk_window ? osw->gtk_window_mapped : glfwGetWindowAttrib(osw->handle, GLFW_VISIBLE))) {
         add_main_loop_timer(0, false, update_os_window_visibility_based_on_focus, (void *)(uintptr_t)osw->id, NULL);
     }
     osw = NULL;
 #undef osw
+}
+
+static OSWindow *
+gtk_os_window_from_id(unsigned long long id) {
+    OSWindow *ans = os_window_for_id((id_type)id);
+    if (!ans || !ans->handle) PyErr_SetString(PyExc_ValueError, "No GTK-backed OSWindow with the specified id found");
+    return ans && ans->handle ? ans : NULL;
+}
+
+PyObject *
+gtk_input_key(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    int key, shifted_key, alternate_key, native_key, action, mods, ime_state = 0;
+    PyObject *text_obj;
+    if (!PyArg_ParseTuple(args, "KiiiiiiO|i", &id, &key, &shifted_key, &alternate_key, &native_key, &action, &mods, &text_obj, &ime_state)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    const char *text = NULL;
+    if (text_obj != Py_None) {
+        if (!PyUnicode_Check(text_obj)) {
+            PyErr_SetString(PyExc_TypeError, "GTK key text must be a string or None");
+            return NULL;
+        }
+        text = PyUnicode_AsUTF8(text_obj);
+        if (!text) return NULL;
+    }
+    GLFWkeyevent ev = {
+        .key = key,
+        .shifted_key = shifted_key,
+        .alternate_key = alternate_key,
+        .native_key = native_key,
+        .action = action,
+        .mods = mods,
+        .text = text,
+        .ime_state = ime_state,
+    };
+    key_callback(osw->handle, &ev);
+    Py_RETURN_TRUE;
+}
+
+PyObject *
+gtk_input_focus(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    int focused;
+    if (!PyArg_ParseTuple(args, "Kp", &id, &focused)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    window_focus_callback(osw->handle, focused);
+    Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_input_pointer(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    int event;
+    double x, y;
+    if (!PyArg_ParseTuple(args, "Kidd", &id, &event, &x, &y)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    GLFWwindow *w = osw->handle;
+    if (!set_callback_window(w)) Py_RETURN_NONE;
+    monotonic_t now = monotonic();
+    if (event == 0) {
+        on_mouse_position_update(x, y);
+    } else if (event == 1) {
+        const double old_x = osw->mouse_x, old_y = osw->mouse_y;
+        set_os_window_mouse_position(osw, x, y);
+        osw->last_mouse_activity_at = now;
+        if (old_x != osw->mouse_x || old_y != osw->mouse_y) cursor_active_callback(now);
+        if (is_window_ready_for_callbacks()) enter_event(global_state.mods_at_last_key_or_button_event, old_x != osw->mouse_x || old_y != osw->mouse_y);
+        request_tick_callback();
+    } else {
+        if (is_window_ready_for_callbacks()) leave_event(global_state.mods_at_last_key_or_button_event);
+        request_tick_callback();
+    }
+    global_state.callback_os_window = NULL;
+    Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_input_mouse_button(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    int button, action, mods;
+    double x, y;
+    if (!PyArg_ParseTuple(args, "Kiiidd", &id, &button, &action, &mods, &x, &y)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    osw->has_received_cursor_pos_event = true;
+    set_os_window_mouse_position(osw, x, y);
+    mouse_button_callback(osw->handle, button, action, mods);
+    Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_input_scroll(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    int mods;
+    double dx, dy, x, y;
+    if (!PyArg_ParseTuple(args, "Kddddi", &id, &dx, &dy, &x, &y, &mods)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    osw->has_received_cursor_pos_event = true;
+    set_os_window_mouse_position(osw, x, y);
+    const double scale = MAX(osw->gtk_scale, 1);
+    GLFWScrollEvent ev = {
+        .x_offset = dx * scale,
+        .y_offset = dy * scale,
+        .unscaled = {.x = dx, .y = dy},
+        .momentum_type = GLFW_NO_MOMENTUM_DATA,
+        .offset_type = GLFW_SCROLL_OFFEST_HIGHRES,
+        .keyboard_modifiers = mods,
+    };
+    scroll_callback(osw->handle, &ev);
+    Py_RETURN_TRUE;
+}
+
+PyObject *
+gtk_input_resize(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    int width, height, scale;
+    if (!PyArg_ParseTuple(args, "Kiii", &id, &width, &height, &scale)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    osw->gtk_scale = MAX(1, scale);
+    framebuffer_size_callback(osw->handle, width * osw->gtk_scale, height * osw->gtk_scale);
+    Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_input_close(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    if (!PyArg_ParseTuple(args, "K", &id)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    window_close_callback(osw->handle);
+    Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_input_ime_cursor(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    int left, top, width, height;
+    if (!PyArg_ParseTuple(args, "Kiiii", &id, &left, &top, &width, &height)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    PyObject *ret = PyObject_CallMethod(osw->gtk_window, "set_ime_cursor_location", "iiii", left, top, width, height);
+    if (!ret) return NULL;
+    Py_DECREF(ret);
+    Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_render_os_window(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long id;
+    if (!PyArg_ParseTuple(args, "K", &id)) return NULL;
+    OSWindow *osw = gtk_os_window_from_id(id);
+    if (!osw) return NULL;
+    make_os_window_context_current(osw);
+    GLint output_fbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &output_fbo);
+    osw->gtk_framebuffer_id = (unsigned)MAX(0, output_fbo);
+    set_framebuffer_to_use_for_output(osw->gtk_framebuffer_id);
+    // GtkGLArea can allocate a fresh backing buffer for each render signal.
+    // Its contents are not preserved when kitty's terminal state is unchanged.
+    osw->needs_render = true;
+    render_os_window(osw, monotonic(), true);
+    Py_RETURN_NONE;
 }
 
 #define TAB_DRAG_MIME_NUMBER 400
@@ -1560,8 +1751,55 @@ set_glfw_mouse_cursor(GLFWwindow *w, GLFWCursorShape shape) {
     if (cursors[shape].glfw) glfwSetCursor(w, cursors[shape].glfw);
 }
 
+static const char *
+gtk_cursor_name(MouseShape type) {
+    switch (type) {
+        case DEFAULT_POINTER: return "default";
+        case TEXT_POINTER: return "text";
+        case POINTER_POINTER: return "pointer";
+        case HELP_POINTER: return "help";
+        case WAIT_POINTER: return "wait";
+        case PROGRESS_POINTER: return "progress";
+        case CROSSHAIR_POINTER: return "crosshair";
+        case CELL_POINTER: return "cell";
+        case VERTICAL_TEXT_POINTER: return "vertical-text";
+        case MOVE_POINTER: return "move";
+        case E_RESIZE_POINTER: return "e-resize";
+        case NE_RESIZE_POINTER: return "ne-resize";
+        case NW_RESIZE_POINTER: return "nw-resize";
+        case N_RESIZE_POINTER: return "n-resize";
+        case SE_RESIZE_POINTER: return "se-resize";
+        case SW_RESIZE_POINTER: return "sw-resize";
+        case S_RESIZE_POINTER: return "s-resize";
+        case W_RESIZE_POINTER: return "w-resize";
+        case EW_RESIZE_POINTER: return "ew-resize";
+        case NS_RESIZE_POINTER: return "ns-resize";
+        case NESW_RESIZE_POINTER: return "nesw-resize";
+        case NWSE_RESIZE_POINTER: return "nwse-resize";
+        case ZOOM_IN_POINTER: return "zoom-in";
+        case ZOOM_OUT_POINTER: return "zoom-out";
+        case ALIAS_POINTER: return "alias";
+        case COPY_POINTER: return "copy";
+        case NOT_ALLOWED_POINTER: return "not-allowed";
+        case NO_DROP_POINTER: return "no-drop";
+        case GRAB_POINTER: return "grab";
+        case GRABBING_POINTER: return "grabbing";
+        default: return NULL;
+    }
+}
+
 static void
 set_glfw_mouse_pointer_shape_in_window(GLFWwindow *w, MouseShape type) {
+    OSWindow *osw = os_window_for_glfw_window(w);
+    if (osw && osw->gtk_window) {
+        const char *name = gtk_cursor_name(type);
+        if (name) {
+            PyObject *ret = PyObject_CallMethod(osw->gtk_window, "set_pointer_shape", "s", name);
+            if (!ret) PyErr_Print();
+            else Py_DECREF(ret);
+        }
+        return;
+    }
     switch (type) {
         case INVALID_POINTER: break;
         /* start enum to glfw (auto generated by gen-key-constants.py do not edit) */
@@ -1681,6 +1919,17 @@ set_os_window_icon(PyObject UNUSED *self, PyObject *args) {
 
 void *
 make_os_window_context_current(OSWindow *w) {
+    if (w->gtk_window) {
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "make_gl_current", NULL);
+        if (!ret) PyErr_Print();
+        else {
+            Py_DECREF(ret);
+            GLint output_fbo = 0;
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &output_fbo);
+            set_framebuffer_to_use_for_output((unsigned)MAX(0, output_fbo));
+        }
+        return NULL;
+    }
     GLFWwindow *current_context = glfwGetCurrentContext();
     if (w->handle != current_context) {
         glfwMakeContextCurrent(w->handle);
@@ -1691,22 +1940,48 @@ make_os_window_context_current(OSWindow *w) {
 
 void
 get_os_window_size(OSWindow *os_window, int *w, int *h, int *fw, int *fh) {
+    if (os_window->gtk_window) {
+        PyObject *size = PyObject_CallMethod(os_window->gtk_window, "get_size", NULL);
+        if (size && PyTuple_Check(size) && PyTuple_GET_SIZE(size) == 4) {
+            if (w) *w = (int)PyLong_AsLong(PyTuple_GET_ITEM(size, 0));
+            if (h) *h = (int)PyLong_AsLong(PyTuple_GET_ITEM(size, 1));
+            if (fw) *fw = (int)PyLong_AsLong(PyTuple_GET_ITEM(size, 2));
+            if (fh) *fh = (int)PyLong_AsLong(PyTuple_GET_ITEM(size, 3));
+            if (PyErr_Occurred()) PyErr_Print();
+            Py_DECREF(size);
+            return;
+        }
+        Py_XDECREF(size);
+        if (PyErr_Occurred()) PyErr_Print();
+    }
     if (w && h) glfwGetWindowSize(os_window->handle, w, h);
     if (fw && fh) glfwGetFramebufferSize(os_window->handle, fw, fh);
 }
 
 void
 set_os_window_size(OSWindow *os_window, int x, int y) {
+    if (os_window->gtk_window) {
+        PyObject *ret = PyObject_CallMethod(os_window->gtk_window, "set_size", "ii", x, y);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+        return;
+    }
     glfwSetWindowSize(os_window->handle, x, y);
 }
 
 void
 get_os_window_pos(OSWindow *os_window, int *x, int *y) {
+    if (os_window->gtk_window) {
+        if (x) *x = 0;
+        if (y) *y = 0;
+        return;
+    }
     glfwGetWindowPos(os_window->handle, x, y);
 }
 
 void
 set_os_window_pos(OSWindow *os_window, int x, int y) {
+    if (os_window->gtk_window) return;
     glfwSetWindowPos(os_window->handle, x, y);
 }
 
@@ -1745,11 +2020,43 @@ get_window_dpi(GLFWwindow *w, double *x, double *y) {
 
 void
 get_os_window_content_scale(OSWindow *os_window, double *xdpi, double *ydpi, float *xscale, float *yscale) {
+    if (os_window->gtk_window) {
+        PyObject *ret = PyObject_CallMethod(os_window->gtk_window, "get_scale", NULL);
+        float scale = ret ? (float)PyFloat_AsDouble(ret) : 1.f;
+        Py_XDECREF(ret);
+        if (PyErr_Occurred()) PyErr_Print();
+        if (scale < 0.0001f || scale >= 24.f) scale = 1.f;
+        *xscale = *yscale = scale;
+        dpi_from_scale(scale, scale, xdpi, ydpi);
+        return;
+    }
     get_window_content_scale(os_window->handle, xscale, yscale, xdpi, ydpi);
 }
 
 static bool
 do_toggle_fullscreen(OSWindow *w, unsigned int flags, bool restore_sizes) {
+    if (w->gtk_window) {
+        const bool entering = !is_os_window_fullscreen(w);
+        if (entering) {
+            get_os_window_size(w, &w->before_fullscreen.w, &w->before_fullscreen.h, NULL, NULL);
+            w->before_fullscreen.x = w->before_fullscreen.y = 0;
+            w->before_fullscreen.was_maximized = is_os_window_maximized(w);
+            w->before_fullscreen.is_set = true;
+        }
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "toggle_fullscreen", NULL);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+        if (!entering && w->before_fullscreen.is_set) {
+            if (restore_sizes) set_os_window_size(w, w->before_fullscreen.w, w->before_fullscreen.h);
+            if (restore_sizes && w->before_fullscreen.was_maximized) {
+                PyObject *maximized = PyObject_CallMethod(w->gtk_window, "maximize", NULL);
+                if (!maximized) PyErr_Print();
+                else Py_DECREF(maximized);
+            }
+            w->before_fullscreen.is_set = false;
+        }
+        return true;
+    }
     int width, height, x, y;
     glfwGetWindowSize(w->handle, &width, &height);
     if (!global_state.is_wayland) glfwGetWindowPos(w->handle, &x, &y);
@@ -1818,6 +2125,13 @@ bool
 is_os_window_fullscreen(OSWindow *w) {
     unsigned int flags = 0;
     if (!w || !w->handle) return false;
+    if (w->gtk_window) {
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "is_fullscreen", NULL);
+        bool ans = ret ? PyObject_IsTrue(ret) : false;
+        Py_XDECREF(ret);
+        if (PyErr_Occurred()) PyErr_Print();
+        return ans;
+    }
     if (w->is_layer_shell) {
         const GLFWLayerShellConfig *c = glfwGetLayerShellConfig(w->handle);
         return c && c->was_toggled_to_fullscreen;
@@ -1828,10 +2142,30 @@ is_os_window_fullscreen(OSWindow *w) {
     return glfwIsFullscreen(w->handle, flags);
 }
 
+bool
+is_os_window_maximized(OSWindow *w) {
+    if (!w || !w->handle) return false;
+    if (w->gtk_window) {
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "is_maximized", NULL);
+        bool ans = ret ? PyObject_IsTrue(ret) : false;
+        Py_XDECREF(ret);
+        if (PyErr_Occurred()) PyErr_Print();
+        return ans;
+    }
+    return glfwGetWindowAttrib(w->handle, GLFW_MAXIMIZED) != 0;
+}
+
 static bool
 toggle_maximized_for_os_window(OSWindow *w) {
     bool maximized = false;
     if (w && w->handle && !w->is_layer_shell) {
+        if (w->gtk_window) {
+            PyObject *ret = PyObject_CallMethod(w->gtk_window, "toggle_maximized", NULL);
+            maximized = ret ? PyObject_IsTrue(ret) : false;
+            Py_XDECREF(ret);
+            if (PyErr_Occurred()) PyErr_Print();
+            return maximized;
+        }
         if (glfwGetWindowAttrib(w->handle, GLFW_MAXIMIZED)) {
             glfwRestoreWindow(w->handle);
         } else {
@@ -1845,6 +2179,23 @@ toggle_maximized_for_os_window(OSWindow *w) {
 static void
 change_state_for_os_window(OSWindow *w, int state) {
     if (!w || !w->handle) return;
+    if (w->gtk_window) {
+        const char *method = NULL;
+        switch (state) {
+            case WINDOW_MAXIMIZED: method = "maximize"; break;
+            case WINDOW_MINIMIZED: method = "minimize"; break;
+            case WINDOW_FULLSCREEN: method = "fullscreen"; break;
+            case WINDOW_NORMAL: method = "restore"; break;
+            case WINDOW_HIDDEN: method = "hide"; break;
+        }
+        if (method) {
+            PyObject *ret = PyObject_CallMethod(w->gtk_window, method, NULL);
+            if (!ret) PyErr_Print();
+            else Py_DECREF(ret);
+        }
+        update_os_window_visibility_reports(w);
+        return;
+    }
     switch (state) {
         case WINDOW_MAXIMIZED:
             if (!w->is_layer_shell) glfwMaximizeWindow(w->handle);
@@ -1991,9 +2342,14 @@ set_os_window_chrome(OSWindow *w) {
     init_window_chrome_state(&new_state, bg, effective_os_window_alpha(w));
     if (memcmp(&new_state, &w->last_window_chrome, sizeof(WindowChromeState)) != 0) {
         int width, height;
-        glfwGetWindowSize(w->handle, &width, &height);
+        if (w->gtk_window) get_os_window_size(w, &width, &height, NULL, NULL);
+        else glfwGetWindowSize(w->handle, &width, &height);
         bool window_decorations_changed = new_state.hide_window_decorations != w->last_window_chrome.hide_window_decorations;
-        apply_window_chrome_state(w->handle, new_state, width, height, window_decorations_changed);
+        if (w->gtk_window) {
+            PyObject *ret = PyObject_CallMethod(w->gtk_window, "apply_chrome_mode", "i", new_state.hide_window_decorations);
+            if (!ret) PyErr_Print();
+            else Py_DECREF(ret);
+        } else apply_window_chrome_state(w->handle, new_state, width, height, window_decorations_changed);
         w->last_window_chrome = new_state;
     }
 }
@@ -2213,6 +2569,7 @@ set_window_creation_error(bool is_panel) {
 
 static PyObject *
 create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
+    RAII_PyObject(gtk_window_obj, NULL);
     int x = INT_MIN, y = INT_MIN, window_state = WINDOW_NORMAL, disallow_override_title = 0;
     char *title, *wm_class_class, *wm_class_name;
     PyObject *optional_window_state = NULL, *load_programs = NULL, *get_window_size, *pre_show_callback, *optional_x = NULL, *optional_y = NULL,
@@ -2314,7 +2671,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         glfwSetApplicationWillFinishLaunching(cocoa_application_lifecycle_event);
 #endif
     }
-    if (OPT(hide_window_decorations) & 1) glfwWindowHint(GLFW_DECORATED, false);
+    if (is_gtk_backend_enabled() || (OPT(hide_window_decorations) & 1)) glfwWindowHint(GLFW_DECORATED, false);
 
     const bool set_blur = OPT(background_blur) > 0 && OPT(background_opacity) < 1.f;
     glfwWindowHint(GLFW_BLUR_RADIUS, set_blur ? OPT(background_blur) : 0);
@@ -2341,7 +2698,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     // used, so start with window visible unless hidden window requested.
     GLFWwindow *common_context = global_state.num_os_windows ? global_state.os_windows[0].handle : NULL;
     GLFWwindow *temp_window = NULL;
-    glfwWindowHint(GLFW_VISIBLE, window_state != WINDOW_HIDDEN && global_state.is_wayland);
+    glfwWindowHint(GLFW_VISIBLE, !is_gtk_backend_enabled() && window_state != WINDOW_HIDDEN && global_state.is_wayland);
     float xscale, yscale;
     double xdpi, ydpi;
     if (global_state.is_wayland) {
@@ -2425,24 +2782,56 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     // Set titlebar-only mode before the window becomes visible
     if (global_state.is_wayland && (OPT(hide_window_decorations) & 2) && glfwWaylandSetTitlebarHidden) { glfwWaylandSetTitlebarHidden(glfw_window, true); }
     glfwMakeContextCurrent(glfw_window);
-    if (is_first_window) initialize_gpu();
+    if (is_first_window && !is_gtk_backend_enabled()) initialize_gpu();
     bool is_semi_transparent = glfwGetWindowAttrib(glfw_window, GLFW_TRANSPARENT_FRAMEBUFFER);
-    // blank the window once so that there is no initial flash of color
-    // changing, in case the background color is not black
-    blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
-    apply_swap_interval(-1);
-    // On Wayland the initial swap is allowed only after the first XDG configure event
-    if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);
-    glfwSetInputMode(glfw_window, GLFW_LOCK_KEY_MODS, true);
-    PyObject *pret = PyObject_CallFunction(pre_show_callback, "N", native_window_handle(glfw_window));
-    if (pret == NULL) return NULL;
-    Py_DECREF(pret);
-    if (x != INT_MIN && y != INT_MIN) glfwSetWindowPos(glfw_window, x, y);
-    if (!global_state.is_apple && !global_state.is_wayland && window_state != WINDOW_HIDDEN) glfwShowWindow(glfw_window, false);
+    if (!is_gtk_backend_enabled()) {
+        // blank the window once so that there is no initial flash of color
+        // changing, in case the background color is not black
+        blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
+        apply_swap_interval(-1);
+        // On Wayland the initial swap is allowed only after the first XDG configure event
+        if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);
+        glfwSetInputMode(glfw_window, GLFW_LOCK_KEY_MODS, true);
+    }
+    gtk_window_obj = PyObject_CallFunction(pre_show_callback, "N", native_window_handle(glfw_window));
+    if (gtk_window_obj == NULL) return NULL;
+    if (is_gtk_backend_enabled()) {
+        if (gtk_window_obj == Py_None || !PyObject_HasAttrString(gtk_window_obj, "make_gl_current")) {
+            PyErr_SetString(PyExc_RuntimeError, "The GTK window callback did not return a GTK window");
+            return NULL;
+        }
+        PyObject *tmp = PyObject_CallMethod(gtk_window_obj, "set_size", "ii", width, height);
+        if (!tmp) return NULL;
+        Py_DECREF(tmp);
+        tmp = PyObject_CallMethod(gtk_window_obj, "realize_gl_area", "p", window_state != WINDOW_HIDDEN);
+        if (!tmp) return NULL;
+        Py_DECREF(tmp);
+        tmp = PyObject_CallMethod(gtk_window_obj, "make_gl_current", NULL);
+        if (!tmp) return NULL;
+        Py_DECREF(tmp);
+        if (is_first_window) initialize_gpu();
+        GLint output_fbo = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &output_fbo);
+        set_framebuffer_to_use_for_output((unsigned)MAX(0, output_fbo));
+        // GTK's first frame starts transparent. Clear it with kitty's configured background before
+        // loading shaders and terminal contents.
+        blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
+    } else {
+        Py_CLEAR(gtk_window_obj);
+    }
+    if (x != INT_MIN && y != INT_MIN && !is_gtk_backend_enabled()) glfwSetWindowPos(glfw_window, x, y);
+    if (!is_gtk_backend_enabled() && !global_state.is_apple && !global_state.is_wayland && window_state != WINDOW_HIDDEN) glfwShowWindow(glfw_window, false);
     if (global_state.is_wayland || global_state.is_apple) {
         float n_xscale, n_yscale;
         double n_xdpi, n_ydpi;
-        get_window_content_scale(glfw_window, &n_xscale, &n_yscale, &n_xdpi, &n_ydpi);
+        if (is_gtk_backend_enabled()) {
+            PyObject *scale = PyObject_CallMethod(gtk_window_obj, "get_scale", NULL);
+            if (!scale) return NULL;
+            n_xscale = n_yscale = (float)PyFloat_AsDouble(scale);
+            Py_DECREF(scale);
+            if (PyErr_Occurred()) return NULL;
+            dpi_from_scale(n_xscale, n_yscale, &n_xdpi, &n_ydpi);
+        } else get_window_content_scale(glfw_window, &n_xscale, &n_yscale, &n_xdpi, &n_ydpi);
         if (n_xdpi != xdpi || n_ydpi != ydpi || lsc) {
             // this can happen if the window is moved by the OS to a different monitor when shown or with fractional scales on Wayland
             // it can also happen with layer shell windows if the callback is
@@ -2465,6 +2854,12 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     bind_shader_globals_to_current_context();
     OSWindow *w = add_os_window();
     w->handle = glfw_window;
+    if (gtk_window_obj) {
+        w->gtk_window = gtk_window_obj;
+        gtk_window_obj = NULL;
+        w->gtk_scale = 1;
+        w->gtk_window_mapped = true;
+    }
     w->disallow_title_changes = disallow_override_title;
     if (lsc != NULL) {
         w->is_layer_shell = true;
@@ -2529,7 +2924,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     init_window_chrome_state(&w->last_window_chrome, OPT(background), effective_os_window_alpha(w));
     if (w->is_layer_shell) {
         if (global_state.is_apple) set_layer_shell_config_for(w, lsc);
-    } else apply_window_chrome_state(w->handle, w->last_window_chrome, width, height, global_state.is_apple ? OPT(hide_window_decorations) != 0 : false);
+    } else if (!w->gtk_window) apply_window_chrome_state(w->handle, w->last_window_chrome, width, height, global_state.is_apple ? OPT(hide_window_decorations) != 0 : false);
 #ifdef __APPLE__
     if (!w->is_layer_shell) glfwCocoaSetWindowLevel(w->handle, OPT(macos_ns_window_layer));
 #endif
@@ -2612,6 +3007,14 @@ destroy_os_window(OSWindow *w) {
 void
 focus_os_window(OSWindow *w, bool also_raise, const char *activation_token) {
     if (w->handle) {
+        if (w->gtk_window) {
+            PyObject *ret = PyObject_CallMethod(w->gtk_window, "present", NULL);
+            if (!ret) PyErr_Print();
+            else Py_DECREF(ret);
+            w->gtk_window_mapped = true;
+            request_tick_callback();
+            return;
+        }
 #ifdef __APPLE__
         if (!also_raise) cocoa_focus_window(glfwGetCocoaWindow(w->handle));
         else glfwFocusWindow(w->handle);
@@ -3039,7 +3442,7 @@ request_attention(PyObject *self UNUSED, PyObject *args) {
     unsigned long long os_window_id;
     if (!PyArg_ParseTuple(args, "K", &os_window_id)) return NULL;
     OSWindow *w = os_window_for_id(os_window_id);
-    if (w && w->handle) glfwRequestWindowAttention(w->handle);
+    if (w && w->handle && !w->gtk_window) glfwRequestWindowAttention(w->handle);
     Py_RETURN_NONE;
 }
 
@@ -3133,39 +3536,64 @@ request_window_attention(id_type kitty_window_id, bool audio_bell) {
     OSWindow *w = os_window_for_kitty_window(kitty_window_id);
     if (w) {
         if (audio_bell) ring_audio_bell(w);
-        if (OPT(window_alert_on_bell)) glfwRequestWindowAttention(w->handle);
+        if (OPT(window_alert_on_bell) && !w->gtk_window) glfwRequestWindowAttention(w->handle);
 #ifdef __APPLE__
         if (OPT(macos_dock_badge_on_bell)) cocoa_set_dock_badge("!");
 #endif
-        glfwPostEmptyEvent();
+        request_tick_callback();
     }
 }
 
 void
 set_os_window_title(OSWindow *w, const char *title) {
     if (!title) {
+        if (w->gtk_window) return;
         if (global_state.is_wayland) glfwWaylandRedrawCSDWindowTitle(w->handle);
         return;
     }
     static char buf[2048];
     strip_csi_(title, buf, arraysz(buf));
+    if (w->gtk_window) {
+        PyObject *text = PyUnicode_FromString(buf);
+        if (!text) return;
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "set_title", "O", text);
+        Py_DECREF(text);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+        return;
+    }
     glfwSetWindowTitle(w->handle, buf);
 }
 
 void
 hide_mouse(OSWindow *w) {
+    if (w->gtk_window) {
+        w->gtk_pointer_hidden = true;
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "hide_pointer", NULL);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+        w->mouse_activate_deadline = -1;
+        return;
+    }
     glfwSetInputMode(w->handle, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
     w->mouse_activate_deadline = -1;
 }
 
 bool
 is_mouse_hidden(OSWindow *w) {
+    if (w->gtk_window) return w->gtk_pointer_hidden;
     return w->handle && glfwGetInputMode(w->handle, GLFW_CURSOR) == GLFW_CURSOR_HIDDEN;
 }
 
 
 void
 swap_window_buffers(OSWindow *os_window) {
+    if (os_window->gtk_window) {
+        os_window->keep_rendering_till_swap = 0;
+        os_window->render_state = RENDER_FRAME_READY;
+        os_window->last_render_frame_received_at = monotonic();
+        return;
+    }
     if (glfwAreSwapsAllowed(os_window->handle)) {
         glfwSwapBuffers(os_window->handle);
         os_window->keep_rendering_till_swap = 0;
@@ -3174,11 +3602,22 @@ swap_window_buffers(OSWindow *os_window) {
 
 void
 wakeup_main_loop(void) {
-    glfwPostEmptyEvent();
+    if (is_gtk_backend_active()) gtk_backend_wakeup();
+    else glfwPostEmptyEvent();
 }
 
 bool
 is_os_window_potentially_visible(OSWindow *w) {
+    if (w->gtk_window) {
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "is_mapped", NULL);
+        if (ret) {
+            int mapped = PyObject_IsTrue(ret);
+            Py_DECREF(ret);
+            if (mapped >= 0) w->gtk_window_mapped = mapped != 0;
+            else PyErr_Print();
+        } else PyErr_Print();
+        return w->gtk_window_mapped;
+    }
     return (glfwGetWindowAttrib(w->handle, GLFW_ICONIFIED) || !glfwGetWindowAttrib(w->handle, GLFW_VISIBLE) || glfwGetWindowAttrib(w->handle, GLFW_OCCLUDED))
                ? false
                : true;
@@ -3186,6 +3625,7 @@ is_os_window_potentially_visible(OSWindow *w) {
 
 bool
 should_os_window_be_rendered(OSWindow *w) {
+    if (w->gtk_window) return is_os_window_potentially_visible(w);
     return is_os_window_potentially_visible(w) && glfwAreSwapsAllowed(w->handle);
 }
 
@@ -3594,26 +4034,43 @@ glfw_get_keyboard_repeat_interval(PyObject *self UNUSED, PyObject *args UNUSED) 
 
 id_type
 add_main_loop_timer(monotonic_t interval, bool repeats, timer_callback_fun callback, void *callback_data, timer_callback_fun free_callback) {
+    if (is_gtk_backend_active()) return gtk_backend_add_main_loop_timer(interval, repeats, callback, callback_data, free_callback);
     return glfwAddTimer(interval, repeats, callback, callback_data, free_callback);
 }
 
 void
 update_main_loop_timer(id_type timer_id, monotonic_t interval, bool enabled) {
+    if (is_gtk_backend_active()) {
+        gtk_backend_update_main_loop_timer(timer_id, interval, enabled);
+        return;
+    }
     glfwUpdateTimer(timer_id, interval, enabled);
 }
 
 void
 remove_main_loop_timer(id_type timer_id) {
+    if (is_gtk_backend_active()) {
+        gtk_backend_remove_main_loop_timer(timer_id);
+        return;
+    }
     glfwRemoveTimer(timer_id);
 }
 
 void
 run_main_loop(tick_callback_fun cb, void *cb_data) {
+    if (is_gtk_backend_active()) {
+        gtk_backend_run_main_loop(cb, cb_data);
+        return;
+    }
     glfwRunMainLoop(cb, cb_data);
 }
 
 void
 stop_main_loop(void) {
+    if (is_gtk_backend_active()) {
+        gtk_backend_stop_main_loop();
+        return;
+    }
     glfwStopMainLoop();
 }
 
@@ -3731,7 +4188,7 @@ toggle_os_window_visibility(PyObject *self UNUSED, PyObject *args, PyObject *kw)
     if (!PyArg_ParseTupleAndKeywords(args, kw, "K|pp", (char **)kwlist, &wid, &set_visible, &move_to_active_screen)) return NULL;
     OSWindow *w = os_window_for_id(wid);
     if (!w || !w->handle) Py_RETURN_FALSE;
-    bool is_visible = glfwGetWindowAttrib(w->handle, GLFW_VISIBLE) != 0;
+    bool is_visible = w->gtk_window ? is_os_window_potentially_visible(w) : glfwGetWindowAttrib(w->handle, GLFW_VISIBLE) != 0;
     if (set_visible == -1) set_visible = !is_visible;
     else if (set_visible == is_visible) Py_RETURN_FALSE;
     set_os_window_visibility(w, set_visible, move_to_active_screen);
@@ -4075,6 +4532,8 @@ init_glfw(PyObject *m) {
     ADDC(GLFW_RELEASE);
     ADDC(GLFW_PRESS);
     ADDC(GLFW_REPEAT);
+    ADDC(GLFW_IME_COMMIT_TEXT);
+    ADDC(GLFW_IME_PREEDIT_CHANGED);
     ADDC(true);
     ADDC(false);
     ADDC(GLFW_PRIMARY_SELECTION);

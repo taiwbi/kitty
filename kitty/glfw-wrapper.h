@@ -1938,6 +1938,10 @@ typedef int (*glfwInit_func)(monotonic_t, bool*);
 GFW_EXTERN glfwInit_func glfwInit_impl;
 #define glfwInit glfwInit_impl
 
+typedef void (*glfwPollEvents_func)(void);
+GFW_EXTERN glfwPollEvents_func glfwPollEvents_impl;
+#define glfwPollEvents glfwPollEvents_impl
+
 typedef void (*glfwRunMainLoop_func)(GLFWtickcallback, void*);
 GFW_EXTERN glfwRunMainLoop_func glfwRunMainLoop_impl;
 #define glfwRunMainLoop glfwRunMainLoop_impl

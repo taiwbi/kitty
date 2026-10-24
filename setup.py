@@ -765,6 +765,20 @@ def kitty_env(args: Options) -> Env:
     at_least_version('fribidi', 1, 0)
     cflags.extend(pkg_config('libpng', '--cflags-only-I'))
     cflags.extend(pkg_config('lcms2', '--cflags-only-I'))
+    gtk_cflags: List[str] = []
+    gtk_libs: List[str] = []
+    if is_linux and subprocess.run([PKGCONFIG, '--exists', 'gtk4', 'libadwaita-1'], check=False).returncode == 0:
+        gtk_version = pkg_version('gtk4')
+        adwaita_version = pkg_version('libadwaita-1')
+        if gtk_version >= (4, 0) and adwaita_version >= (1, 4):
+            gtk_cflags.extend(pkg_config('gtk4', '--cflags-only-I'))
+            gtk_cflags.extend(pkg_config('libadwaita-1', '--cflags-only-I'))
+            gtk_libs.extend(pkg_config('gtk4', '--libs'))
+            gtk_libs.extend(pkg_config('libadwaita-1', '--libs'))
+            cppflags.append('-DKITTY_WITH_GTK')
+        else:
+            print(error('GTK backend disabled: GTK 4 and libadwaita 1.4 or newer are required'), file=sys.stderr)
+    cflags.extend(gtk_cflags)
     cflags.extend(xxhash[0])
     # simde doesnt come with pkg-config files but some Linux distros add
     # them and on macOS when building with homebrew it is required
@@ -799,6 +813,7 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('cairo-fc', '--cflags-only-I'))
         platform_libs = []
         platform_libs.extend(pkg_config('cairo-fc', '--libs'))
+    platform_libs.extend(gtk_libs)
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
     platform_libs.extend(pkg_config('harfbuzz', '--libs'))
     cflags.extend(pkg_config('fribidi', '--cflags-only-I'))

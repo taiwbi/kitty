@@ -83,6 +83,7 @@ typedef struct Options {
         bool on_cross, on_drop;
     } focus_follows_mouse;
     unsigned int hide_window_decorations;
+    bool linux_use_gtk_window;
     bool macos_hide_from_tasks, macos_quit_when_last_window_closed, macos_window_resizable, macos_traditional_fullscreen,
         macos_fullscreen_ignore_safe_area_insets, macos_use_physical_screen_frame;
     unsigned int macos_option_as_alt;
@@ -537,6 +538,10 @@ typedef enum {
 
 typedef struct OSWindow {
     void *handle;
+    PyObject *gtk_window;
+    unsigned int gtk_framebuffer_id;
+    int gtk_scale;
+    bool gtk_window_mapped, gtk_pointer_hidden;
     id_type id;
     monotonic_t created_at;
     struct {
@@ -735,6 +740,22 @@ void free_vao(ssize_t vao_idx);
 void cleanup_shader_resources_on_terminate(void);
 bool remove_os_window(id_type os_window_id);
 void *make_os_window_context_current(OSWindow *w);
+PyObject *gtk_backend_available(PyObject *, PyObject *);
+PyObject *gtk_backend_initialize(PyObject *, PyObject *);
+PyObject *gtk_backend_set_enabled(PyObject *, PyObject *);
+PyObject *gtk_backend_activate(PyObject *, PyObject *);
+PyObject *gtk_backend_register_window(PyObject *, PyObject *);
+PyObject *gtk_backend_is_active(PyObject *, PyObject *);
+PyObject *gtk_backend_main_context_iteration(PyObject *, PyObject *);
+PyObject *gtk_input_key(PyObject *, PyObject *);
+PyObject *gtk_input_focus(PyObject *, PyObject *);
+PyObject *gtk_input_pointer(PyObject *, PyObject *);
+PyObject *gtk_input_mouse_button(PyObject *, PyObject *);
+PyObject *gtk_input_scroll(PyObject *, PyObject *);
+PyObject *gtk_input_resize(PyObject *, PyObject *);
+PyObject *gtk_input_close(PyObject *, PyObject *);
+PyObject *gtk_input_ime_cursor(PyObject *, PyObject *);
+PyObject *gtk_render_os_window(PyObject *, PyObject *);
 void set_os_window_size(OSWindow *os_window, int x, int y);
 void get_os_window_size(OSWindow *os_window, int *w, int *h, int *fw, int *fh);
 void get_os_window_pos(OSWindow *os_window, int *x, int *y);
@@ -787,6 +808,14 @@ void request_frame_render(OSWindow *w);
 void request_tick_callback(void);
 typedef void (*timer_callback_fun)(id_type, void *);
 typedef void (*tick_callback_fun)(void *);
+bool is_gtk_backend_active(void);
+bool is_gtk_backend_enabled(void);
+void gtk_backend_wakeup(void);
+id_type gtk_backend_add_main_loop_timer(monotonic_t interval, bool repeats, timer_callback_fun callback, void *callback_data, timer_callback_fun free_callback);
+void gtk_backend_update_main_loop_timer(id_type timer_id, monotonic_t interval, bool enabled);
+void gtk_backend_remove_main_loop_timer(id_type timer_id);
+void gtk_backend_run_main_loop(tick_callback_fun callback, void *callback_data);
+void gtk_backend_stop_main_loop(void);
 id_type add_main_loop_timer(monotonic_t interval, bool repeats, timer_callback_fun callback, void *callback_data, timer_callback_fun free_callback);
 void remove_main_loop_timer(id_type timer_id);
 void update_main_loop_timer(id_type timer_id, monotonic_t interval, bool enabled);
@@ -809,6 +838,7 @@ void get_platform_dependent_config_values(void *glfw_window);
 bool draw_window_title(double, double, const char *text, color_type fg, color_type bg, uint8_t *output_buf, size_t width, size_t height, size_t *actual_width);
 uint8_t *draw_single_ascii_char(const char ch, size_t *result_width, size_t *result_height);
 bool is_os_window_fullscreen(OSWindow *);
+bool is_os_window_maximized(OSWindow *);
 void update_ime_focus(OSWindow *osw, bool focused);
 void update_ime_position(Window *w, Screen *screen);
 bool update_ime_position_for_window(id_type window_id, bool force, int update_focus);

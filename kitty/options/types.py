@@ -389,6 +389,7 @@ option_names = (
     'kitty_mod',
     'linux_bell_theme',
     'linux_display_server',
+    'linux_use_gtk_window',
     'listen_on',
     'macos_colorspace',
     'macos_custom_beam_cursor',
@@ -613,6 +614,7 @@ class Options:
     kitty_mod: int = 5
     linux_bell_theme: str = '__custom'
     linux_display_server: choices_for_linux_display_server = 'auto'
+    linux_use_gtk_window: bool = False
     listen_on: str = 'none'
     macos_colorspace: choices_for_macos_colorspace = 'srgb'
     macos_custom_beam_cursor: bool = False

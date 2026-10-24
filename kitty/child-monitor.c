@@ -1138,7 +1138,10 @@ render_prepared_os_window(
     os_window->last_active_window_id = active_window_id;
     os_window->focused_at_last_render = os_window->is_focused;
     if (os_window->redraw_count) os_window->redraw_count--;
-    if (USE_RENDER_FRAMES) request_frame_render(os_window);
+    // GTK renders into a GtkGLArea from GTK's own frame callback. Asking the
+    // hidden GLFW window for a compositor frame leaves its render state
+    // REQUESTED forever, preventing the GLArea frame from ever drawing.
+    if (USE_RENDER_FRAMES && !os_window->gtk_window) request_frame_render(os_window);
 #undef WD
 #undef TD
 }
@@ -1164,7 +1167,10 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
         if (w->is_focused) change_menubar_title(w->window_title);
         return false;
     }
-    if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
+    // GtkGLArea's render signal is already synchronized to GTK's frame clock.
+    // The backing GLFW window is hidden, so its frame callback cannot gate this
+    // path; rendering is invoked by the GLArea after it is queued.
+    if (!w->gtk_window && !w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
         if (w->render_state == RENDER_FRAME_NOT_REQUESTED || no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll))) request_frame_render(w);
         if (w->id != global_state.thumbnail_callback.os_window) {
             // dont respect render frames soon after a resize on Wayland as they cause flicker because
@@ -1220,6 +1226,10 @@ render(monotonic_t now, bool input_read) {
         // turn that parses them paints again because it ignores repaint_delay.
         if (w->input_held && w->id != global_state.thumbnail_callback.os_window) {
             if (scan_for_animated_images) global_state.check_for_active_animated_images = true;
+            continue;
+        }
+        if (is_gtk_backend_active() && w->gtk_window) {
+            if (should_os_window_be_rendered(w)) call_boss(queue_gtk_render, "K", w->id);
             continue;
         }
         if (!render_os_window(w, now, scan_for_animated_images)) {
@@ -1457,7 +1467,7 @@ close_os_window(ChildMonitor *self, OSWindow *os_window) {
         if (os_window->before_fullscreen.is_set && is_os_window_fullscreen(os_window)) {
             was_maximized = os_window->before_fullscreen.was_maximized;
         } else {
-            was_maximized = glfwGetWindowAttrib(os_window->handle, GLFW_MAXIMIZED) != 0;
+            was_maximized = is_os_window_maximized(os_window);
         }
     }
     destroy_os_window(os_window);

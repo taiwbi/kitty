@@ -1100,6 +1100,9 @@ class Parser:
 
     choices_for_linux_display_server = frozenset(('auto', 'wayland', 'x11'))
 
+    def linux_use_gtk_window(self, val: str, ans: dict[str, typing.Any]) -> None:
+        ans['linux_use_gtk_window'] = to_bool(val)
+
     def listen_on(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['listen_on'] = str(val)
 

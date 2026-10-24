@@ -432,6 +432,7 @@ class Boss:
         # A list of events received so far that are potentially part of a sequence keybinding.
         self.cached_values = cached_values
         self.os_window_map: dict[int, TabManager] = {}
+        self.gtk_windows: dict[int, Any] = {}
         self.os_window_death_actions: dict[int, Callable[[], None]] = {}
         self.thumbnail_request_queue: deque[PendingThumbnailRequest] = deque()
         self.cursor_blinking = True
@@ -508,10 +509,34 @@ class Boss:
             wtitle = override_title or getattr(startup_session, 'os_window_title', None) or self.args.title
             window_state = window_state or getattr(startup_session, 'os_window_state', None)
             wstate = parse_os_window_state(window_state) if window_state is not None else None
+            gtk_window_holder: dict[str, Any] = {}
             with startup_notification_handler(do_notify=startup_id is not None, startup_id=startup_id) as pre_show_callback:
+
+                def show_window(window_handle: int) -> Any:
+                    startup_window = pre_show_callback(window_handle)
+                    from .fast_data_types import gtk_backend_is_active
+
+                    if not gtk_backend_is_active():
+                        return startup_window
+                    from .gtk_window import GtkKittyEvents, GtkKittyWindow
+
+                    gtk_window = GtkKittyWindow(
+                        wtitle or appname,
+                        (960, 640),
+                        events=GtkKittyEvents(),
+                        on_new_tab=lambda: None,
+                        on_select_tab=lambda _: None,
+                        on_close_tab=lambda _: None,
+                        on_reorder_tabs=lambda _: None,
+                    )
+                    gtk_window.apply_chrome_mode(get_options().hide_window_decorations)
+                    gtk_window_holder['window'] = gtk_window
+                    return gtk_window
+
+                get_size = initial_window_size_func(size_data, self.cached_values)
                 os_window_id = create_os_window(
-                    initial_window_size_func(size_data, self.cached_values),
-                    pre_show_callback,
+                    get_size,
+                    show_window,
                     wtitle or appname,
                     wname,
                     wclass,
@@ -520,11 +545,16 @@ class Boss:
                     x=x,
                     y=y,
                 )
+                if gtk_window := gtk_window_holder.get('window'):
+                    self.register_gtk_window(os_window_id, gtk_window)
         else:
             wname = self.args.name or self.args.cls or appname
             wclass = self.args.cls or appname
         tm = TabManager(os_window_id, self.args, wclass, wname, startup_session)
         self.os_window_map[os_window_id] = tm
+        if gtk_window := self.gtk_windows.get(os_window_id):
+            tm.mark_tab_bar_dirty()
+            tm.update_tab_bar_data()
         return os_window_id
 
     def add_os_panel(self, cfg: LayerShellConfig, wclass: str | None = appname, wname: str | None = appname) -> int:
@@ -2150,6 +2180,66 @@ class Boss:
         if tm is not None:
             tm.update_tab_bar_data()
 
+    def register_gtk_window(self, os_window_id: int, window: Any) -> None:
+        from .fast_data_types import gtk_backend_register_window
+
+        window.set_tab_actions(
+            on_new_tab=lambda: self.gtk_new_tab(os_window_id),
+            on_select_tab=lambda tab_id: self.gtk_select_tab(os_window_id, tab_id),
+            on_close_tab=lambda tab_id: self.gtk_close_tab(os_window_id, tab_id),
+            on_reorder_tabs=lambda tab_ids: self.gtk_reorder_tabs(os_window_id, tab_ids),
+        )
+        gtk_backend_register_window(os_window_id, window)
+        self.gtk_windows[os_window_id] = window
+        if tm := self.os_window_map.get(os_window_id):
+            tm.mark_tab_bar_dirty()
+            tm.update_tab_bar_data()
+
+    def queue_gtk_render(self, os_window_id: int) -> None:
+        if window := self.gtk_windows.get(os_window_id):
+            window.queue_render()
+
+    def create_gtk_window(self, os_window_id: int, title: str, size: tuple[int, int], events: Any) -> Any:
+        from .gtk_window import GtkKittyWindow
+
+        window = GtkKittyWindow(
+            title,
+            size,
+            events=events,
+            on_new_tab=lambda: self.gtk_new_tab(os_window_id),
+            on_select_tab=lambda tab_id: self.gtk_select_tab(os_window_id, tab_id),
+            on_close_tab=lambda tab_id: self.gtk_close_tab(os_window_id, tab_id),
+            on_reorder_tabs=lambda tab_ids: self.gtk_reorder_tabs(os_window_id, tab_ids),
+        )
+        self.register_gtk_window(os_window_id, window)
+        window.present()
+        return window
+
+    def unregister_gtk_window(self, os_window_id: int) -> None:
+        self.gtk_windows.pop(os_window_id, None)
+
+    def gtk_new_tab(self, os_window_id: int) -> None:
+        if tm := self.os_window_map.get(os_window_id):
+            tm.new_tab()
+        if window := self.gtk_windows.get(os_window_id):
+            window.gl_area.grab_focus()
+
+    def gtk_select_tab(self, os_window_id: int, tab_id: int) -> None:
+        if (tm := self.os_window_map.get(os_window_id)) and (tab := tm.tab_for_id(tab_id)) is not None:
+            tm.set_active_tab(tab)
+        if window := self.gtk_windows.get(os_window_id):
+            window.gl_area.grab_focus()
+
+    def gtk_close_tab(self, os_window_id: int, tab_id: int) -> None:
+        if (tm := self.os_window_map.get(os_window_id)) and (tab := tm.tab_for_id(tab_id)) is not None:
+            self.confirm_tab_close(tab)
+        if window := self.gtk_windows.get(os_window_id):
+            window.gl_area.grab_focus()
+
+    def gtk_reorder_tabs(self, os_window_id: int, tab_ids: Sequence[int]) -> None:
+        if tm := self.os_window_map.get(os_window_id):
+            tm.apply_tab_ordering(tab_ids)
+
     def _reset_drop_previews(self, restore_tab_drag_focus_for: TabManager | None = None) -> None:
         "Clear drag UI state and restore pre-hover focus after a same-window tab reorder"
         self._update_drag_over(None)
@@ -2429,6 +2519,7 @@ class Boss:
     def on_os_window_closed(
         self, os_window_id: int, x: int, y: int, viewport_width: int, viewport_height: int, was_maximized: bool, is_layer_shell: bool
     ) -> None:
+        self.gtk_windows.pop(os_window_id, None)
         tm = self.os_window_map.pop(os_window_id, None)
         opts = get_options()
         if not is_layer_shell:

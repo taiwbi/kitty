@@ -592,6 +592,12 @@ destroy_os_window_item(OSWindow *w) {
     if (w->persist_fbo_id) free_framebuffer(&w->persist_fbo_id);
     free(w->pointer_map.data);
     zero_at_ptr(&w->pointer_map);
+    if (w->gtk_window) {
+        PyObject *ret = PyObject_CallMethod(w->gtk_window, "close", NULL);
+        if (!ret) PyErr_Print();
+        else Py_DECREF(ret);
+        Py_CLEAR(w->gtk_window);
+    }
 }
 
 bool
@@ -2118,6 +2124,22 @@ static PyMethodDef module_methods[] = {
     MW(create_mock_window, METH_VARARGS),
     MW(destroy_global_data, METH_NOARGS),
     MW(wakeup_main_loop, METH_NOARGS),
+    M(gtk_backend_available, METH_NOARGS),
+    M(gtk_backend_initialize, METH_NOARGS),
+    M(gtk_backend_set_enabled, METH_VARARGS),
+    M(gtk_backend_activate, METH_NOARGS),
+    M(gtk_backend_register_window, METH_VARARGS),
+    M(gtk_backend_is_active, METH_NOARGS),
+    M(gtk_backend_main_context_iteration, METH_VARARGS),
+    M(gtk_input_key, METH_VARARGS),
+    M(gtk_input_focus, METH_VARARGS),
+    M(gtk_input_pointer, METH_VARARGS),
+    M(gtk_input_mouse_button, METH_VARARGS),
+    M(gtk_input_scroll, METH_VARARGS),
+    M(gtk_input_resize, METH_VARARGS),
+    M(gtk_input_close, METH_VARARGS),
+    M(gtk_input_ime_cursor, METH_VARARGS),
+    M(gtk_render_os_window, METH_VARARGS),
 
     {NULL, NULL, 0, NULL} /* Sentinel */
 };

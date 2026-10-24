@@ -1597,11 +1597,22 @@ class TabManager:  # {{{
 
     def mark_tab_bar_dirty(self) -> None:
         should_be_shown = not self.tab_bar_hidden and self.tab_bar_should_be_visible
-        mark_tab_bar_dirty(self.os_window_id, should_be_shown)
+        boss = get_boss()
+        gtk_window = getattr(boss, 'gtk_windows', {}).get(self.os_window_id)
+        if gtk_window is None:
+            mark_tab_bar_dirty(self.os_window_id, should_be_shown)
+        else:
+            # The GTK headerbar owns the row; the kitty OpenGL tab-bar renderer
+            # must not reserve or draw a second row in the terminal surface.
+            # Keep the headerbar visible with one tab so its new-tab button is
+            # available immediately, as it is in GNOME tabbed applications.
+            mark_tab_bar_dirty(self.os_window_id, False)
+            gtk_window.apply_chrome_mode(get_options().hide_window_decorations, not self.tab_bar_hidden)
+            active_tab = self.active_tab
+            gtk_window.tab_chrome.sync_tabs(self.tab_bar_data, active_tab.id if active_tab is not None else -1)
         w = self.active_window or self.any_window
         if w is not None:
             data = {'tab_manager': self}
-            boss = get_boss()
             for watcher in global_watchers().on_tab_bar_dirty:
                 watcher(boss, w, data)
 
@@ -1609,6 +1620,9 @@ class TabManager:  # {{{
         if self.tab_bar.update(self.tab_bar_data):
             for tab in self.tabs:
                 tab.relayout_borders()
+        if gtk_window := getattr(get_boss(), 'gtk_windows', {}).get(self.os_window_id):
+            active_tab = self.active_tab
+            gtk_window.tab_chrome.sync_tabs(self.tab_bar_data, active_tab.id if active_tab is not None else -1)
 
     def title_changed(self, tab: Tab) -> None:
         self.mark_tab_bar_dirty()

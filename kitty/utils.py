@@ -337,19 +337,21 @@ class startup_notification_handler:
     # after the window is shown, not before, as they do not do two stage window
     # creation.
 
-    def __init__(self, do_notify: bool = True, startup_id: str | None = None, extra_callback: Callable[[int], None] | None = None):
+    def __init__(self, do_notify: bool = True, startup_id: str | None = None, extra_callback: Callable[[int], Any] | None = None):
         self.do_notify = do_notify
         self.startup_id = startup_id
         self.extra_callback = extra_callback
         self.ctx: Optional['StartupCtx'] = None
 
-    def __enter__(self) -> Callable[[int], None]:
+    def __enter__(self) -> Callable[[int], Any]:
 
-        def pre_show_callback(window_handle: int) -> None:
+        def pre_show_callback(window_handle: int) -> Any:
+            ans = None
             if self.extra_callback is not None:
-                self.extra_callback(window_handle)
+                ans = self.extra_callback(window_handle)
             if self.do_notify:
                 self.ctx = init_startup_notification(window_handle, self.startup_id)
+            return ans
 
         return pre_show_callback
 

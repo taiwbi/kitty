@@ -3081,7 +3081,7 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
 
         // Set the output framebuffer
         if (is_last) {
-            set_framebuffer_to_use_for_output(0);
+            set_framebuffer_to_use_for_output(os_window->gtk_window ? os_window->gtk_framebuffer_id : 0);
             bind_framebuffer_for_output(0);
         } else if (cg->output_texture != CUSTOM_SHADER_TEXTURE_DEFAULT) {
             // Output to named texture; backbuffer is unchanged for the next group
@@ -3166,7 +3166,7 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
             run_custom_end_shader(os_window, sx, sy, now);
         } else {
             // debug_rendering("Custom shaders inactive, falling back to blit\n");
-            set_framebuffer_to_use_for_output(0);
+            set_framebuffer_to_use_for_output(os_window->gtk_window ? os_window->gtk_framebuffer_id : 0);
             bind_framebuffer_for_output(0);
             bind_program(BLIT_PROGRAM);
             glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);

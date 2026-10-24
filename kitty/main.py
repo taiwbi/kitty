@@ -39,6 +39,8 @@ from .fast_data_types import (
     SingleKey,
     create_os_window,
     free_font_data,
+    gtk_backend_available,
+    gtk_backend_set_enabled,
     glfw_get_monitor_names,
     glfw_get_monitor_workarea,
     glfw_init,
@@ -105,6 +107,28 @@ def init_glfw(opts: Options, debug_keyboard: bool = False, debug_rendering: bool
     glfw_module = 'cocoa' if is_macos else ('wayland' if is_wayland(opts) else 'x11')
     init_glfw_module(glfw_module, debug_keyboard, debug_rendering, wayland_enable_ime=opts.wayland_enable_ime)
     return glfw_module
+
+
+def configure_gtk_window_backend(opts: Options) -> bool:
+    if not opts.linux_use_gtk_window:
+        return False
+    desktops = {x.strip().upper() for x in os.environ.get('XDG_CURRENT_DESKTOP', '').split(':')}
+    if is_macos or not is_wayland(opts) or not any('GNOME' in x for x in desktops):
+        log_error('linux_use_gtk_window applies only to GNOME Wayland sessions; using the native kitty window backend')
+        return False
+    if not gtk_backend_available():
+        raise SystemExit('linux_use_gtk_window requires kitty to be built with GTK 4 and libadwaita 1.4 or newer')
+    try:
+        from .gtk_window import initialize_gtk
+
+        initialize_gtk()
+    except Exception as e:
+        raise SystemExit(f'Failed to initialize the optional GTK window backend: {e}') from e
+    gtk_backend_set_enabled(True)
+    # GTK's input context handles IME commits in this backend. Disable the
+    # separate GLFW IME connection so each key does not get delivered twice.
+    opts.wayland_enable_ime = False
+    return True
 
 
 def get_macos_shortcut_for(func_map: dict[tuple[str, ...], list[SingleKey]], defn: str = 'new_os_window', lookup_name: str = '') -> SingleKey | None:
@@ -325,21 +349,49 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
             window_state = cached_values.get('window-state') or None
         wstate = parse_os_window_state(window_state) if window_state is not None else None
 
-        with startup_notification_handler(extra_callback=run_app.first_window_callback) as pre_show_callback:
-            window_id = create_os_window(
-                run_app.initial_window_size_func(get_os_window_sizing_data(opts, startup_sessions[0] if startup_sessions else None), cached_values),
-                pre_show_callback,
-                args.title or appname,
-                winname,
-                wincls,
-                wstate,
-                load_all_shaders,
-                disallow_override_title=bool(args.title),
-                layer_shell_config=run_app.layer_shell_config,
-                x=pos_x,
-                y=pos_y,
-            )
+        old_first_window_callback = run_app.first_window_callback
+        run_app.pending_gtk_window = None
+
+        if run_app.gtk_window_enabled:
+
+            def create_first_gtk_window(window_handle: int) -> object:
+                old_first_window_callback(window_handle)
+                from .gtk_window import GtkKittyEvents, GtkKittyWindow
+
+                gtk_window = GtkKittyWindow(
+                    args.title or appname,
+                    (960, 640),
+                    events=GtkKittyEvents(),
+                    on_new_tab=lambda: None,
+                    on_select_tab=lambda _: None,
+                    on_close_tab=lambda _: None,
+                    on_reorder_tabs=lambda _: None,
+                )
+                gtk_window.apply_chrome_mode(opts.hide_window_decorations)
+                run_app.pending_gtk_window = gtk_window
+                return gtk_window
+
+            run_app.first_window_callback = create_first_gtk_window
+        try:
+            with startup_notification_handler(extra_callback=run_app.first_window_callback) as pre_show_callback:
+                window_id = create_os_window(
+                    run_app.initial_window_size_func(get_os_window_sizing_data(opts, startup_sessions[0] if startup_sessions else None), cached_values),
+                    pre_show_callback,
+                    args.title or appname,
+                    winname,
+                    wincls,
+                    wstate,
+                    load_all_shaders,
+                    disallow_override_title=bool(args.title),
+                    layer_shell_config=run_app.layer_shell_config,
+                    x=pos_x,
+                    y=pos_y,
+                )
+        finally:
+            run_app.first_window_callback = old_first_window_callback
         boss = Boss(opts, args, cached_values, global_shortcuts, talk_fd)
+        if gtk_window := run_app.pending_gtk_window:
+            boss.register_gtk_window(window_id, gtk_window)
         boss.start(window_id, startup_sessions)
         if args.debug_font_fallback:
             dump_font_debug()
@@ -364,6 +416,8 @@ class AppRunner:
     def __init__(self) -> None:
         self.cached_values_name = 'main'
         self.first_window_callback = lambda window_handle: None
+        self.gtk_window_enabled = False
+        self.pending_gtk_window = None
         self.layer_shell_config: LayerShellConfig | None = None
         self.initial_window_size_func = initial_window_size_func
 
@@ -636,6 +690,7 @@ def kitty_main(called_from_panel: bool = False) -> None:
     # threads. These threads must not handle the masked signals, to ensure
     # kitty can handle them. See https://github.com/kovidgoyal/kitty/issues/4636
     mask_kitty_signals_process_wide()
+    run_app.gtk_window_enabled = configure_gtk_window_backend(opts)
     init_glfw(opts, cli_opts.debug_keyboard, cli_opts.debug_rendering)
     try:
         with setup_profiling():
