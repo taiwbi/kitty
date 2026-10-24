@@ -2291,6 +2291,14 @@ init_window_chrome_state(WindowChromeState *s, color_type active_window_bg, floa
 }
 
 static void
+apply_gtk_chrome_style(OSWindow *w, color_type background_color, float background_opacity) {
+    if (!w->gtk_window) return;
+    PyObject *ret = PyObject_CallMethod(w->gtk_window, "apply_chrome_style", "If", background_color, background_opacity);
+    if (!ret) PyErr_Print();
+    else Py_DECREF(ret);
+}
+
+static void
 apply_window_chrome_state(GLFWwindow *w, WindowChromeState new_state, int width, int height, bool window_decorations_changed) {
 #ifdef __APPLE__
     glfwCocoaSetWindowChrome(
@@ -2340,6 +2348,7 @@ set_os_window_chrome(OSWindow *w) {
 
     WindowChromeState new_state;
     init_window_chrome_state(&new_state, bg, effective_os_window_alpha(w));
+    if (w->gtk_window) apply_gtk_chrome_style(w, bg, new_state.background_opacity);
     if (memcmp(&new_state, &w->last_window_chrome, sizeof(WindowChromeState)) != 0) {
         int width, height;
         if (w->gtk_window) get_os_window_size(w, &width, &height, NULL, NULL);
@@ -2922,6 +2931,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         }
     }
     init_window_chrome_state(&w->last_window_chrome, OPT(background), effective_os_window_alpha(w));
+    if (w->gtk_window) apply_gtk_chrome_style(w, OPT(background), w->last_window_chrome.background_opacity);
     if (w->is_layer_shell) {
         if (global_state.is_apple) set_layer_shell_config_for(w, lsc);
     } else if (!w->gtk_window) apply_window_chrome_state(w->handle, w->last_window_chrome, width, height, global_state.is_apple ? OPT(hide_window_decorations) != 0 : false);

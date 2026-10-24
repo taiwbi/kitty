@@ -123,6 +123,7 @@ if (Adw.get_major_version(), Adw.get_minor_version()) < (1, 4):
 PageWidgetFactory = Callable[[int], Gtk.Widget]
 TabAction = Callable[[int], None]
 _gtk_initialized = False
+_gtk_chrome_css: Gtk.CssProvider | None = None
 _shared_gl_context: ReferenceType[Any] | None = None
 
 
@@ -204,22 +205,75 @@ class GtkTabHeaderBar:
 
         self.tab_view = Adw.TabView.new()
         self.tab_bar = Adw.TabBar.new()
+        self.tab_bar.add_css_class('kitty-tabbar')
+        self.tab_bar.add_css_class('inline')
         self.tab_bar.set_view(self.tab_view)
         # Kitty's tab_bar_min_tabs decides whether the row is shown. Once shown,
         # keep the add button visible even when the window has only one tab.
         self.tab_bar.set_autohide(False)
         self.tab_bar.set_hexpand(True)
+        self.tab_bar.set_expand_tabs(True)
+        self.tab_bar.set_halign(Gtk.Align.FILL)
 
-        self.new_tab_button = Gtk.Button.new_from_icon_name('list-add-symbolic')
-        self.new_tab_button.add_css_class('flat')
+        self.new_tab_button = Gtk.Button.new_from_icon_name('tab-new-symbolic')
         self.new_tab_button.set_tooltip_text('New Tab')
         self.new_tab_button.update_property([Gtk.AccessibleProperty.LABEL], ['New Tab'])
         self.new_tab_button.connect('clicked', self._new_tab_clicked)
         self.tab_bar.set_start_action_widget(self.new_tab_button)
 
         self.header_bar = Adw.HeaderBar.new()
+        self.header_bar.add_css_class('kitty-headerbar')
+        self.header_bar.add_css_class('flat')
         self.header_bar.set_show_start_title_buttons(False)
-        self.header_bar.set_title_widget(self.tab_bar)
+        self.header_bar.set_show_end_title_buttons(False)
+        # HeaderBar balances the title slot against its side controls, leaving
+        # a matching empty area on the left. Put the native window controls in
+        # the expanding row itself so tabs use all space up to those controls.
+        self.window_controls = Gtk.WindowControls.new(Gtk.PackType.END)
+        self.window_controls.set_valign(Gtk.Align.CENTER)
+        self.title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.title_row.set_hexpand(True)
+        self.title_row.append(self.tab_bar)
+        self.title_row.append(self.window_controls)
+        self.header_bar.set_title_widget(self.title_row)
+
+        # Widget-local providers cannot style descendants. Install these
+        # class-scoped rules on the display so they reach the internal boxes,
+        # action widgets and tabs, including widgets created after startup.
+        # Remove the outer header inset; retain native tab/action padding and
+        # the translucent selected-tab background inside the transparent strip.
+        global _gtk_chrome_css
+        if _gtk_chrome_css is None:
+            _gtk_chrome_css = Gtk.CssProvider()
+            _gtk_chrome_css.load_from_data(b'''
+                headerbar.kitty-headerbar {
+                    min-height: 42px;
+                    padding: 0;
+                    padding-right: 7px;
+                    margin: 0;
+                    border: none;
+                    box-shadow: none;
+                }
+                headerbar.kitty-headerbar > windowhandle > box,
+                .kitty-tabbar {
+                    padding: 0;
+                }
+                headerbar.kitty-headerbar box.start,
+                headerbar.kitty-headerbar box.end {
+                    margin: 0;
+                    border-spacing: 0;
+                }
+                headerbar.kitty-headerbar > windowhandle > box .kitty-tabbar > revealer > box,
+                tabbar.kitty-tabbar .box {
+                    background: 0;
+                    padding: 0;
+                    border: none;
+                    box-shadow: none;
+                }
+            ''')
+            Gtk.StyleContext.add_provider_for_display(
+                self.header_bar.get_display(), _gtk_chrome_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
         self.tab_view.connect('notify::selected-page', self._selected_page_changed)
         self.tab_view.connect('close-page', self._close_page_requested)
         self.tab_view.connect('page-reordered', self._page_reordered)
@@ -340,6 +394,7 @@ class GtkKittyWindow:
         self.window.set_title(title)
         self.window.set_default_size(*initial_size)
         self.window.set_focusable(True)
+        self.window.add_css_class('kitty-window')
 
         self.tab_chrome = GtkTabHeaderBar(
             on_new_tab=on_new_tab,
@@ -623,6 +678,41 @@ class GtkKittyWindow:
             self._tab_bar_visible = tab_bar_visible
         topbar_visible = not bool(hide_window_decorations & 0b01) and self._tab_bar_visible
         self.tab_chrome.set_visible(topbar_visible)
+
+    def apply_chrome_style(self, background_color: int, background_opacity: float) -> None:
+        """Match GTK's header surface to kitty's active terminal background."""
+        style_key = (background_color, float(background_opacity))
+        if getattr(self, '_chrome_style_key', None) == style_key:
+            return
+        self._chrome_style_key = style_key
+        r = (background_color >> 16) & 0xff
+        g = (background_color >> 8) & 0xff
+        b = background_color & 0xff
+        alpha = max(0.0, min(float(background_opacity), 1.0))
+        css = f'''
+            window.kitty-window,
+            glarea {{
+                background-color: transparent;
+                background-image: none;
+            }}
+            headerbar.kitty-headerbar {{
+                background-color: rgba({r}, {g}, {b}, {alpha:.4f});
+                background-image: none;
+                box-shadow: none;
+                border-bottom: none;
+            }}
+        '''
+        old_provider = getattr(self, '_background_css', None)
+        if old_provider is not None:
+            self.window.get_style_context().remove_provider(old_provider)
+            self.gl_area.get_style_context().remove_provider(old_provider)
+            self.tab_chrome.header_bar.get_style_context().remove_provider(old_provider)
+        self._background_css = Gtk.CssProvider()
+        self._background_css.load_from_data(css.encode())
+        for widget in (self.window, self.gl_area, self.tab_chrome.header_bar):
+            widget.get_style_context().add_provider(
+                self._background_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
 
     def bind(self, os_window_id: int) -> None:
         self.os_window_id = os_window_id

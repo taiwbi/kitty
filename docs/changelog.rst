@@ -231,6 +231,10 @@ Detailed list of changes
 0.50.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- GTK window backend: Keep tabs expanded across a compact, transparent header
+  bar without a centered window title, excess padding, or a bottom separator.
+  Match the header background to the active terminal's color and opacity.
+
 - Allow docking kitty windows to the edges of other windows or of the tab, for
   status bars, file trees, etc. Create them with :code:`launch --type=window-dock`
   or :code:`launch --type=tab-dock`, see :ref:`docks`
