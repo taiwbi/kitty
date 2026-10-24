@@ -270,6 +270,9 @@ class GtkTabHeaderBar:
                     border: none;
                     box-shadow: none;
                 }
+                tabbar.kitty-tabbar tab:selected .tab-title {
+                    font-weight: bold;
+                }
             ''')
             Gtk.StyleContext.add_provider_for_display(
                 self.header_bar.get_display(), _gtk_chrome_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
@@ -329,6 +332,17 @@ class GtkTabHeaderBar:
                 return tab_id
         return None
 
+    def _set_close_buttons_visible(self, visible: bool) -> None:
+        pending = [self.tab_bar]
+        while pending:
+            widget = pending.pop()
+            if widget.has_css_class('tab-close-button'):
+                widget.set_visible(visible)
+            child = widget.get_first_child()
+            while child is not None:
+                pending.append(child)
+                child = child.get_next_sibling()
+
     def _page_reordered(self, _view: Adw.TabView, _page: Adw.TabPage, _position: int) -> None:
         if not self._syncing:
             order = (self._tab_id_for_page(self.tab_view.get_nth_page(i)) for i in range(self.tab_view.get_n_pages()))
@@ -364,6 +378,7 @@ class GtkTabHeaderBar:
             selected = self._pages.get(active_tab_id)
             if selected is not None:
                 self.tab_view.set_selected_page(selected)
+            self._set_close_buttons_visible(len(wanted) > 1)
         finally:
             self._syncing = False
 
