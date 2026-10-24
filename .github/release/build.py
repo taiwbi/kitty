@@ -97,7 +97,15 @@ def sign_macos_binaries(app: Path) -> None:
             if f.read(4) not in macho:
                 continue
         run('lipo', str(path), '-verify_arch', 'arm64', 'x86_64')
-        run('codesign', '--force', '--sign', '-', str(path))
+        # codesign recognizes a bundle's main executable and signs the whole
+        # bundle, even when passed the executable's path. Sign a standalone copy
+        # so this pass works before sub-bundles are complete and signed. Keep the
+        # filename (used for the signing identifier) and executable permissions.
+        with tempfile.TemporaryDirectory(prefix='kitty-sign-') as tmp:
+            binary = Path(tmp) / path.name
+            shutil.copy2(path, binary)
+            run('codesign', '--force', '--sign', '-', str(binary))
+            shutil.copy2(binary, path)
 
 
 def sign_macos_app(app: Path) -> None:

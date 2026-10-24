@@ -52,8 +52,10 @@ Asset versions come from `kitty/constants.py`; the GitHub release name is the ta
    without build-time Python/library paths. Linux tests the extracted archive
    at a new location and repeats the check in a fresh container with no build
    prefix or toolchain. macOS re-signs relocated Mach-O binaries before executing
-   the frozen launcher for code generation, then signs the completed app, verifies signatures
-   and universal executables, and verifies the DMG.
+   the frozen launcher for code generation. It signs standalone copies of the
+   binaries to avoid sealing app bundles before their nested code is ready, then
+   signs the completed bundles from the inside out, verifies signatures and
+   universal executables, and verifies the DMG.
 7. On Linux amd64, run `setup.py build-static-binaries` **after** native code
    generation. This is the upstream cross-compilation path for all 13 standalone
    kitten targets, with `CGO_ENABLED=0` and the standalone-build linker flag.
