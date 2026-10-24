@@ -1575,14 +1575,17 @@ def build_static_kittens(
 
 def build_static_binaries(args: Options, launcher_dir: str) -> None:
     arches = 'amd64', 'arm64'
-    for os_, arches_ in {
+    platforms = {
         'darwin': arches,
         'linux': arches + ('arm', '386'),
         'freebsd': arches,
         'netbsd': arches,
         'openbsd': arches,
         'dragonfly': ('amd64',),
-    }.items():
+    }
+    selected_oses = args.static_binary_os or tuple(platforms)
+    for os_ in selected_oses:
+        arches_ = platforms[os_]
         for arch in arches_:
             print('Cross compiling static kitten for:', os_, arch)
             build_static_kittens(args, launcher_dir, args.dir_for_static_binaries, for_platform=(os_, arch))
@@ -2293,6 +2296,7 @@ def option_parser() -> argparse.ArgumentParser:  # {{{
     )
     p.add_argument('--prefix', default=Options.prefix, help='Where to create the linux package')
     p.add_argument('--dir-for-static-binaries', default=Options.dir_for_static_binaries, help='Where to create the static kitten binary')
+    p.add_argument('--static-binary-os', action='append', choices=('darwin', 'dragonfly', 'freebsd', 'linux', 'netbsd', 'openbsd'), help='Build static kitten binaries only for this OS (repeatable)')
     p.add_argument(
         '--skip-code-generation',
         default=Options.skip_code_generation,

@@ -19,4 +19,4 @@ RUN if [ "$RELEASE_GTK" = 1 ]; then \
 
 ENV PATH="/opt/go/bin:${PATH}" GOTOOLCHAIN=local
 WORKDIR /src
-CMD ["bash", ".github/release/bootstrap.sh", "linux"]
+CMD ["bash", ".github/release/bootstrap.sh"]

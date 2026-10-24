@@ -21,7 +21,6 @@ SOURCE = Path.cwd()
 ROOT = Path(os.environ['BYPY_ROOT'])
 PREFIX = ROOT / 'sw/sw'
 OUTPUT = SOURCE / 'dist'
-IS_MACOS = sys.platform == 'darwin'
 
 
 def run(*cmd: str, cwd: Path = SOURCE, env: dict[str, str] | None = None) -> None:
@@ -32,7 +31,7 @@ def run(*cmd: str, cwd: Path = SOURCE, env: dict[str, str] | None = None) -> Non
 def check_gtk_fallback() -> None:
     # Linux builders with GTK installed would otherwise never compile these
     # stubs. Reuse setup.py's compiler/headers and keep warnings fatal, as on
-    # macOS and on systems without the optional GTK development packages.
+    # systems without the optional GTK development packages.
     commands = json.loads((SOURCE / 'build/compile_commands.json').read_text())
     entry, = (c for c in commands if c['file'] == 'kitty/gtk_backend.c')
     args = [a for a in entry['arguments'] if a != '-MMD']
@@ -52,30 +51,14 @@ def build_fribidi() -> None:
         with tarfile.open(archive) as tf:
             tf.extractall(base, filter='data')
         source = base / f'fribidi-{FRIBIDI_VERSION}'
-        arches = ('arm64', 'x86_64') if IS_MACOS else ('native',)
-        libraries = []
-        for arch in arches:
-            build = base / arch
-            build.mkdir()
-            env = os.environ.copy()
-            env['CFLAGS'] = '-O2 -fPIC'
-            env['LDFLAGS'] = ''
-            flags = []
-            if IS_MACOS:
-                env['CC'] = 'clang'
-                env['CFLAGS'] += f' -arch {arch} -mmacosx-version-min=12.0'
-                env['LDFLAGS'] = f'-arch {arch} -mmacosx-version-min=12.0'
-                host = 'aarch64' if arch == 'arm64' else arch
-                flags.append(f'--host={host}-apple-darwin')
-            run(str(source / 'configure'), f'--prefix={PREFIX}', '--disable-shared', '--enable-static', '--with-pic', *flags, cwd=build, env=env)
-            run('make', '-j4', cwd=build, env=env)
-            run('make', 'install', cwd=build, env=env)
-            library = base / f'libfribidi-{arch}.a'
-            shutil.copy2(PREFIX / 'lib/libfribidi.a', library)
-            libraries.append(str(library))
-        if IS_MACOS:
-            run('lipo', '-create', *libraries, '-output', str(PREFIX / 'lib/libfribidi.a'))
-            run('lipo', str(PREFIX / 'lib/libfribidi.a'), '-verify_arch', 'arm64', 'x86_64')
+        build = base / 'native'
+        build.mkdir()
+        env = os.environ.copy()
+        env['CFLAGS'] = '-O2 -fPIC'
+        env['LDFLAGS'] = ''
+        run(str(source / 'configure'), f'--prefix={PREFIX}', '--disable-shared', '--enable-static', '--with-pic', cwd=build, env=env)
+        run('make', '-j4', cwd=build, env=env)
+        run('make', 'install', cwd=build, env=env)
 
 
 def smoke_test(kitty: Path, kitten: Path) -> None:
@@ -84,38 +67,6 @@ def smoke_test(kitty: Path, kitten: Path) -> None:
     env = {k: v for k, v in os.environ.items() if not k.startswith('PYTHON') and k not in build_vars}
     with tempfile.TemporaryDirectory() as tmp:
         run(str(kitty), '+launch', str(SOURCE / '.github/release/smoke.py'), str(kitten), cwd=Path(tmp), env=env)
-
-
-def sign_macos_binaries(app: Path) -> None:
-    # Include Python extensions outside the standard macOS nested-code
-    # directories (which --deep alone can miss).
-    macho = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'}
-    for path in sorted(app.rglob('*')):
-        if path.is_symlink() or not path.is_file():
-            continue
-        with path.open('rb') as f:
-            if f.read(4) not in macho:
-                continue
-        run('lipo', str(path), '-verify_arch', 'arm64', 'x86_64')
-        # codesign recognizes a bundle's main executable and signs the whole
-        # bundle, even when passed the executable's path. Sign a standalone copy
-        # so this pass works before sub-bundles are complete and signed. Keep the
-        # filename (used for the signing identifier) and executable permissions.
-        with tempfile.TemporaryDirectory(prefix='kitty-sign-') as tmp:
-            binary = Path(tmp) / path.name
-            shutil.copy2(path, binary)
-            run('codesign', '--force', '--sign', '-', str(binary))
-            shutil.copy2(binary, path)
-
-
-def sign_macos_app(app: Path) -> None:
-    # Sign code from the inside out, then seal framework and app bundles.
-    sign_macos_binaries(app)
-    bundles = [p for p in app.rglob('*') if p.is_dir() and not p.is_symlink() and p.suffix in ('.app', '.framework')]
-    for path in sorted(bundles, key=lambda p: len(p.parts), reverse=True):
-        run('codesign', '--force', '--sign', '-', str(path))
-    run('codesign', '--force', '--sign', '-', str(app))
-    run('codesign', '--verify', '--deep', '--strict', str(app))
 
 
 def preserve_library_aliases(destination: Path) -> None:
@@ -150,46 +101,21 @@ def freeze() -> Path:
     build_dir(mkdtemp('build-'))
     init_env['build_c_extensions'](ext_dir, args)
     data: dict[str, Any] = {'args': args, 'ext_dir': ext_dir, 'init_env': init_env}
-    if IS_MACOS:
-        mod = runpy.run_path(str(SOURCE / 'bypy/macos'), init_globals=data, run_name='release_builder')
-        upstream_freeze = mod['Freeze']
-
-        class AdHocFreeze(upstream_freeze):
-            def add_misc_libraries(self) -> None:
-                super().add_misc_libraries()
-                preserve_library_aliases(Path(self.frameworks_dir))
-
-            def build_frozen_tools(self) -> None:
-                # This step executes the relocated frozen kitty to generate Go
-                # code and shaders. Its rewritten Mach-O load commands must be
-                # re-signed already, or Apple Silicon can kill the executable.
-                sign_macos_binaries(Path(self.build_dir))
-                super().build_frozen_tools()
-
-            def makedmg(self, app: str, volname: str, format: str = 'ULMO') -> str:
-                # install_name_tool invalidates Apple Silicon code signatures.
-                # Re-sign the completed app before testing and putting it in a DMG.
-                sign_macos_app(Path(app))
-                smoke_test(Path(app) / 'Contents/MacOS/kitty', Path(app) / 'Contents/MacOS/kitten')
-                return super().makedmg(app, volname, format)
-
-        AdHocFreeze(str(Path(ext_dir) / 'kitty.app'), skip_tests=True)
-    else:
-        # Same sequence as upstream main(), with aliases retained after copying.
-        mod = runpy.run_path(str(SOURCE / 'bypy/linux'), init_globals=data, run_name='release_builder')
-        env = mod['Env'](str(Path(ext_dir) / 'kitty'))
-        mod['copy_libs'](env)
-        preserve_library_aliases(Path(env.lib_dir))
-        mod['copy_python'](env)
-        init_env['build_frozen_launcher']([mod['path_to_freeze_dir'](), env.obj_dir])
-        files = mod['find_binaries'](env)
-        mod['fix_permissions'](files)
-        mod['add_ca_certs'](env)
-        init_env['build_frozen_tools'](str(Path(env.base) / 'bin/kitty'))
-        if not args.dont_strip:
-            mod['strip_binaries'](files)
-        smoke_test(Path(env.base) / 'bin/kitty', Path(env.base) / 'bin/kitten')
-        mod['create_tarfile'](env, args.compression_level)
+    # Same sequence as upstream main(), with aliases retained after copying.
+    mod = runpy.run_path(str(SOURCE / 'bypy/linux'), init_globals=data, run_name='release_builder')
+    env = mod['Env'](str(Path(ext_dir) / 'kitty'))
+    mod['copy_libs'](env)
+    preserve_library_aliases(Path(env.lib_dir))
+    mod['copy_python'](env)
+    init_env['build_frozen_launcher']([mod['path_to_freeze_dir'](), env.obj_dir])
+    files = mod['find_binaries'](env)
+    mod['fix_permissions'](files)
+    mod['add_ca_certs'](env)
+    init_env['build_frozen_tools'](str(Path(env.base) / 'bin/kitty'))
+    if not args.dont_strip:
+        mod['strip_binaries'](files)
+    smoke_test(Path(env.base) / 'bin/kitty', Path(env.base) / 'bin/kitten')
+    mod['create_tarfile'](env, args.compression_level)
     return Path(ext_dir)
 
 
@@ -245,16 +171,15 @@ def main() -> None:
     try:
         for asset in (ROOT / 'sw/dist').iterdir():
             shutil.copy2(asset, OUTPUT)
-        if not IS_MACOS:
-            # Test the extracted download, at a different location, without SW.
-            asset, = OUTPUT.glob('kitty-*.txz')
-            with tempfile.TemporaryDirectory() as tmp:
-                package = Path(tmp)
-                with tarfile.open(asset) as tf:
-                    tf.extractall(package, filter='tar')
-                smoke_test(package / 'bin/kitty', package / 'bin/kitten')
+        # Test the extracted download, at a different location, without SW.
+        asset, = OUTPUT.glob('kitty-*.txz')
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            with tarfile.open(asset) as tf:
+                tf.extractall(package, filter='tar')
+            smoke_test(package / 'bin/kitty', package / 'bin/kitten')
         if os.environ.get('RELEASE_STATIC_KITTENS') == '1':
-            run(sys.executable, 'setup.py', 'build-static-binaries', '--dir-for-static-binaries', str(OUTPUT))
+            run(sys.executable, 'setup.py', 'build-static-binaries', '--static-binary-os', 'linux', '--dir-for-static-binaries', str(OUTPUT))
             run(str(OUTPUT / 'kitten-linux-amd64'), '--version')
             version = runpy.run_path('setup.py', run_name='release_metadata')['version']
             ver = '.'.join(map(str, version))

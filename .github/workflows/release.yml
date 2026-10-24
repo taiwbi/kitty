@@ -80,43 +80,9 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  macos:
-    name: macOS universal (amd64 + arm64)
-    runs-on: macos-26
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Check out the pinned upstream freezer
-        run: |
-          git init "$RUNNER_TEMP/bypy"
-          git -C "$RUNNER_TEMP/bypy" remote add origin https://github.com/kovidgoyal/bypy.git
-          git -C "$RUNNER_TEMP/bypy" fetch --depth=1 origin "$BYPY_REVISION"
-          git -C "$RUNNER_TEMP/bypy" checkout --detach FETCH_HEAD
-      - name: Build and verify universal application and DMG
-        env:
-          GOTOOLCHAIN: local
-        run: |
-          export BYPY_SOURCE="$RUNNER_TEMP/bypy"
-          bash .github/release/bootstrap.sh macos
-          hdiutil verify dist/kitty-*.dmg
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: release-macos
-          path: dist/*
-          if-no-files-found: error
-          overwrite: true
-          compression-level: 0
-          retention-days: 7
-
   publish:
     name: Verify all assets and publish GitHub release
-    needs: [linux, macos]
+    needs: [linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

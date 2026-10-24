@@ -1,32 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-platform="${1:?Expected linux or macos}"
-case "$platform" in
-    linux)
-        export BYPY_ROOT=/
-        # Docker runs as root, while actions/checkout files belong to the runner.
-        git config --global --add safe.directory "$PWD"
-        case "$(uname -m)" in
-            x86_64) export BYPY_ARCH=linux-64 ;;
-            aarch64) export BYPY_ARCH=linux-arm64 ;;
-            *) echo 'Unsupported Linux release architecture' >&2; exit 1 ;;
-        esac
-        ;;
-    macos)
-        export BYPY_ROOT=/Users/Shared/kitty-build BYPY_ARCH=macos
-        export BYPY_UNIVERSAL=true BYPY_DEPLOY_TARGET=12.0 MACOSX_DEPLOYMENT_TARGET=12.0
-        ;;
-    *) echo 'Expected linux or macos' >&2; exit 1 ;;
+[[ $# -eq 0 ]] || { echo 'This release builder supports Linux only' >&2; exit 1; }
+export BYPY_ROOT=/
+# Docker runs as root, while actions/checkout files belong to the runner.
+git config --global --add safe.directory "$PWD"
+case "$(uname -m)" in
+    x86_64) export BYPY_ARCH=linux-64 ;;
+    aarch64) export BYPY_ARCH=linux-arm64 ;;
+    *) echo 'Unsupported Linux release architecture' >&2; exit 1 ;;
 esac
 
 release_root="${BYPY_ROOT%/}"
 release_prefix="$release_root/sw/sw"
 mkdir -p "$release_prefix" "$release_root/sw/t" "$release_root/sw/downloads"
-if [[ "$platform" == macos ]]; then
-    ln -s "$PWD" "$release_root/src"
-    ln -s "${BYPY_SOURCE:?Path to the pinned upstream bypy checkout}" "$release_root/bypy"
-fi
 
 download() {
     local url="$1" dest="$release_root/sw/downloads/$2"
@@ -39,22 +26,15 @@ download() {
 }
 
 bundle="$BYPY_ARCH"
-[[ "$platform" != macos ]] || bundle=macos-64
 download "https://download.calibre-ebook.com/ci/kitty/$bundle.tar.xz" "$bundle.tar.xz"
 tar -xf "$release_root/sw/downloads/$bundle.tar.xz" -C "$release_prefix"
 export PATH="$release_prefix/bin:$PATH"
 unset PYTHONPATH PYTHONHOME
-if [[ "$platform" == linux ]]; then
-    export LD_LIBRARY_PATH="$release_prefix/lib" PYTHONHOME="$release_prefix"
-    export FONTCONFIG_PATH=/etc/fonts
-fi
+export LD_LIBRARY_PATH="$release_prefix/lib" PYTHONHOME="$release_prefix"
+export FONTCONFIG_PATH=/etc/fonts
 export SW="$release_prefix" SLANGC="$release_prefix/bin/slangc"
 export PKG_CONFIG_PATH="$release_prefix/lib/pkgconfig"
-if [[ "$platform" == macos ]]; then
-    export PKGCONFIG_EXE="$release_prefix/bin/pkg-config"
-else
-    export PKGCONFIG_EXE=/usr/bin/pkg-config
-fi
+export PKGCONFIG_EXE=/usr/bin/pkg-config
 export CI=true PYTHONUNBUFFERED=1
 
 download https://github.com/ryanoasis/nerd-fonts/releases/latest/download/NerdFontsSymbolsOnly.tar.xz nerd-fonts.tar.xz

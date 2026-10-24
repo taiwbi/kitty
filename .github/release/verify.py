@@ -10,12 +10,7 @@ import tarfile
 from pathlib import Path
 
 PLATFORMS = {
-    'darwin': ('amd64', 'arm64'),
-    'dragonfly': ('amd64',),
-    'freebsd': ('amd64', 'arm64'),
     'linux': ('386', 'amd64', 'arm', 'arm64'),
-    'netbsd': ('amd64', 'arm64'),
-    'openbsd': ('amd64', 'arm64'),
 }
 
 
@@ -38,12 +33,7 @@ def check_kitten(path: Path, goos: str, arch: str, revision: str) -> None:
     for item in (f'GOOS={goos}', f'GOARCH={arch}', 'CGO_ENABLED=0', 'IsStandaloneBuild=true', f'VCSRevision={revision}'):
         assert item in metadata, f'{path}: missing build metadata {item}'
     header = path.read_bytes()[:32]
-    if goos == 'darwin':
-        assert header[:4] == b'\xcf\xfa\xed\xfe', f'Not a Mach-O executable: {path}'
-        cpu = struct.unpack_from('<I', header, 4)[0]
-        assert cpu == {'amd64': 0x01000007, 'arm64': 0x0100000C}[arch], f'Wrong Mach-O architecture: {path}'
-    else:
-        check_elf(header, arch)
+    check_elf(header, arch)
 
 
 def check_bundle(path: Path, arch: str) -> None:
@@ -65,7 +55,7 @@ def main() -> None:
     dest = Path('dist')
     kittens = {f'kitten-{goos}-{arch}': (goos, arch) for goos, arches in PLATFORMS.items() for arch in arches}
     expected = set(kittens) | {
-        f'kitty-{version}-x86_64.txz', f'kitty-{version}-arm64.txz', f'kitty-{version}.dmg',
+        f'kitty-{version}-x86_64.txz', f'kitty-{version}-arm64.txz',
         f'kitty-{version}.tar.xz', f'kitty-{version}.tar.xz.spdx.json',
     }
     actual = {p.name for p in dest.iterdir()} - {'SHA256SUMS'}
@@ -75,10 +65,6 @@ def main() -> None:
         check_kitten(dest / name, goos, arch, revision)
     for suffix, arch in (('x86_64', 'amd64'), ('arm64', 'arm64')):
         check_bundle(dest / f'kitty-{version}-{suffix}.txz', arch)
-    dmg = dest / f'kitty-{version}.dmg'
-    with dmg.open('rb') as f:
-        f.seek(-512, 2)
-        assert f.read(4) == b'koly', 'Invalid DMG trailer'
     with tarfile.open(dest / f'kitty-{version}.tar.xz') as tf:
         names = set(tf.getnames())
         prefix = f'kitty-{version}/'
