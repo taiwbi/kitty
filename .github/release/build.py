@@ -94,6 +94,10 @@ def freeze() -> Path:
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     args = parser.parse_args(['--non-interactive', '--skip-tests', '--extra-program-data', revision])
     init_env = runpy.run_path(str(SOURCE / 'bypy/init_env.py'), run_name='program')
+    # bypy's worker environment can override the release container's pkg-config.
+    # GTK is provided by the Linux builder image, so make the freezer's separate
+    # native-extension build detect the same GTK 4/libadwaita development files.
+    init_env['worker_env']['PKGCONFIG_EXE'] = '/usr/bin/pkg-config'
     # Download once with curl's retry and platform trust-store support, before
     # building. Both upstream freezers use this URL to copy the shipped CA bundle.
     init_env['kitty_constants']['cacerts_url'] = (ROOT / 'sw/downloads/cacert.pem').as_uri()

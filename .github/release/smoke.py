@@ -8,9 +8,13 @@ import sys
 from pathlib import Path
 
 from kitty.constants import kitty_exe
+from kitty.fast_data_types import gtk_backend_available
 
 assert sys.frozen, 'Expected the frozen Python runtime'
 assert ssl.create_default_context().get_ca_certs(), 'The shipped CA bundle did not load'
+assert gtk_backend_available(), (
+    'The frozen Linux release was built without GTK 4/libadwaita support'
+)
 for module in ('bz2', 'lzma', 'ctypes', 'sqlite3', 'kittens.transfer.rsync', 'kitty.fast_data_types'):
     importlib.import_module(module)
 kitty = Path(kitty_exe())
