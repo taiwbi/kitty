@@ -1080,6 +1080,20 @@ _glfwPlatformPostEmptyEvent(void) {
 
 
 void
+_glfwPlatformPollEvents(void) {
+    @autoreleasepool {
+        for (;;) {
+            NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                              untilDate:[NSDate distantPast]
+                                                 inMode:NSDefaultRunLoopMode
+                                                dequeue:YES];
+            if (event == nil) break;
+            [NSApp sendEvent:event];
+        }
+    }
+}
+
+void
 _glfwPlatformStopMainLoop(void) {
     [NSApp stop:nil];
     _glfwCocoaPostEmptyEvent();
