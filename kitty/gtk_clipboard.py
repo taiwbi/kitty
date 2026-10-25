@@ -65,7 +65,12 @@ def get_clipboard_mime(ctype: int, mime: str | None, output: Callable[[bytes], N
         for available in clipboard.get_formats().get_mime_types():
             output(available.encode('utf-8'))
         return
-    if not clipboard.get_formats().contain_mime_type(mime):
+    formats = clipboard.get_formats()
+    if mime == 'text/plain':
+        plain_text_mimes = ('text/plain', 'text/plain;charset=utf-8', 'UTF8_STRING', 'TEXT', 'STRING')
+        if not any(formats.contain_mime_type(mime_type) for mime_type in plain_text_mimes):
+            return
+    elif not formats.contain_mime_type(mime):
         return
 
     # Kitty's clipboard API is synchronous. Dispatch GDK's async transfer on the
@@ -81,30 +86,43 @@ def get_clipboard_mime(ctype: int, mime: str | None, output: Callable[[bytes], N
             cancellable.cancel()
         return True
 
-    def read_chunk(stream: Any, result: Any, _data: Any) -> None:
-        nonlocal finished, last_progress
-        try:
-            data = stream.read_bytes_finish(result).get_data()
-            if data:
-                last_progress = monotonic()
-                output(data)
-                stream.read_bytes_async(65536, GLib.PRIORITY_DEFAULT, cancellable, read_chunk, None)
-                return
-        except Exception as err:
-            errors.append(err)
-        stream.close_async(GLib.PRIORITY_DEFAULT, None, None, None)
-        finished = True
-
-    def opened(source: Any, result: Any, _data: Any) -> None:
-        nonlocal finished
-        try:
-            stream, _mime = source.read_finish(result)
-            stream.read_bytes_async(65536, GLib.PRIORITY_DEFAULT, cancellable, read_chunk, None)
-        except Exception as err:
-            errors.append(err)
+    if mime == 'text/plain':
+        def opened_text(source: Any, result: Any, _data: Any) -> None:
+            nonlocal finished
+            try:
+                text = source.read_text_finish(result)
+                if text is not None:
+                    output(text.encode('utf-8'))
+            except Exception as err:
+                errors.append(err)
             finished = True
 
-    clipboard.read_async([mime], GLib.PRIORITY_DEFAULT, cancellable, opened, None)
+        clipboard.read_text_async(cancellable, opened_text, None)
+    else:
+        def read_chunk(stream: Any, result: Any, _data: Any) -> None:
+            nonlocal finished, last_progress
+            try:
+                data = stream.read_bytes_finish(result).get_data()
+                if data:
+                    last_progress = monotonic()
+                    output(data)
+                    stream.read_bytes_async(65536, GLib.PRIORITY_DEFAULT, cancellable, read_chunk, None)
+                    return
+            except Exception as err:
+                errors.append(err)
+            stream.close_async(GLib.PRIORITY_DEFAULT, None, None, None)
+            finished = True
+
+        def opened(source: Any, result: Any, _data: Any) -> None:
+            nonlocal finished
+            try:
+                stream, _mime = source.read_finish(result)
+                stream.read_bytes_async(65536, GLib.PRIORITY_DEFAULT, cancellable, read_chunk, None)
+            except Exception as err:
+                errors.append(err)
+                finished = True
+
+        clipboard.read_async([mime], GLib.PRIORITY_DEFAULT, cancellable, opened, None)
     timeout = GLib.timeout_add(1000, check_timeout)
     try:
         while not finished:
