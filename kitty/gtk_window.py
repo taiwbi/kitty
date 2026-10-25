@@ -106,6 +106,7 @@ from .fast_data_types import (
     gtk_backend_activate,
     gtk_backend_available,
     gtk_backend_clear_window_blur,
+    gtk_backend_has_wayland_blur,
     gtk_backend_initialize,
     gtk_backend_set_window_app_id,
     gtk_backend_set_window_blur,
@@ -121,9 +122,11 @@ from .fast_data_types import (
 from .tab_bar import TabBarData
 
 
-_gtk_owns_wayland_blur = (
+# Prefer kitty's region protocol whenever it was compiled in. GTK's CSS
+# backdrop filter cannot be constrained to the visible CSD window allocation.
+_use_gtk_css_wayland_blur = (
     Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()
-) >= (4, 23, 3)
+) >= (4, 23, 3) and not gtk_backend_has_wayland_blur()
 
 if (Adw.get_major_version(), Adw.get_minor_version()) < (1, 4):
     raise RuntimeError('kitty GTK backend requires libadwaita 1.4 or newer')
@@ -826,7 +829,7 @@ class GtkKittyWindow:
         self.tab_chrome.set_visible(topbar_visible)
 
     def _apply_wayland_blur(self) -> None:
-        if _gtk_owns_wayland_blur or not self.os_window_id or not self.window.get_realized():
+        if _use_gtk_css_wayland_blur or not self.os_window_id or not self.window.get_realized():
             return
         gtk_backend_set_window_blur(self.os_window_id, self.window.__gpointer__, self._background_blur)
 
@@ -843,7 +846,7 @@ class GtkKittyWindow:
         b = background_color & 0xff
         alpha = max(0.0, min(float(background_opacity), 1.0))
         blur_css = ''
-        if _gtk_owns_wayland_blur and is_wayland():
+        if _use_gtk_css_wayland_blur and is_wayland():
             blur_css = f'backdrop-filter: {"blur(20px)" if self._background_blur > 0 else "none"};'
         css = f'''
             window.kitty-window,

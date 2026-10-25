@@ -2125,6 +2125,7 @@ static PyMethodDef module_methods[] = {
     MW(destroy_global_data, METH_NOARGS),
     MW(wakeup_main_loop, METH_NOARGS),
     M(gtk_backend_available, METH_NOARGS),
+    M(gtk_backend_has_wayland_blur, METH_NOARGS),
     M(gtk_backend_initialize, METH_NOARGS),
     M(gtk_backend_set_enabled, METH_VARARGS),
     M(gtk_backend_activate, METH_NOARGS),

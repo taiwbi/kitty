@@ -741,6 +741,7 @@ void cleanup_shader_resources_on_terminate(void);
 bool remove_os_window(id_type os_window_id);
 void *make_os_window_context_current(OSWindow *w);
 PyObject *gtk_backend_available(PyObject *, PyObject *);
+PyObject *gtk_backend_has_wayland_blur(PyObject *, PyObject *);
 PyObject *gtk_backend_initialize(PyObject *, PyObject *);
 PyObject *gtk_backend_set_enabled(PyObject *, PyObject *);
 PyObject *gtk_backend_activate(PyObject *, PyObject *);

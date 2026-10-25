@@ -204,6 +204,15 @@ gtk_backend_available(PyObject UNUSED *self, PyObject UNUSED *args) {
 }
 
 PyObject *
+gtk_backend_has_wayland_blur(PyObject UNUSED *self, PyObject UNUSED *args) {
+#if defined(KITTY_WITH_GTK) && defined(KITTY_WITH_GTK_WAYLAND_BLUR)
+    Py_RETURN_TRUE;
+#else
+    Py_RETURN_FALSE;
+#endif
+}
+
+PyObject *
 gtk_backend_initialize(PyObject UNUSED *self, PyObject UNUSED *args) {
 #ifdef KITTY_WITH_GTK
     if (!gtk_backend_initialized) {

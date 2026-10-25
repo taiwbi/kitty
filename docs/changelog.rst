@@ -232,7 +232,9 @@ Detailed list of changes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - GTK window backend: Keep Wayland background blur inside the visible window
-  and set the application ID from kitty's window class.
+  and set the application ID from kitty's window class. Use kitty's bounded
+  blur region instead of GTK's CSS backdrop blur when the Wayland protocol is
+  available.
 
 - GTK windows: Fix copying text and other clipboard data to other applications.
 
