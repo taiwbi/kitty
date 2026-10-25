@@ -3,66 +3,30 @@
 """Clipboard access on the same GDK display as kitty's GTK windows."""
 
 from collections.abc import Callable
-from copy import copy
 from time import monotonic
 from typing import Any
 
 import gi
 
-gi.require_version('Gdk', '4.0')
-from gi.repository import Gdk, Gio, GLib  # type: ignore[import-not-found]
-
 from .fast_data_types import GLFW_PRIMARY_SELECTION, get_boss
 
+gi.require_version('Gdk', '4.0')
+from gi.repository import Gdk, Gio, GLib  # type: ignore[import-not-found]  # noqa: E402
 
-class ClipboardProvider(Gdk.ContentProvider):
-    def __init__(self, ctype: int, mime_types: tuple[str, ...]) -> None:
-        super().__init__()
-        source = get_boss().primary_selection if ctype == GLFW_PRIMARY_SELECTION else get_boss().clipboard
-        self.source = copy(source)
-        self.source.data = dict(source.data)
-        self.formats = Gdk.ContentFormats.new(mime_types)
 
-    def do_ref_formats(self) -> Any:
-        return self.formats
-
-    def do_ref_storable_formats(self) -> Any:
-        return self.formats
-
-    def do_write_mime_type_async(
-        self, mime: str, stream: Any, priority: int, cancellable: Any, callback: Any, user_data: Any
-    ) -> None:
-        task = Gio.Task.new(self, cancellable, callback, user_data)
-        chunker: Callable[[], bytes] | None = None
-
-        def write_next() -> None:
-            nonlocal chunker
-            try:
-                if chunker is None:
-                    chunker = self.source(mime)
-                chunk = chunker()
-                if chunk:
-                    # Keep the bytes alive until the asynchronous write finishes.
-                    stream.write_all_async(chunk, priority, cancellable, written, chunk)
-                else:
-                    task.return_boolean(True)
-            except Exception as err:
-                task.return_error(err if isinstance(err, GLib.Error) else GLib.Error.new_literal(
-                    Gio.io_error_quark(), str(err), Gio.IOErrorEnum.FAILED
-                ))
-
-        def written(output: Any, result: Any, _data: Any) -> None:
-            try:
-                output.write_all_finish(result)
-            except GLib.Error as err:
-                task.return_error(err)
-            else:
-                write_next()
-
-        write_next()
-
-    def do_write_mime_type_finish(self, result: Any) -> bool:
-        return bool(result.propagate_boolean())
+def content_provider_for(ctype: int, mime_types: tuple[str, ...]) -> Any:
+    source = get_boss().primary_selection if ctype == GLFW_PRIMARY_SELECTION else get_boss().clipboard
+    providers = []
+    for mime in mime_types:
+        chunker = source(mime)
+        data = GLib.Bytes.new(b''.join(iter(chunker, b'')))
+        providers.append(Gdk.ContentProvider.new_for_bytes(mime, data))
+        if mime == 'text/plain' and 'text/plain;charset=utf-8' not in mime_types:
+            providers.append(Gdk.ContentProvider.new_for_bytes('text/plain;charset=utf-8', data))
+    # Keep the transfer entirely in GDK: PyGObject does not preserve native
+    # callback user_data when forwarding the async provider vfunc to Gio.Task.
+    # GDK's byte providers also retain this offer when another copy replaces it.
+    return Gdk.ContentProvider.new_union(providers)
 
 
 _clipboards: dict[int, Any] = {}
@@ -77,7 +41,7 @@ def clipboard_for(ctype: int) -> Any:
         def changed(clipboard: Any) -> None:
             nonlocal owned
             was_owned = owned
-            owned = isinstance(clipboard.get_content(), ClipboardProvider)
+            owned = clipboard.is_local()
             if was_owned and not owned:
                 get_boss().on_clipboard_lost('primary' if ctype == GLFW_PRIMARY_SELECTION else 'clipboard')
 
@@ -88,13 +52,13 @@ def clipboard_for(ctype: int) -> Any:
 
 def set_clipboard_data_types(ctype: int, mime_types: tuple[str, ...]) -> None:
     clipboard = clipboard_for(ctype)
-    if not clipboard.set_content(ClipboardProvider(ctype, mime_types) if mime_types else None):
+    if not clipboard.set_content(content_provider_for(ctype, mime_types) if mime_types else None):
         raise RuntimeError('GDK could not set clipboard content')
 
 
 def get_clipboard_mime(ctype: int, mime: str | None, output: Callable[[bytes], None]) -> None:
     clipboard = clipboard_for(ctype)
-    if isinstance(clipboard.get_content(), ClipboardProvider):
+    if clipboard.is_local():
         # Let Clipboard use its original data, including lazy chunkers.
         raise RuntimeError('is_self_offer')
     if mime is None:

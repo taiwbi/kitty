@@ -231,6 +231,8 @@ Detailed list of changes
 0.50.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- GTK windows: Fix copying text and other clipboard data to other applications.
+
 - GTK window backend: Keep tabs expanded across a compact, transparent header
   bar without a centered window title, excess padding, or a bottom separator.
   Match the header background to the active terminal's color and opacity.
