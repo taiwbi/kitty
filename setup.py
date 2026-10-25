@@ -72,6 +72,7 @@ is_arm = platform.processor() == 'arm' or platform.machine() in ('arm64', 'aarch
 c_std = '' if is_openbsd else '-std=c11'
 PKGCONFIG = os.environ.get('PKGCONFIG_EXE', 'pkg-config')
 link_targets: List[str] = []
+gtk_library_dirs: List[str] = []
 macos_universal_arches = ('arm64', 'x86_64') if is_arm else ('x86_64', 'arm64')
 
 
@@ -340,8 +341,15 @@ def error(text: str) -> str:
     return text
 
 
-def pkg_config(pkg: str, *args: str, extra_pc_dir: str = '', fatal: bool = True) -> List[str]:
+def pkg_config(pkg: str, *args: str, extra_pc_dir: str = '', fatal: bool = True, system: bool = False) -> List[str]:
     env = os.environ.copy()
+    if system:
+        # GTK is supplied by the host system. In a development build the
+        # bundled dependency directory can contain older .pc files for
+        # libraries GTK also depends on (notably cairo, glib and harfbuzz),
+        # causing pkg-config to reject the otherwise valid system GTK stack.
+        env.pop('PKG_CONFIG_PATH', None)
+        env.pop('PKG_CONFIG_LIBDIR', None)
     if extra_pc_dir:
         pp = env.get('PKG_CONFIG_PATH', '')
         if pp:
@@ -362,8 +370,12 @@ def pkg_config(pkg: str, *args: str, extra_pc_dir: str = '', fatal: bool = True)
         raise
 
 
-def pkg_version(package: str) -> Tuple[int, int]:
-    ver = subprocess.check_output([PKGCONFIG, package, '--modversion']).decode('utf-8').strip()
+def pkg_version(package: str, system: bool = False) -> Tuple[int, int]:
+    env = os.environ.copy()
+    if system:
+        env.pop('PKG_CONFIG_PATH', None)
+        env.pop('PKG_CONFIG_LIBDIR', None)
+    ver = subprocess.check_output([PKGCONFIG, package, '--modversion'], env=env).decode('utf-8').strip()
     m = re.match(r'(\d+).(\d+)', ver)
     if m is not None:
         qmajor, qminor = map(int, m.groups())
@@ -767,19 +779,26 @@ def kitty_env(args: Options) -> Env:
     cflags.extend(pkg_config('lcms2', '--cflags-only-I'))
     gtk_cflags: List[str] = []
     gtk_libs: List[str] = []
-    if is_linux and subprocess.run([PKGCONFIG, '--exists', 'gtk4', 'libadwaita-1'], check=False).returncode == 0:
-        gtk_version = pkg_version('gtk4')
-        adwaita_version = pkg_version('libadwaita-1')
+    gtk_library_dirs.clear()
+    gtk_pkg_env = os.environ.copy()
+    gtk_pkg_env.pop('PKG_CONFIG_PATH', None)
+    gtk_pkg_env.pop('PKG_CONFIG_LIBDIR', None)
+    if is_linux and subprocess.run([PKGCONFIG, '--exists', 'gtk4', 'libadwaita-1'], env=gtk_pkg_env, check=False).returncode == 0:
+        gtk_version = pkg_version('gtk4', system=True)
+        adwaita_version = pkg_version('libadwaita-1', system=True)
         if gtk_version >= (4, 0) and adwaita_version >= (1, 4):
-            gtk_cflags.extend(pkg_config('gtk4', '--cflags-only-I'))
-            gtk_cflags.extend(pkg_config('libadwaita-1', '--cflags-only-I'))
-            gtk_libs.extend(pkg_config('gtk4', '--libs'))
-            gtk_libs.extend(pkg_config('libadwaita-1', '--libs'))
+            gtk_cflags.extend(pkg_config('gtk4', '--cflags-only-I', system=True))
+            gtk_cflags.extend(pkg_config('libadwaita-1', '--cflags-only-I', system=True))
+            gtk_libs.extend(pkg_config('gtk4', '--libs', system=True))
+            gtk_libs.extend(pkg_config('libadwaita-1', '--libs', system=True))
+            gtk_library_dirs.extend(pkg_config('gtk4', '--variable=libdir', system=True))
+            gtk_library_dirs.extend(pkg_config('libadwaita-1', '--variable=libdir', system=True))
+            gtk_library_dirs[:] = list(dict.fromkeys(filter(None, gtk_library_dirs)))
             cppflags.append('-DKITTY_WITH_GTK')
         else:
             print(error('GTK backend disabled: GTK 4 and libadwaita 1.4 or newer are required'), file=sys.stderr)
     if is_linux and os.environ.get('KITTY_REQUIRE_GTK') == '1' and not gtk_libs:
-        subprocess.run([PKGCONFIG, '--print-errors', '--exists', 'gtk4 >= 4.0', 'libadwaita-1 >= 1.4'], check=False)
+        subprocess.run([PKGCONFIG, '--print-errors', '--exists', 'gtk4 >= 4.0', 'libadwaita-1 >= 1.4'], env=gtk_pkg_env, check=False)
         raise SystemExit('GTK support is required for this build: install GTK 4 and libadwaita 1.4 or newer development libraries')
     # Some GTK releases have declarations rejected by -pedantic-errors. Treat
     # third-party headers as system headers while keeping our own warnings fatal.
@@ -1651,7 +1670,12 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
         ph = os.path.relpath(os.environ['DEVELOP_ROOT'], '.')
         cppflags.append(f'-DSET_PYTHON_HOME="{ph}"')
         if not is_macos:
-            ldflags += ['-Wl,--disable-new-dtags', f'-Wl,-rpath,$ORIGIN/../../{ph}/lib']
+            # GTK is linked against host Cairo/GLib/Harfbuzz, while the
+            # development bundle may ship incompatible copies. Put GTK's
+            # host library directories before the bundle in RPATH so its
+            # transitive dependencies resolve to the same host stack.
+            rpath = [*gtk_library_dirs, f'$ORIGIN/../../{ph}/lib']
+            ldflags += ['-Wl,--disable-new-dtags', f'-Wl,-rpath,{os.pathsep.join(rpath)}']
     if bundle_type.startswith('macos-'):
         klp = '../Resources/kitty'
     elif bundle_type.startswith('linux-'):

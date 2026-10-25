@@ -583,6 +583,10 @@ Control when the scrollbar is displayed.
     means whenever any scrollback is present
 :code:`never`
     means disable the scrollbar.
+
+When :opt:`linux_use_gtk_window` is enabled, GTK draws the scrollbar using the
+desktop theme. The visibility policy and :opt:`scrollbar_interactive` setting
+still apply, but the custom scrollbar color and sizing options do not.
 """,
 )
 

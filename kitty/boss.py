@@ -83,6 +83,7 @@ from .fast_data_types import (
     background_opacity_of,
     change_background_opacity,
     change_drag_thumbnail,
+    cell_size_for_window,
     cocoa_hide_app,
     cocoa_hide_other_apps,
     cocoa_minimize_os_window,
@@ -2189,6 +2190,10 @@ class Boss:
             on_close_tab=lambda tab_id: self.gtk_close_tab(os_window_id, tab_id),
             on_reorder_tabs=lambda tab_ids: self.gtk_reorder_tabs(os_window_id, tab_ids),
         )
+        window.set_scrollbar_callbacks(
+            lambda: self.gtk_scrollbar_state(os_window_id),
+            lambda scrolled_by: self.gtk_scroll_to(os_window_id, scrolled_by),
+        )
         gtk_backend_register_window(os_window_id, window)
         self.gtk_windows[os_window_id] = window
         if tm := self.os_window_map.get(os_window_id):
@@ -2198,6 +2203,32 @@ class Boss:
     def queue_gtk_render(self, os_window_id: int) -> None:
         if window := self.gtk_windows.get(os_window_id):
             window.queue_render()
+
+    def gtk_scrollbar_state(self, os_window_id: int) -> tuple[float, int, int, bool, str, bool]:
+        opts = get_options()
+        tm = self.os_window_map.get(os_window_id)
+        window = tm.active_tab.active_window if tm and tm.active_tab else None
+        if window is None:
+            return 0, 0, 0, False, opts.scrollbar, opts.scrollbar_interactive
+        screen = window.screen
+        _, cell_height = cell_size_for_window(os_window_id)
+        scroll_position = screen.scrolled_by + screen.pixel_scroll_offset_y / max(1, cell_height)
+        return (
+            scroll_position,
+            screen.historybuf.count,
+            screen.lines,
+            screen.is_main_linebuf(),
+            opts.scrollbar,
+            opts.scrollbar_interactive,
+        )
+
+    def gtk_scroll_to(self, os_window_id: int, scrolled_by: float) -> None:
+        tm = self.os_window_map.get(os_window_id)
+        window = tm.active_tab.active_window if tm and tm.active_tab else None
+        if window is not None and window.screen.is_main_linebuf():
+            window.finish_scroll_animation()
+            window.screen.scroll_to_absolute(scrolled_by)
+            self.queue_gtk_render(os_window_id)
 
     def create_gtk_window(self, os_window_id: int, title: str, size: tuple[int, int], events: Any) -> Any:
         from .gtk_window import GtkKittyWindow

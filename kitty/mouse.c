@@ -625,6 +625,8 @@ static const MouseShape scrollbar_drag_mouse_cursor = NS_RESIZE_POINTER;
 static bool
 handle_scrollbar_mouse(Window *w, int button, MouseAction action, int modifiers UNUSED) {
     if (!w || !OPT(scrollbar_interactive) || !global_state.callback_os_window) return false;
+    // GTK windows provide their own native GtkScrollbar overlay.
+    if (global_state.callback_os_window->gtk_window) return false;
 
     double mouse_x = global_state.callback_os_window->mouse_x;
     double mouse_y = global_state.callback_os_window->mouse_y;

@@ -429,7 +429,23 @@ class GtkKittyWindow:
         self.gl_area.set_hexpand(True)
         self.gl_area.set_vexpand(True)
         self.gl_area.set_focusable(True)
-        self.window.set_child(self.gl_area)
+        self.content = Gtk.Overlay.new()
+        # Gtk.Align.END follows text direction, which can move the scrollbar
+        # to the physical left edge in RTL locales. Terminal chrome is always
+        # laid out left-to-right, even when the desktop locale is RTL.
+        self.content.set_direction(Gtk.TextDirection.LTR)
+        self.content.set_child(self.gl_area)
+        self.scrollbar_adjustment = Gtk.Adjustment.new(0, 0, 1, 1, 1, 1)
+        self.scrollbar = Gtk.Scrollbar.new(Gtk.Orientation.VERTICAL, self.scrollbar_adjustment)
+        self.scrollbar.set_direction(Gtk.TextDirection.LTR)
+        self.scrollbar.set_halign(Gtk.Align.END)
+        self.scrollbar.set_valign(Gtk.Align.FILL)
+        self.scrollbar.set_margin_top(4)
+        self.scrollbar.set_margin_bottom(4)
+        self.scrollbar.set_visible(False)
+        self.scrollbar_adjustment.connect('value-changed', self._scrollbar_value_changed)
+        self.content.add_overlay(self.scrollbar)
+        self.window.set_child(self.content)
 
         self.events = events
         self.os_window_id = 0
@@ -440,6 +456,12 @@ class GtkKittyWindow:
         self._cursor_hidden = False
         self._pressed_keys: set[int] = set()
         self._ime_filtered_keys: set[int] = set()
+        self._scrollbar_state_getter: Callable[[], tuple[float, int, int, bool, str, bool]] | None = None
+        self._scrollbar_scroll_handler: Callable[[float], None] | None = None
+        self._scrollbar_state: tuple[float, int, int, bool, str, bool] = (0, 0, 0, False, 'never', False)
+        self._scrollbar_hovered = False
+        self._syncing_scrollbar = False
+        self._scrollbar_adjustment_key: tuple[float, int, int, int, int, int] | None = None
         self.im_context = Gtk.IMMulticontext.new()
         self.im_context.set_client_widget(self.gl_area)
         self.im_context.connect('commit', self._ime_commit)
@@ -484,6 +506,16 @@ class GtkKittyWindow:
         scroll.connect('scroll', self._scrolled)
         self.gl_area.add_controller(scroll)
 
+        # This capture controller sees pointer motion over both the GL area and
+        # its overlay scrollbar, so visibility policies can use the right edge
+        # as the hover target even while the scrollbar itself is hidden.
+        scrollbar_motion = Gtk.EventControllerMotion.new()
+        scrollbar_motion.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        scrollbar_motion.connect('enter', self._scrollbar_pointer_moved)
+        scrollbar_motion.connect('motion', self._scrollbar_pointer_moved)
+        scrollbar_motion.connect('leave', self._scrollbar_pointer_left)
+        self.content.add_controller(scrollbar_motion)
+
     def _area_realized(self, area: Gtk.GLArea) -> None:
         area.make_current()
         error = area.get_error()
@@ -501,7 +533,9 @@ class GtkKittyWindow:
             gtk_input_resize(self.os_window_id, width, height, self._gtk_scale)
 
     def _area_rendered(self, _area: Gtk.GLArea, context: Any) -> bool:
-        return bool(self.events.render(context))
+        rendered = bool(self.events.render(context))
+        self._sync_scrollbar()
+        return rendered
 
     def _close_requested(self, _window: Gtk.Window) -> bool:
         if self._programmatic_close:
@@ -588,7 +622,71 @@ class GtkKittyWindow:
             pos = event.get_position()
             if pos and pos[0]:
                 x, y = pos[1], pos[2]
-        return bool(gtk_input_scroll(self.os_window_id, dx, dy, x, y, self._mods(controller.get_current_event_state())))
+        is_wheel = controller.get_unit() == Gdk.ScrollUnit.WHEEL
+        return bool(gtk_input_scroll(self.os_window_id, dx, dy, x, y, self._mods(controller.get_current_event_state()), is_wheel))
+
+    def set_scrollbar_callbacks(
+        self,
+        state_getter: Callable[[], tuple[float, int, int, bool, str, bool]],
+        scroll_handler: Callable[[float], None],
+    ) -> None:
+        self._scrollbar_state_getter = state_getter
+        self._scrollbar_scroll_handler = scroll_handler
+        self._sync_scrollbar()
+
+    def _sync_scrollbar(self) -> None:
+        if self._scrollbar_state_getter is None:
+            return
+        self._scrollbar_state = self._scrollbar_state_getter()
+        scrolled_by, history_lines, screen_lines, is_main_screen, _policy, interactive = self._scrollbar_state
+        lines = max(1, screen_lines)
+        history = max(0, history_lines) if is_main_screen else 0
+        adjustment_key = (max(0, history - scrolled_by), 0, history + lines, 1, max(1, lines - 1), lines)
+        if adjustment_key != self._scrollbar_adjustment_key:
+            self._syncing_scrollbar = True
+            try:
+                self.scrollbar_adjustment.configure(*adjustment_key)
+            finally:
+                self._syncing_scrollbar = False
+            self._scrollbar_adjustment_key = adjustment_key
+        self.scrollbar.set_can_target(interactive)
+        self._update_scrollbar_visibility()
+
+    def _scrollbar_value_changed(self, adjustment: Gtk.Adjustment) -> None:
+        if self._syncing_scrollbar or self._scrollbar_scroll_handler is None:
+            return
+        history = max(0, self._scrollbar_state[1])
+        if self._scrollbar_state[3]:
+            self._scrollbar_scroll_handler(max(0.0, history - adjustment.get_value()))
+
+    def _scrollbar_pointer_moved(self, _controller: Gtk.EventControllerMotion, x: float, _y: float) -> None:
+        hovered = x >= max(0, self.content.get_width() - 24)
+        if hovered != self._scrollbar_hovered:
+            self._scrollbar_hovered = hovered
+            self._update_scrollbar_visibility()
+
+    def _scrollbar_pointer_left(self, _controller: Gtk.EventControllerMotion) -> None:
+        if self._scrollbar_hovered:
+            self._scrollbar_hovered = False
+            self._update_scrollbar_visibility()
+
+    def _update_scrollbar_visibility(self) -> None:
+        _scrolled_by, history, _lines, is_main_screen, policy, _interactive = self._scrollbar_state
+        has_history = is_main_screen and history > 0
+        if not has_history:
+            self.scrollbar.set_visible(False)
+            return
+        scrolling_up = has_history and self._scrollbar_state[0] > 0
+        hovered = self._scrollbar_hovered
+        visible = {
+            'always': has_history,
+            'never': False,
+            'scrolled': scrolling_up,
+            'hovered': hovered,
+            'scrolled-and-hovered': scrolling_up and hovered,
+            'scrolled-or-hovered': scrolling_up or hovered,
+        }.get(policy, scrolling_up)
+        self.scrollbar.set_visible(visible)
 
     @staticmethod
     def _mods(state: Gdk.ModifierType) -> int:

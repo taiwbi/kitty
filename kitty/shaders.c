@@ -1618,6 +1618,7 @@ static void
 draw_scrollbar(const UIRenderData *ui) {
     Screen *screen = ui->screen;
     Window *window = ui->window;
+    if (ui->os_window && ui->os_window->gtk_window) return;
     if (!window || !screen || !has_scrollbar(window, screen)) return;
 
     color_type bar_color = scrollbar_color(screen, OPT(scrollbar_handle_color)), track_color = scrollbar_color(screen, OPT(scrollbar_track_color));

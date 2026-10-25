@@ -1114,20 +1114,24 @@ gtk_input_mouse_button(PyObject UNUSED *self, PyObject *args) {
 PyObject *
 gtk_input_scroll(PyObject UNUSED *self, PyObject *args) {
     unsigned long long id;
-    int mods;
+    int mods, is_wheel;
     double dx, dy, x, y;
-    if (!PyArg_ParseTuple(args, "Kddddi", &id, &dx, &dy, &x, &y, &mods)) return NULL;
+    if (!PyArg_ParseTuple(args, "Kddddip", &id, &dx, &dy, &x, &y, &mods, &is_wheel)) return NULL;
     OSWindow *osw = gtk_os_window_from_id(id);
     if (!osw) return NULL;
     osw->has_received_cursor_pos_event = true;
     set_os_window_mouse_position(osw, x, y);
-    const double scale = MAX(osw->gtk_scale, 1);
+    // GDK scroll deltas use positive values for down/right, while kitty's
+    // scroll events use positive values for up/right.
+    // Wheel units count detents; surface units are logical pixels and need to
+    // be scaled to framebuffer pixels for high-resolution scrolling.
+    const double scale = is_wheel ? 1.0 : MAX(osw->gtk_scale, 1);
     GLFWScrollEvent ev = {
         .x_offset = dx * scale,
-        .y_offset = dy * scale,
-        .unscaled = {.x = dx, .y = dy},
+        .y_offset = -dy * scale,
+        .unscaled = {.x = dx, .y = -dy},
         .momentum_type = GLFW_NO_MOMENTUM_DATA,
-        .offset_type = GLFW_SCROLL_OFFEST_HIGHRES,
+        .offset_type = is_wheel ? GLFW_SCROLL_OFFSET_LINES : GLFW_SCROLL_OFFEST_HIGHRES,
         .keyboard_modifiers = mods,
     };
     scroll_callback(osw->handle, &ev);
