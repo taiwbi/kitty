@@ -3687,6 +3687,9 @@ Use GTK 4 and libadwaita for GNOME Wayland window decorations and the tab
 header bar. This requires kitty to be built with GTK 4 and libadwaita
 development libraries, and only applies to GNOME on Wayland. The default is
 the native kitty window backend.
+
+GTK windows return to the bottom of the scrollback when typing or receiving
+new output. The native scrollbar follows the :opt:`scrollbar` visibility policy.
 """,
 )
 

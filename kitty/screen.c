@@ -6166,6 +6166,17 @@ screen_history_scroll(Screen *self, int amt, bool upwards) {
     return false;
 }
 
+void
+screen_scroll_to_bottom(Screen *self) {
+    if (!self->scrolled_by && !self->pixel_scroll_offset_y) return;
+    if (self->callbacks != Py_None) {
+        PyObject *ret = PyObject_CallMethod(self->callbacks, "finish_scroll_animation", NULL);
+        if (ret == NULL) PyErr_Print();
+        else Py_DECREF(ret);
+    }
+    screen_history_scroll(self, SCROLL_FULL, false);
+}
+
 static bool
 screen_fractional_scroll(Screen *self, double amt) {
     if (amt == 0 || isnan(amt)) return false;

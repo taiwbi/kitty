@@ -18,7 +18,7 @@ import gi
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Adw, Gdk, Gtk  # type: ignore[import-not-found]
+from gi.repository import Adw, Gdk, GLib, Gtk  # type: ignore[import-not-found]
 
 from .fast_data_types import (
     GLFW_FKEY_BACKSPACE,
@@ -461,6 +461,7 @@ class GtkKittyWindow:
         self._scrollbar_state: tuple[float, int, int, bool, str, bool] = (0, 0, 0, False, 'never', False)
         self._scrollbar_hovered = False
         self._syncing_scrollbar = False
+        self._scrollbar_sync_source = 0
         self._scrollbar_adjustment_key: tuple[float, int, int, int, int, int] | None = None
         self.im_context = Gtk.IMMulticontext.new()
         self.im_context.set_client_widget(self.gl_area)
@@ -534,8 +535,17 @@ class GtkKittyWindow:
 
     def _area_rendered(self, _area: Gtk.GLArea, context: Any) -> bool:
         rendered = bool(self.events.render(context))
-        self._sync_scrollbar()
+        # GLArea renders during GTK's snapshot phase. Changing the adjustment
+        # or visibility here invalidates the scrollbar's allocation while GTK
+        # is drawing it. Sync after the snapshot so GTK can lay it out first.
+        if not self._scrollbar_sync_source:
+            self._scrollbar_sync_source = GLib.idle_add(self._sync_scrollbar_after_render)
         return rendered
+
+    def _sync_scrollbar_after_render(self) -> bool:
+        self._scrollbar_sync_source = 0
+        self._sync_scrollbar()
+        return GLib.SOURCE_REMOVE
 
     def _close_requested(self, _window: Gtk.Window) -> bool:
         if self._programmatic_close:
@@ -915,8 +925,6 @@ class GtkKittyWindow:
     def realize_gl_area(self, present: bool = True) -> None:
         # The first GTK GL context must be current before kitty uploads shader
         # programs and sprite atlases during create_os_window().
-        from gi.repository import GLib
-
         if present:
             self.window.present()
             gtk_backend_activate()
@@ -978,5 +986,8 @@ class GtkKittyWindow:
 
     def close(self) -> None:
         self._programmatic_close = True
+        if self._scrollbar_sync_source:
+            GLib.source_remove(self._scrollbar_sync_source)
+            self._scrollbar_sync_source = 0
         self.bind(0)
         self.window.close()

@@ -457,6 +457,9 @@ Detailed list of changes
 - Make reverse-video cursors follow dimmed text colors while keeping text under
   block cursors legible.
 
+- GTK windows: Fix the native scrollbar disappearing during rendering and
+  return to the bottom of the terminal when typing or receiving new output.
+
 - A new option :opt:`detect_url_regex` to detect arbitrary text, such as file
   references in compiler output, as clickable URLs under the mouse (:iss:`10407`)
 

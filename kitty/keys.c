@@ -212,7 +212,7 @@ send_key_to_child(id_type window_id, Screen *screen, const GLFWkeyevent *ev) {
         return;
     }
     if ((screen->scrolled_by || screen->pixel_scroll_offset_y != 0) && action == GLFW_PRESS && !is_no_action_key(key, native_key)) {
-        screen_history_scroll(screen, SCROLL_FULL, false); // scroll back to bottom
+        screen_scroll_to_bottom(screen);
     }
     char encoded_key[KEY_BUFFER_SIZE] = {0};
     int size = encode_glfw_key_event(ev, screen->modes.mDECCKM, screen_current_key_encoding_flags(screen), encoded_key);
@@ -311,6 +311,7 @@ on_key_input(const GLFWkeyevent *ev) {
             return;
         case GLFW_IME_COMMIT_TEXT:
             if (*text) {
+                screen_scroll_to_bottom(screen);
                 schedule_write_to_child(w->id, 1, text, strlen(text));
                 debug("committed pre-edit text: %s sent to child as text.\n", text);
             } else debug("committed pre-edit text: (null)\n");

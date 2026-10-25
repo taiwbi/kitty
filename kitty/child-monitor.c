@@ -553,6 +553,7 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     ParseData pd = {.dump_callback = self->dump_callback, .now = now};
     self->parse_func(screen, &pd, flush);
     if (pd.input_read) {
+        if (is_gtk_backend_enabled()) screen_scroll_to_bottom(screen);
         if (pd.write_space_created) wakeup_io_loop(self, false);
         if (screen->paused_rendering.expires_at) set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
     }
