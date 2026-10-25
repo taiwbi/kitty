@@ -795,6 +795,10 @@ def kitty_env(args: Options) -> Env:
             gtk_library_dirs.extend(pkg_config('libadwaita-1', '--variable=libdir', system=True))
             gtk_library_dirs[:] = list(dict.fromkeys(filter(None, gtk_library_dirs)))
             cppflags.append('-DKITTY_WITH_GTK')
+            if subprocess.run([PKGCONFIG, '--exists', 'wayland-client'], env=gtk_pkg_env, check=False).returncode == 0:
+                gtk_cflags.extend(pkg_config('wayland-client', '--cflags-only-I', system=True))
+                gtk_libs.extend(pkg_config('wayland-client', '--libs', system=True))
+                cppflags.append('-DKITTY_WITH_GTK_WAYLAND_BLUR')
         else:
             print(error('GTK backend disabled: GTK 4 and libadwaita 1.4 or newer are required'), file=sys.stderr)
     if is_linux and os.environ.get('KITTY_REQUIRE_GTK') == '1' and not gtk_libs:
@@ -1467,18 +1471,29 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
     if call_init:
         init_env_from_args(args, native_optimizations)
 
+    # GTK's blur bridge reuses the generated client bindings from the regular
+    # Wayland backend, so generate those bindings before compiling kitty core.
+    compile_glfw(args.compilation_database, args.build_dsym)
     sources, headers = find_c_files()
     headers.append(build_ref_map(args.skip_code_generation))
     headers.append(build_cli_parser_specs(args.skip_code_generation))
+    kenv = kitty_env(args)
+    if '-DKITTY_WITH_GTK_WAYLAND_BLUR' in kenv.cppflags:
+        protocol_source = 'glfw/wayland-ext-background-effect-v1-client-protocol.c'
+        protocol_header = 'glfw/wayland-ext-background-effect-v1-client-protocol.h'
+        if os.path.isfile(protocol_source) and os.path.isfile(protocol_header):
+            sources.append(protocol_source)
+            headers.append(protocol_header)
+        else:
+            kenv.cppflags.remove('-DKITTY_WITH_GTK_WAYLAND_BLUR')
     compile_c_extension(
-        kitty_env(args),
+        kenv,
         'kitty/fast_data_types',
         args.compilation_database,
         sources,
         headers,
         build_dsym=args.build_dsym,
     )
-    compile_glfw(args.compilation_database, args.build_dsym)
     compile_kittens(args)
     add_builtin_fonts(args)
 

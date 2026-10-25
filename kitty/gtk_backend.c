@@ -12,6 +12,13 @@
 #include <gtk/gtk.h>
 #include "glfw-wrapper.h"
 #include <stdatomic.h>
+#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+#include <gdk/wayland/gdkwayland.h>
+#include <wayland-client.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../glfw/wayland-ext-background-effect-v1-client-protocol.h"
+#endif
 static bool gtk_backend_initialized = false;
 static bool gtk_backend_active = false;
 static bool gtk_backend_enabled = false;
@@ -32,6 +39,155 @@ typedef struct GTKTimer {
 
 static GTKTimer *gtk_timers = NULL;
 static id_type next_gtk_timer_id = 0;
+
+#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+typedef struct GTKWaylandBlurSurface {
+    id_type window_id;
+    GdkSurface *gdk_surface;
+    struct wl_surface *wl_surface;
+    struct ext_background_effect_surface_v1 *effect;
+    int blur_radius;
+    int region_width, region_height;
+    bool region_set;
+    struct GTKWaylandBlurSurface *next;
+} GTKWaylandBlurSurface;
+
+static struct wl_display *gtk_blur_display = NULL;
+static struct wl_compositor *gtk_blur_compositor = NULL;
+static struct wl_registry *gtk_blur_registry = NULL;
+static struct ext_background_effect_manager_v1 *gtk_blur_manager = NULL;
+static uint32_t gtk_blur_capabilities = 0;
+static uint32_t gtk_blur_manager_name = 0;
+static GTKWaylandBlurSurface *gtk_blur_surfaces = NULL;
+
+static void gtk_wayland_blur_update(GTKWaylandBlurSurface *entry);
+
+static void
+gtk_wayland_blur_capabilities(void UNUSED *data, struct ext_background_effect_manager_v1 UNUSED *manager, uint32_t flags) {
+    gtk_blur_capabilities = flags;
+    for (GTKWaylandBlurSurface *entry = gtk_blur_surfaces; entry; entry = entry->next) gtk_wayland_blur_update(entry);
+    if (gtk_blur_display) wl_display_flush(gtk_blur_display);
+}
+
+static const struct ext_background_effect_manager_v1_listener gtk_wayland_blur_listener = {
+    gtk_wayland_blur_capabilities,
+};
+
+static void
+gtk_wayland_blur_global(void UNUSED *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
+    if (!gtk_blur_manager && strcmp(interface, "ext_background_effect_manager_v1") == 0) {
+        gtk_blur_manager_name = name;
+        gtk_blur_manager = wl_registry_bind(registry, name, &ext_background_effect_manager_v1_interface, MIN(version, 1));
+        if (gtk_blur_manager) {
+            ext_background_effect_manager_v1_add_listener(gtk_blur_manager, &gtk_wayland_blur_listener, NULL);
+            wl_display_flush(gtk_blur_display);
+        }
+    }
+}
+
+static void
+gtk_wayland_blur_global_remove(void UNUSED *data, struct wl_registry UNUSED *registry, uint32_t name) {
+    if (name != gtk_blur_manager_name) return;
+    gtk_blur_manager_name = 0;
+    gtk_blur_capabilities = 0;
+    if (gtk_blur_manager) {
+        ext_background_effect_manager_v1_destroy(gtk_blur_manager);
+        gtk_blur_manager = NULL;
+    }
+    for (GTKWaylandBlurSurface *entry = gtk_blur_surfaces; entry; entry = entry->next) {
+        if (entry->effect) {
+            ext_background_effect_surface_v1_destroy(entry->effect);
+            entry->effect = NULL;
+        }
+        entry->region_set = false;
+    }
+}
+
+static const struct wl_registry_listener gtk_wayland_blur_registry_listener = {
+    gtk_wayland_blur_global,
+    gtk_wayland_blur_global_remove,
+};
+
+static void
+gtk_wayland_blur_initialize(GdkDisplay *display) {
+    if (gtk_blur_registry || !display || !GDK_IS_WAYLAND_DISPLAY(display)) return;
+    gtk_blur_display = gdk_wayland_display_get_wl_display(display);
+    gtk_blur_compositor = gdk_wayland_display_get_wl_compositor(display);
+    if (!gtk_blur_display || !gtk_blur_compositor) return;
+    gtk_blur_registry = wl_display_get_registry(gtk_blur_display);
+    if (gtk_blur_registry) {
+        wl_registry_add_listener(gtk_blur_registry, &gtk_wayland_blur_registry_listener, NULL);
+        wl_display_flush(gtk_blur_display);
+    }
+}
+
+static void
+gtk_wayland_blur_update(GTKWaylandBlurSurface *entry) {
+    if (!entry->effect && gtk_blur_manager && entry->blur_radius > 0 &&
+        (gtk_blur_capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {
+        entry->effect = ext_background_effect_manager_v1_get_background_effect(gtk_blur_manager, entry->wl_surface);
+    }
+    if (!entry->effect) return;
+    if (entry->blur_radius <= 0 || !gtk_blur_manager ||
+        !(gtk_blur_capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {
+        if (entry->region_set) {
+            ext_background_effect_surface_v1_set_blur_region(entry->effect, NULL);
+            entry->region_set = false;
+            gdk_surface_queue_render(entry->gdk_surface);
+        }
+        return;
+    }
+    const int width = gdk_surface_get_width(entry->gdk_surface), height = gdk_surface_get_height(entry->gdk_surface);
+    if (entry->region_set && entry->region_width == width && entry->region_height == height) return;
+    struct wl_region *region = width > 0 && height > 0 ? wl_compositor_create_region(gtk_blur_compositor) : NULL;
+    if (region) {
+        wl_region_add(region, 0, 0, width, height);
+        ext_background_effect_surface_v1_set_blur_region(entry->effect, region);
+        wl_region_destroy(region);
+        entry->region_width = width;
+        entry->region_height = height;
+        entry->region_set = true;
+        gdk_surface_queue_render(entry->gdk_surface);
+    }
+}
+
+static void *
+gtk_pointer_from_capsule(PyObject *capsule) {
+    if (!PyCapsule_CheckExact(capsule)) {
+        PyErr_SetString(PyExc_TypeError, "expected a PyGObject native pointer capsule");
+        return NULL;
+    }
+    const char *name = PyCapsule_GetName(capsule);
+    if (!name && PyErr_Occurred()) return NULL;
+    return PyCapsule_GetPointer(capsule, name);
+}
+
+static GTKWaylandBlurSurface *
+gtk_wayland_blur_surface_for_id(id_type window_id) {
+    for (GTKWaylandBlurSurface *entry = gtk_blur_surfaces; entry; entry = entry->next) {
+        if (entry->window_id == window_id) return entry;
+    }
+    return NULL;
+}
+
+static void
+gtk_wayland_blur_remove(id_type window_id) {
+    GTKWaylandBlurSurface **link = &gtk_blur_surfaces;
+    while (*link) {
+        GTKWaylandBlurSurface *entry = *link;
+        if (entry->window_id != window_id) {
+            link = &entry->next;
+            continue;
+        }
+        if (entry->effect) ext_background_effect_surface_v1_destroy(entry->effect);
+        g_object_unref(entry->gdk_surface);
+        *link = entry->next;
+        free(entry);
+        if (gtk_blur_display) wl_display_flush(gtk_blur_display);
+        return;
+    }
+}
+#endif
 #endif
 
 PyObject *
@@ -133,6 +289,64 @@ gtk_backend_register_window(PyObject UNUSED *self, PyObject UNUSED *args) {
     PyErr_SetString(PyExc_RuntimeError, "kitty was built without GTK 4 and libadwaita development libraries");
     return NULL;
 #endif
+}
+
+PyObject *
+gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long window_id = 0;
+    PyObject *display_capsule = NULL, *surface_capsule = NULL;
+    int blur_radius = 0;
+    if (!PyArg_ParseTuple(args, "KOOi", &window_id, &display_capsule, &surface_capsule, &blur_radius)) return NULL;
+#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+    GdkDisplay *display = gtk_pointer_from_capsule(display_capsule);
+    if (!display) return NULL;
+    GdkSurface *surface = gtk_pointer_from_capsule(surface_capsule);
+    if (!surface) return NULL;
+    if (!GDK_IS_WAYLAND_DISPLAY(display) || !GDK_IS_WAYLAND_SURFACE(surface) || gdk_surface_get_display(surface) != display) Py_RETURN_NONE;
+    struct wl_surface *wl_surface = gdk_wayland_surface_get_wl_surface(surface);
+    if (!wl_surface) Py_RETURN_NONE;
+    gtk_wayland_blur_initialize(display);
+    if (!gtk_blur_display || gtk_blur_display != gdk_wayland_display_get_wl_display(display)) Py_RETURN_NONE;
+    GTKWaylandBlurSurface *entry = gtk_wayland_blur_surface_for_id((id_type)window_id);
+    if (!entry && blur_radius <= 0) Py_RETURN_NONE;
+    if (!entry) {
+        entry = calloc(1, sizeof(GTKWaylandBlurSurface));
+        if (!entry) return PyErr_NoMemory();
+        entry->window_id = (id_type)window_id;
+        entry->next = gtk_blur_surfaces;
+        gtk_blur_surfaces = entry;
+    } else if (entry->gdk_surface != surface) {
+        if (entry->effect) ext_background_effect_surface_v1_destroy(entry->effect);
+        entry->effect = NULL;
+        entry->region_set = false;
+        g_clear_object(&entry->gdk_surface);
+    }
+    if (entry->gdk_surface != surface) {
+        entry->gdk_surface = g_object_ref(surface);
+        entry->wl_surface = wl_surface;
+    }
+    entry->blur_radius = blur_radius;
+    gtk_wayland_blur_update(entry);
+    wl_display_flush(gtk_blur_display);
+#else
+    (void)window_id;
+    (void)display_capsule;
+    (void)surface_capsule;
+    (void)blur_radius;
+#endif
+    Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_backend_clear_window_blur(PyObject UNUSED *self, PyObject *args) {
+    unsigned long long window_id = 0;
+    if (!PyArg_ParseTuple(args, "K", &window_id)) return NULL;
+#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+    gtk_wayland_blur_remove((id_type)window_id);
+#else
+    (void)window_id;
+#endif
+    Py_RETURN_NONE;
 }
 
 PyObject *

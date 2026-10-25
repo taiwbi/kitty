@@ -2295,9 +2295,9 @@ init_window_chrome_state(WindowChromeState *s, color_type active_window_bg, floa
 }
 
 static void
-apply_gtk_chrome_style(OSWindow *w, color_type background_color, float background_opacity) {
+apply_gtk_chrome_style(OSWindow *w, color_type background_color, float background_opacity, int background_blur) {
     if (!w->gtk_window) return;
-    PyObject *ret = PyObject_CallMethod(w->gtk_window, "apply_chrome_style", "If", background_color, background_opacity);
+    PyObject *ret = PyObject_CallMethod(w->gtk_window, "apply_chrome_style", "Ifi", background_color, background_opacity, background_blur);
     if (!ret) PyErr_Print();
     else Py_DECREF(ret);
 }
@@ -2352,7 +2352,7 @@ set_os_window_chrome(OSWindow *w) {
 
     WindowChromeState new_state;
     init_window_chrome_state(&new_state, bg, effective_os_window_alpha(w));
-    if (w->gtk_window) apply_gtk_chrome_style(w, bg, new_state.background_opacity);
+    if (w->gtk_window) apply_gtk_chrome_style(w, bg, new_state.background_opacity, new_state.background_blur);
     if (memcmp(&new_state, &w->last_window_chrome, sizeof(WindowChromeState)) != 0) {
         int width, height;
         if (w->gtk_window) get_os_window_size(w, &width, &height, NULL, NULL);
@@ -2686,7 +2686,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     }
     if (is_gtk_backend_enabled() || (OPT(hide_window_decorations) & 1)) glfwWindowHint(GLFW_DECORATED, false);
 
-    const bool set_blur = OPT(background_blur) > 0 && OPT(background_opacity) < 1.f;
+    const bool set_blur = !is_gtk_backend_enabled() && OPT(background_blur) > 0 && OPT(background_opacity) < 1.f;
     glfwWindowHint(GLFW_BLUR_RADIUS, set_blur ? OPT(background_blur) : 0);
 #ifdef __APPLE__
     glfwWindowHint(GLFW_COCOA_COLOR_SPACE, OPT(macos_colorspace));
@@ -2935,7 +2935,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         }
     }
     init_window_chrome_state(&w->last_window_chrome, OPT(background), effective_os_window_alpha(w));
-    if (w->gtk_window) apply_gtk_chrome_style(w, OPT(background), w->last_window_chrome.background_opacity);
+    if (w->gtk_window) apply_gtk_chrome_style(w, OPT(background), w->last_window_chrome.background_opacity, w->last_window_chrome.background_blur);
     if (w->is_layer_shell) {
         if (global_state.is_apple) set_layer_shell_config_for(w, lsc);
     } else if (!w->gtk_window) apply_window_chrome_state(w->handle, w->last_window_chrome, width, height, global_state.is_apple ? OPT(hide_window_decorations) != 0 : false);
