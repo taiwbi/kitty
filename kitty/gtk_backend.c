@@ -373,9 +373,9 @@ gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
     double surface_x = 0.0, surface_y = 0.0;
     gtk_native_get_surface_transform(GTK_NATIVE(window), &surface_x, &surface_y);
     // GTK's Wayland surface includes transparent client-side shadow margins.
-    // The native transform maps surface coordinates into widget coordinates;
-    // negate it to place the visible GtkWindow allocation inside the surface.
-    const int region_x = (int)(-surface_x + 0.5), region_y = (int)(-surface_y + 0.5);
+    // GtkWindow reports the inset of its allocation in the native surface.
+    // Negating it moves the blur into the transparent shadow, outside the window.
+    const int region_x = (int)floor(surface_x), region_y = (int)floor(surface_y);
     const int region_width = gtk_widget_get_width(GTK_WIDGET(window));
     const int region_height = gtk_widget_get_height(GTK_WIDGET(window));
     if (entry->region_x != region_x || entry->region_y != region_y ||
@@ -424,8 +424,14 @@ gtk_backend_main_context_iteration(PyObject UNUSED *self, PyObject UNUSED *args)
 }
 
 #ifdef KITTY_WITH_GTK
+static void
+gtk_release_gil(PyGILState_STATE *state) {
+    PyGILState_Release(*state);
+}
+
 static gboolean
 gtk_dispatch_tick(gpointer UNUSED data) {
+    __attribute__((cleanup(gtk_release_gil))) PyGILState_STATE gil = PyGILState_Ensure();
     atomic_store(&gtk_tick_pending, false);
     if (gtk_main_loop && gtk_tick_callback) gtk_tick_callback(gtk_tick_callback_data);
     return G_SOURCE_REMOVE;
@@ -433,6 +439,7 @@ gtk_dispatch_tick(gpointer UNUSED data) {
 
 static gboolean
 gtk_poll_glfw_events(gpointer UNUSED data) {
+    __attribute__((cleanup(gtk_release_gil))) PyGILState_STATE gil = PyGILState_Ensure();
     glfwPollEvents();
     return G_SOURCE_CONTINUE;
 }
@@ -455,6 +462,10 @@ gtk_timer_interval_ms(monotonic_t interval) {
 
 static gboolean
 gtk_timer_callback(gpointer data) {
+    // PyGObject releases the GIL around MainContext.iteration(), including
+    // nested iterations while realizing a window or transferring clipboard data.
+    // Our native sources call Python and must acquire it themselves.
+    __attribute__((cleanup(gtk_release_gil))) PyGILState_STATE gil = PyGILState_Ensure();
     GTKTimer *timer = data;
     const guint fired_source = timer->source_id;
     if (timer->removed || !timer->enabled) return G_SOURCE_REMOVE;

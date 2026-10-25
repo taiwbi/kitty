@@ -410,6 +410,9 @@ change_live_resize_state(OSWindow *w, bool in_progress) {
 #ifdef __APPLE__
         cocoa_out_of_sequence_render(w);
 #else
+        // GTK owns presentation for its GLArea. GLFW's hidden context and
+        // surface must not be used to change its swap interval.
+        if (w->gtk_window) return;
         GLFWwindow *orig_ctx = make_os_window_context_current(w);
         apply_swap_interval(in_progress ? 0 : -1);
         if (orig_ctx) glfwMakeContextCurrent(orig_ctx);
@@ -2816,7 +2819,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         PyObject *tmp = PyObject_CallMethod(gtk_window_obj, "set_size", "ii", width, height);
         if (!tmp) return NULL;
         Py_DECREF(tmp);
-        tmp = PyObject_CallMethod(gtk_window_obj, "realize_gl_area", "p", window_state != WINDOW_HIDDEN);
+        tmp = PyObject_CallMethod(gtk_window_obj, "realize_gl_area", "i", window_state != WINDOW_HIDDEN);
         if (!tmp) return NULL;
         Py_DECREF(tmp);
         tmp = PyObject_CallMethod(gtk_window_obj, "make_gl_current", NULL);

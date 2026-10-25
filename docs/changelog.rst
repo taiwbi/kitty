@@ -231,6 +231,12 @@ Detailed list of changes
 0.50.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- GTK window backend: Fix crashes when native timers and GLFW events are
+  dispatched by a Python GTK event loop. Wait for the GLArea's initial allocation
+  and avoid forwarding zero-sized resizes or changing GLFW's swap interval.
+  Correct the Wayland blur offset for client-side shadow margins. Avoid setting
+  a background uniform in the foreground shader.
+
 - GTK window backend: Keep Wayland background blur inside the visible window
   and set the application ID from kitty's window class. Use kitty's bounded
   blur region instead of GTK's CSS backdrop blur when the Wayland protocol is

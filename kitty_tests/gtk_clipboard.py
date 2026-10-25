@@ -146,6 +146,13 @@ class TestGtkClipboard(BaseTest):
             def read_finish(self, result):
                 return backend.Gio.MemoryInputStream.new_from_bytes(backend.GLib.Bytes.new(payload)), 'text/plain'
 
+            def read_text_async(self, cancellable, callback, data):
+                self.mimes = ['text/plain']
+                backend.GLib.idle_add(lambda: callback(self, None, data))
+
+            def read_text_finish(self, result):
+                return payload.decode('utf-8')
+
         regular, primary = FakeClipboard(), FakeClipboard()
         with patch.dict(backend._clipboards, {GLFW_CLIPBOARD: regular, GLFW_PRIMARY_SELECTION: primary}):
             for ctype in (GLFW_CLIPBOARD, GLFW_PRIMARY_SELECTION):
@@ -155,12 +162,16 @@ class TestGtkClipboard(BaseTest):
                 parts.clear()
                 backend.get_clipboard_mime(ctype, 'text/plain', parts.append)
                 self.ae(b''.join(parts), payload)
+                self.ae(len(parts), 1)
+                parts.clear()
+                backend.get_clipboard_mime(ctype, 'application/test', parts.append)
+                self.ae(b''.join(parts), payload)
                 self.assertGreater(len(parts), 1)
                 parts.clear()
                 backend.get_clipboard_mime(ctype, 'unavailable', parts.append)
                 self.ae(parts, [])
-            self.ae(regular.mimes, ['text/plain'])
-            self.ae(primary.mimes, ['text/plain'])
+            self.ae(regular.mimes, ['application/test'])
+            self.ae(primary.mimes, ['application/test'])
             source = Clipboard()
             source.data = {'text/plain': b'local'}
             with patch.object(backend, 'get_boss', return_value=SimpleNamespace(clipboard=source)):

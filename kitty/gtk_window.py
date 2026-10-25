@@ -172,7 +172,7 @@ class GtkKittyEvents:
         pass
 
     def resized(self, width: int, height: int, scale: int) -> None:
-        if self.os_window_id:
+        if self.os_window_id and width > 0 and height > 0:
             gtk_input_resize(self.os_window_id, width, height, scale)
 
     def render(self, _context: Any) -> bool:
@@ -555,7 +555,7 @@ class GtkKittyWindow:
 
     def _area_resized(self, _area: Gtk.GLArea, width: int, height: int) -> None:
         self._gtk_scale = max(1, self.gl_area.get_scale_factor())
-        if self.os_window_id:
+        if self.os_window_id and width > 0 and height > 0:
             gtk_input_resize(self.os_window_id, width, height, self._gtk_scale)
             self._apply_wayland_blur()
 
@@ -975,7 +975,7 @@ class GtkKittyWindow:
         context = GLib.MainContext.default()
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if self.gl_area.get_realized():
+            if self.gl_area.get_realized() and self.gl_area.get_width() > 0 and self.gl_area.get_height() > 0:
                 self.gl_area.make_current()
                 if error := self.gl_area.get_error():
                     raise RuntimeError(f'Failed to create GTK OpenGL area: {error.message}')

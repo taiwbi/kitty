@@ -1954,7 +1954,7 @@ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for
     CELL_BUFFERS;
     bind_vao_uniform_buffer(vao_idx, uniform_buffer, CELL_RENDER_DATA_BINDING_POINT);
     bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
-    glUniform1ui(program_uniform_location(program, "draw_bg_bitfield"), draw_bg_bitfield);
+    if (program != CELL_FG_PROGRAM) glUniform1ui(program_uniform_location(program, "draw_bg_bitfield"), draw_bg_bitfield);
     glUniform1i(program_uniform_location(program, "italic_overdraw_only"), overdraw_only);
     if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
     draw_quad(!for_final_output, render_lines_for_screen(ui->screen) * ui->screen->columns);
