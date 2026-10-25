@@ -200,7 +200,9 @@ def freeze() -> Path:
     extension_dir = Path(env.lib_dir) / 'kitty-extensions'
     for pattern in ('gi._gi*.so', 'cairo._cairo*.so'):
         for extension in extension_dir.glob(pattern):
-            run('chrpath', '-r', '$ORIGIN/..', str(extension))
+            # Pycairo's extension can have no RPATH at all; chrpath only edits
+            # an existing tag, while patchelf can add the relocatable RUNPATH.
+            run('patchelf', '--set-rpath', '$ORIGIN/..', str(extension))
     init_env['build_frozen_launcher']([mod['path_to_freeze_dir'](), env.obj_dir])
     files = mod['find_binaries'](env)
     mod['fix_permissions'](files)

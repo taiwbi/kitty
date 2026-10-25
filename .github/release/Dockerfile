@@ -12,7 +12,7 @@ ARG RELEASE_GTK=1
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-    build-essential ca-certificates chrpath curl git pkg-config xz-utils \
+    build-essential ca-certificates chrpath curl git patchelf pkg-config xz-utils \
     libfontconfig1-dev libdbus-1-dev libgl1-mesa-dev libxcursor-dev \
     libxi-dev libxinerama-dev libxrandr-dev libx11-xcb-dev libxcb-xkb-dev \
     libsystemd-dev ncurses-bin \
