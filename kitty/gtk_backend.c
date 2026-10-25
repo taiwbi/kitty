@@ -12,8 +12,10 @@
 #include <gtk/gtk.h>
 #include "glfw-wrapper.h"
 #include <stdatomic.h>
-#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+#if defined(GDK_WINDOWING_WAYLAND)
 #include <gdk/wayland/gdkwayland.h>
+#endif
+#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
 #include <wayland-client.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,14 +42,28 @@ typedef struct GTKTimer {
 static GTKTimer *gtk_timers = NULL;
 static id_type next_gtk_timer_id = 0;
 
-#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+#if defined(KITTY_WITH_GTK) && \
+    (defined(KITTY_WITH_GTK_WAYLAND_BLUR) || (defined(GDK_WINDOWING_WAYLAND) && GTK_CHECK_VERSION(4, 12, 0)))
+static void *
+gtk_pointer_from_capsule(PyObject *capsule) {
+    if (!PyCapsule_CheckExact(capsule)) {
+        PyErr_SetString(PyExc_TypeError, "expected a PyGObject native pointer capsule");
+        return NULL;
+    }
+    const char *name = PyCapsule_GetName(capsule);
+    if (!name && PyErr_Occurred()) return NULL;
+    return PyCapsule_GetPointer(capsule, name);
+}
+#endif
+
+#if defined(KITTY_WITH_GTK) && defined(KITTY_WITH_GTK_WAYLAND_BLUR)
 typedef struct GTKWaylandBlurSurface {
     id_type window_id;
     GdkSurface *gdk_surface;
     struct wl_surface *wl_surface;
     struct ext_background_effect_surface_v1 *effect;
     int blur_radius;
-    int region_width, region_height;
+    int region_x, region_y, region_width, region_height;
     bool region_set;
     struct GTKWaylandBlurSurface *next;
 } GTKWaylandBlurSurface;
@@ -137,29 +153,17 @@ gtk_wayland_blur_update(GTKWaylandBlurSurface *entry) {
         }
         return;
     }
-    const int width = gdk_surface_get_width(entry->gdk_surface), height = gdk_surface_get_height(entry->gdk_surface);
-    if (entry->region_set && entry->region_width == width && entry->region_height == height) return;
+    const int x = entry->region_x, y = entry->region_y;
+    const int width = entry->region_width, height = entry->region_height;
+    if (entry->region_set && width > 0 && height > 0) return;
     struct wl_region *region = width > 0 && height > 0 ? wl_compositor_create_region(gtk_blur_compositor) : NULL;
     if (region) {
-        wl_region_add(region, 0, 0, width, height);
+        wl_region_add(region, x, y, width, height);
         ext_background_effect_surface_v1_set_blur_region(entry->effect, region);
         wl_region_destroy(region);
-        entry->region_width = width;
-        entry->region_height = height;
         entry->region_set = true;
         gdk_surface_queue_render(entry->gdk_surface);
     }
-}
-
-static void *
-gtk_pointer_from_capsule(PyObject *capsule) {
-    if (!PyCapsule_CheckExact(capsule)) {
-        PyErr_SetString(PyExc_TypeError, "expected a PyGObject native pointer capsule");
-        return NULL;
-    }
-    const char *name = PyCapsule_GetName(capsule);
-    if (!name && PyErr_Occurred()) return NULL;
-    return PyCapsule_GetPointer(capsule, name);
 }
 
 static GTKWaylandBlurSurface *
@@ -292,17 +296,49 @@ gtk_backend_register_window(PyObject UNUSED *self, PyObject UNUSED *args) {
 }
 
 PyObject *
+gtk_backend_set_window_app_id(PyObject UNUSED *self, PyObject *args) {
+    PyObject *window_capsule = NULL;
+    const char *application_id = NULL;
+    if (!PyArg_ParseTuple(args, "Os", &window_capsule, &application_id)) return NULL;
+#ifdef KITTY_WITH_GTK
+#if defined(GDK_WINDOWING_WAYLAND) && GTK_CHECK_VERSION(4, 12, 0)
+    GtkWindow *window = gtk_pointer_from_capsule(window_capsule);
+    if (!window) return NULL;
+    if (!GTK_IS_WINDOW(window)) {
+        PyErr_SetString(PyExc_TypeError, "expected a GTK window");
+        return NULL;
+    }
+    GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(window));
+    if (surface && GDK_IS_WAYLAND_DISPLAY(gtk_widget_get_display(GTK_WIDGET(window)))) {
+        gdk_wayland_toplevel_set_application_id(GDK_TOPLEVEL(surface), application_id);
+    }
+#else
+    (void)window_capsule;
+    (void)application_id;
+#endif
+#else
+    (void)window_capsule;
+    (void)application_id;
+#endif
+    Py_RETURN_NONE;
+}
+
+PyObject *
 gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
     unsigned long long window_id = 0;
-    PyObject *display_capsule = NULL, *surface_capsule = NULL;
+    PyObject *window_capsule = NULL;
     int blur_radius = 0;
-    if (!PyArg_ParseTuple(args, "KOOi", &window_id, &display_capsule, &surface_capsule, &blur_radius)) return NULL;
+    if (!PyArg_ParseTuple(args, "KOi", &window_id, &window_capsule, &blur_radius)) return NULL;
 #if defined(KITTY_WITH_GTK) && defined(KITTY_WITH_GTK_WAYLAND_BLUR)
-    GdkDisplay *display = gtk_pointer_from_capsule(display_capsule);
-    if (!display) return NULL;
-    GdkSurface *surface = gtk_pointer_from_capsule(surface_capsule);
-    if (!surface) return NULL;
-    if (!GDK_IS_WAYLAND_DISPLAY(display) || !GDK_IS_WAYLAND_SURFACE(surface) || gdk_surface_get_display(surface) != display) Py_RETURN_NONE;
+    GtkWindow *window = gtk_pointer_from_capsule(window_capsule);
+    if (!window) return NULL;
+    if (!GTK_IS_WINDOW(window)) {
+        PyErr_SetString(PyExc_TypeError, "expected a GTK window");
+        return NULL;
+    }
+    GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(window));
+    GdkDisplay *display = gtk_widget_get_display(GTK_WIDGET(window));
+    if (!surface || !GDK_IS_WAYLAND_DISPLAY(display)) Py_RETURN_NONE;
     struct wl_surface *wl_surface = gdk_wayland_surface_get_wl_surface(surface);
     if (!wl_surface) Py_RETURN_NONE;
     gtk_wayland_blur_initialize(display);
@@ -325,13 +361,26 @@ gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
         entry->gdk_surface = g_object_ref(surface);
         entry->wl_surface = wl_surface;
     }
+    double surface_x = 0.0, surface_y = 0.0;
+    gtk_native_get_surface_transform(GTK_NATIVE(window), &surface_x, &surface_y);
+    // GTK's Wayland surface includes transparent client-side shadow margins.
+    // The native transform maps surface coordinates into widget coordinates;
+    // negate it to place the visible GtkWindow allocation inside the surface.
+    const int region_x = (int)(-surface_x + 0.5), region_y = (int)(-surface_y + 0.5);
+    const int region_width = gtk_widget_get_width(GTK_WIDGET(window));
+    const int region_height = gtk_widget_get_height(GTK_WIDGET(window));
+    if (entry->region_x != region_x || entry->region_y != region_y ||
+        entry->region_width != region_width || entry->region_height != region_height) entry->region_set = false;
+    entry->region_x = region_x;
+    entry->region_y = region_y;
+    entry->region_width = region_width;
+    entry->region_height = region_height;
     entry->blur_radius = blur_radius;
     gtk_wayland_blur_update(entry);
     wl_display_flush(gtk_blur_display);
 #else
     (void)window_id;
-    (void)display_capsule;
-    (void)surface_capsule;
+    (void)window_capsule;
     (void)blur_radius;
 #endif
     Py_RETURN_NONE;

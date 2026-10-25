@@ -524,6 +524,7 @@ class Boss:
                     gtk_window = GtkKittyWindow(
                         wtitle or appname,
                         (960, 640),
+                        application_id=wclass,
                         events=GtkKittyEvents(),
                         on_new_tab=lambda: None,
                         on_select_tab=lambda _: None,

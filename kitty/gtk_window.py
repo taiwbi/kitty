@@ -20,7 +20,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, GLib, Gtk  # type: ignore[import-not-found]
 
-from .constants import is_wayland
+from .constants import appname, is_wayland
 from .fast_data_types import (
     GLFW_FKEY_BACKSPACE,
     GLFW_FKEY_CAPS_LOCK,
@@ -107,6 +107,7 @@ from .fast_data_types import (
     gtk_backend_available,
     gtk_backend_clear_window_blur,
     gtk_backend_initialize,
+    gtk_backend_set_window_app_id,
     gtk_backend_set_window_blur,
     gtk_input_close,
     gtk_input_focus,
@@ -404,6 +405,7 @@ class GtkKittyWindow:
         title: str,
         initial_size: tuple[int, int],
         *,
+        application_id: str = appname,
         events: Any,
         on_new_tab: Callable[[], None],
         on_select_tab: TabAction,
@@ -413,6 +415,7 @@ class GtkKittyWindow:
     ) -> None:
         initialize_gtk()
 
+        self.application_id = application_id
         self.window = Gtk.Window.new()
         self.window.set_title(title)
         self.window.set_default_size(*initial_size)
@@ -540,6 +543,7 @@ class GtkKittyWindow:
         self.events.gl_unrealized()
 
     def _window_realized(self, _window: Gtk.Window) -> None:
+        gtk_backend_set_window_app_id(self.window.__gpointer__, self.application_id)
         self._apply_wayland_blur()
 
     def _window_unrealized(self, _window: Gtk.Window) -> None:
@@ -824,12 +828,7 @@ class GtkKittyWindow:
     def _apply_wayland_blur(self) -> None:
         if _gtk_owns_wayland_blur or not self.os_window_id or not self.window.get_realized():
             return
-        surface = self.window.get_surface()
-        display = self.window.get_display()
-        if surface is not None and display is not None:
-            gtk_backend_set_window_blur(
-                self.os_window_id, display.__gpointer__, surface.__gpointer__, self._background_blur
-            )
+        gtk_backend_set_window_blur(self.os_window_id, self.window.__gpointer__, self._background_blur)
 
     def apply_chrome_style(self, background_color: int, background_opacity: float, background_blur: int) -> None:
         """Match GTK's header surface to kitty's active terminal background."""

@@ -363,6 +363,7 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
                 gtk_window = GtkKittyWindow(
                     args.title or appname,
                     (960, 640),
+                    application_id=wincls,
                     events=GtkKittyEvents(),
                     on_new_tab=lambda: None,
                     on_select_tab=lambda _: None,

@@ -231,6 +231,9 @@ Detailed list of changes
 0.50.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- GTK window backend: Keep Wayland background blur inside the visible window
+  and set the application ID from kitty's window class.
+
 - GTK windows: Fix copying text and other clipboard data to other applications.
 
 - GTK window backend: Keep tabs expanded across a compact, transparent header

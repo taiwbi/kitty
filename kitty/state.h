@@ -745,6 +745,7 @@ PyObject *gtk_backend_initialize(PyObject *, PyObject *);
 PyObject *gtk_backend_set_enabled(PyObject *, PyObject *);
 PyObject *gtk_backend_activate(PyObject *, PyObject *);
 PyObject *gtk_backend_register_window(PyObject *, PyObject *);
+PyObject *gtk_backend_set_window_app_id(PyObject *, PyObject *);
 PyObject *gtk_backend_set_window_blur(PyObject *, PyObject *);
 PyObject *gtk_backend_clear_window_blur(PyObject *, PyObject *);
 PyObject *gtk_backend_is_active(PyObject *, PyObject *);
