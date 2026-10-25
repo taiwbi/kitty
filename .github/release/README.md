@@ -15,7 +15,12 @@ SPDX dependency SBOM, and `SHA256SUMS`.
 3. Extract upstream's exported Linux dependency bundle into `/sw/sw`. Download
    the Nerd Font used by the build. Install documentation tools outside the
    shipped prefix, configure the exported OpenSSL trust store, and pre-download
-   the shipped CA bundle with retries before compilation.
+   the shipped CA bundle with retries before compilation. Build PyGObject and
+   Pycairo for the exported Python, rather than using the distro Python's ABI,
+   after relocating Python's exported `.pc` prefixes to `/sw/sw`.
+   Replace exported Cairo and HarfBuzz with the builder's GTK-compatible builds
+   and matching package metadata. The exported builds lack Xlib and GLib/GObject
+   integration, and mixing HarfBuzz versions prevents GTK detection.
 4. Build checksum-verified FriBidi 1.0.16 statically because this checkout needs
    it and the exported bundles do not include it.
 5. Build native kitty/kitten to generate Go code and shaders. Compile the GTK
@@ -23,12 +28,19 @@ SPDX dependency SBOM, and `SHA256SUMS`.
    HTML/man documentation and use the `bypy` Linux hooks to bundle the Python
    runtime, native libraries, resources, and launchers. Preserve shared-library
    aliases needed by Python extensions, including SQLite's unversioned library
-   name. These hooks are called directly because `bypy`'s normal `program`
+   name. Require GTK support during both builds (`KITTY_REQUIRE_GTK=1`), and
+   include GTK/libadwaita libraries, introspection typelibs, schemas and icons.
+   Set PyGObject and Pycairo extension runpaths to the portable bundle's library
+   directory and configure relocatable runtime data paths before GTK is imported.
+   Record the additional runtime packages in the SBOM and retain their distro
+   copyright files under `share/licenses`.
+   These hooks are called directly because `bypy`'s normal `program`
    entry point deletes the dependency prefix and expects the maintainer's
    private package cache/VMs.
 6. Smoke-test the frozen runtime and extracted Linux archive without build-time
-   Python/library paths. The workflow repeats the archive check in a fresh
-   container with no build prefix or toolchain.
+   Python/library paths, including importing the GTK window module. The workflow
+   repeats the archive check in the minimal `runtime` container stage, which has
+   no GTK installation, Python, build prefix or toolchain.
 7. On Linux amd64, build standalone `kitten` binaries for Linux amd64, arm64,
    arm, and 386 after native code generation.
 8. Download all Linux job artifacts in one publishing job. Validate the exact

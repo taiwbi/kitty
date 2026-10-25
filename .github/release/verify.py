@@ -39,7 +39,12 @@ def check_kitten(path: Path, goos: str, arch: str, revision: str) -> None:
 def check_bundle(path: Path, arch: str) -> None:
     with tarfile.open(path) as tf:
         members = {m.name.removeprefix('./'): m for m in tf}
-        for name in ('bin/kitty', 'bin/kitten', 'lib/cacert.pem', 'share/man/man1/kitty.1', 'share/doc/kitty/html/index.html'):
+        for name in (
+            'bin/kitty', 'bin/kitten', 'lib/cacert.pem', 'share/man/man1/kitty.1', 'share/doc/kitty/html/index.html',
+            'lib/libgtk-4.so.1', 'lib/libadwaita-1.so.0', 'lib/libgirepository-2.0.so.0',
+            'lib/girepository-1.0/Gtk-4.0.typelib', 'lib/girepository-1.0/Adw-1.typelib',
+            'share/glib-2.0/schemas/gschemas.compiled',
+        ):
             assert name in members, f'{path}: missing {name}'
         for binary in ('bin/kitty', 'bin/kitten'):
             member = members[binary]
@@ -48,6 +53,8 @@ def check_bundle(path: Path, arch: str) -> None:
             assert stream is not None
             check_elf(stream.read(32), arch)
         assert any(n.startswith('lib/kitty-extensions/') and 'fast_data_types' in n for n in members), f'{path}: missing native kitty module'
+        assert any(n.startswith('lib/kitty-extensions/gi._gi.') for n in members), f'{path}: missing PyGObject extension'
+        assert any(n.startswith('lib/kitty-extensions/cairo._cairo.') for n in members), f'{path}: missing Pycairo extension'
 
 
 def main() -> None:
@@ -73,6 +80,8 @@ def main() -> None:
     sbom = json.loads((dest / f'kitty-{version}.tar.xz.spdx.json').read_text())
     assert sbom['spdxVersion'] == 'SPDX-2.3'
     assert any(p['name'] == 'fribidi' for p in sbom['packages']), 'SBOM omits the static FriBidi dependency'
+    for name in ('PyGObject', 'pycairo', 'libgtk-4-1', 'libadwaita-1-0'):
+        assert any(p['name'].split(':')[0] == name for p in sbom['packages']), f'SBOM omits the GTK dependency: {name}'
     checksums = []
     for name in sorted(expected):
         with (dest / name).open('rb') as f:

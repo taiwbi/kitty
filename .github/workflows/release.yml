@@ -63,10 +63,11 @@ jobs:
             --env GITHUB_REPOSITORY \
             kitty-release
           # A fresh container has no /sw/sw, source checkout, or build toolchain.
+          docker build --target runtime --tag kitty-release-runtime .github/release
           docker run --rm \
             --volume "$GITHUB_WORKSPACE/dist:/dist:ro" \
             --volume "$GITHUB_WORKSPACE/.github/release:/checks:ro" \
-            kitty-release bash -euc '
+            kitty-release-runtime bash -euc '
               mkdir /tmp/kitty
               tar -xf /dist/kitty-*.txz -C /tmp/kitty
               /tmp/kitty/bin/kitty +launch /checks/smoke.py

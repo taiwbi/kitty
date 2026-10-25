@@ -101,6 +101,31 @@ def kitty_exe() -> str:
     return os.path.join(rpath, 'kitty')
 
 
+def configure_gtk_runtime_paths() -> None:
+    if not sys.platform.startswith('linux'):
+        return
+    executable_dir = kitty_run_data.get('bundle_exe_dir')
+    if not executable_dir:
+        try:
+            executable_dir = os.path.dirname(kitty_exe())
+        except RuntimeError:
+            return
+    bundle = os.path.dirname(executable_dir)
+    typelibs = os.path.join(bundle, 'lib', 'girepository-1.0')
+    if not os.path.isdir(typelibs):
+        return
+    existing = os.environ.get('GI_TYPELIB_PATH', '')
+    if typelibs not in existing.split(os.pathsep):
+        os.environ['GI_TYPELIB_PATH'] = typelibs + (os.pathsep + existing if existing else '')
+    data_dir = os.path.join(bundle, 'share')
+    existing = os.environ.get('XDG_DATA_DIRS', '/usr/local/share:/usr/share')
+    if data_dir not in existing.split(os.pathsep):
+        os.environ['XDG_DATA_DIRS'] = data_dir + os.pathsep + existing
+    schema_dir = os.path.join(data_dir, 'glib-2.0', 'schemas')
+    if os.path.isfile(os.path.join(schema_dir, 'gschemas.compiled')):
+        os.environ['GSETTINGS_SCHEMA_DIR'] = schema_dir
+
+
 @run_once
 def kitten_exe() -> str:
     return os.path.join(os.path.dirname(kitty_exe()), 'kitten')

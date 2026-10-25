@@ -35,7 +35,19 @@ export FONTCONFIG_PATH=/etc/fonts
 export SW="$release_prefix" SLANGC="$release_prefix/bin/slangc"
 export PKG_CONFIG_PATH="$release_prefix/lib/pkgconfig"
 export PKGCONFIG_EXE=/usr/bin/pkg-config
-export CI=true PYTHONUNBUFFERED=1
+export CI=true PYTHONUNBUFFERED=1 KITTY_REQUIRE_GTK=1
+# The exported Python .pc files can retain the temporary prefix used to build
+# Python. Meson uses these when compiling Pycairo/PyGObject extensions.
+sed -i "s|^prefix=.*|prefix=$release_prefix|" "$release_prefix"/lib/pkgconfig/python*.pc
+# GTK needs Cairo's Xlib and HarfBuzz's GLib/GObject integration, which the
+# exported libraries disable. Replace both with the builder's complete builds,
+# including their metadata so GTK's exact HarfBuzz dependencies remain coherent.
+for package in cairo harfbuzz; do
+    system_libdir="$(env -u PKG_CONFIG_PATH -u PKG_CONFIG_LIBDIR /usr/bin/pkg-config --variable=libdir "$package")"
+    rm "$release_prefix"/lib/lib"$package"*.so*
+    cp -a "$system_libdir"/lib"$package"*.so* "$release_prefix/lib/"
+    cp "$system_libdir"/pkgconfig/"$package"*.pc "$release_prefix/lib/pkgconfig/"
+done
 
 download https://github.com/ryanoasis/nerd-fonts/releases/latest/download/NerdFontsSymbolsOnly.tar.xz nerd-fonts.tar.xz
 mkdir -p fonts
@@ -48,6 +60,10 @@ python "$release_root/sw/downloads/get-pip.py" --target "$docs_deps" --no-warn-s
 PYTHONPATH="$docs_deps" python -m pip install --disable-pip-version-check \
     --no-warn-script-location --upgrade --target "$docs_deps" -r docs/requirements.txt
 export RELEASE_DOCS_DEPS="$docs_deps"
+# The distro's python3-gi targets its own Python ABI, not the exported Python
+# used by the frozen runtime. Build the bindings for the interpreter we ship.
+PYTHONPATH="$docs_deps" python -m pip install --disable-pip-version-check \
+    --no-warn-script-location --prefix "$release_prefix" 'pycairo==1.28.0' 'PyGObject==3.54.5'
 # Exported OpenSSL's default CA path points at the maintainer's build prefix.
 # The freezer downloads CA certificates with urllib, so supply a real trust store.
 export SSL_CERT_FILE="$docs_deps/certifi/cacert.pem"

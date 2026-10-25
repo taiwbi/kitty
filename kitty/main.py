@@ -21,6 +21,7 @@ from .constants import (
     appname,
     beam_cursor_data_file,
     clear_handled_signals,
+    configure_gtk_runtime_paths,
     glfw_path,
     is_macos,
     is_quick_access_terminal_app,
@@ -39,13 +40,13 @@ from .fast_data_types import (
     SingleKey,
     create_os_window,
     free_font_data,
-    gtk_backend_available,
-    gtk_backend_set_enabled,
     glfw_get_monitor_names,
     glfw_get_monitor_workarea,
     glfw_init,
     glfw_terminate,
     grab_keyboard,
+    gtk_backend_available,
+    gtk_backend_set_enabled,
     is_layer_shell_supported,
     load_png_data,
     mask_kitty_signals_process_wide,
@@ -118,6 +119,7 @@ def configure_gtk_window_backend(opts: Options) -> bool:
         return False
     if not gtk_backend_available():
         raise SystemExit('linux_use_gtk_window requires kitty to be built with GTK 4 and libadwaita 1.4 or newer')
+    configure_gtk_runtime_paths()
     try:
         from .gtk_window import initialize_gtk
 

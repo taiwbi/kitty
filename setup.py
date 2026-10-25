@@ -778,7 +778,13 @@ def kitty_env(args: Options) -> Env:
             cppflags.append('-DKITTY_WITH_GTK')
         else:
             print(error('GTK backend disabled: GTK 4 and libadwaita 1.4 or newer are required'), file=sys.stderr)
-    cflags.extend(gtk_cflags)
+    if is_linux and os.environ.get('KITTY_REQUIRE_GTK') == '1' and not gtk_libs:
+        subprocess.run([PKGCONFIG, '--print-errors', '--exists', 'gtk4 >= 4.0', 'libadwaita-1 >= 1.4'], check=False)
+        raise SystemExit('GTK support is required for this build: install GTK 4 and libadwaita 1.4 or newer development libraries')
+    # Some GTK releases have declarations rejected by -pedantic-errors. Treat
+    # third-party headers as system headers while keeping our own warnings fatal.
+    for flag in gtk_cflags:
+        cflags.extend(('-isystem', flag[2:]))
     cflags.extend(xxhash[0])
     # simde doesnt come with pkg-config files but some Linux distros add
     # them and on macOS when building with homebrew it is required
@@ -2296,7 +2302,10 @@ def option_parser() -> argparse.ArgumentParser:  # {{{
     )
     p.add_argument('--prefix', default=Options.prefix, help='Where to create the linux package')
     p.add_argument('--dir-for-static-binaries', default=Options.dir_for_static_binaries, help='Where to create the static kitten binary')
-    p.add_argument('--static-binary-os', action='append', choices=('darwin', 'dragonfly', 'freebsd', 'linux', 'netbsd', 'openbsd'), help='Build static kitten binaries only for this OS (repeatable)')
+    p.add_argument(
+        '--static-binary-os', action='append', choices=('darwin', 'dragonfly', 'freebsd', 'linux', 'netbsd', 'openbsd'),
+        help='Build static kitten binaries only for this OS (repeatable)',
+    )
     p.add_argument(
         '--skip-code-generation',
         default=Options.skip_code_generation,
