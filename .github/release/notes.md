@@ -2,6 +2,7 @@ Portable Linux kitty and standalone kitten builds from this tag.
 
 Fixes in v0.49.2.13:
 
+- Fix portable-build startup crashes and spurious systemd allocation errors caused by loading a second, incompatible host systemd library.
 - Fix intermittent GTK crashes when native timers or GLFW events run inside a Python GTK event loop.
 - Keep Wayland background blur aligned with the visible window, inside its shadow margins.
 - Wait for the terminal's initial allocation, ignore zero-sized GTK resizes, and avoid the inactive foreground shader uniform warning.

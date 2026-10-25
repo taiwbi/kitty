@@ -60,9 +60,11 @@ ensure_initialized(void) {
 #if defined(_KITTY_SYSTEMD_LIBRARY)
         _KITTY_SYSTEMD_LIBRARY,
 #else
-        "libsystemd.so",
-        // some installs are missing the .so symlink, so try the full name
+        // Reuse the runtime SONAME already loaded by GTK/GIO. The development
+        // symlink can resolve to a different system version in portable builds;
+        // mixing their sd_bus objects and interposed symbols can corrupt memory.
         "libsystemd.so.0",
+        "libsystemd.so",
         "libsystemd.so.0.38.0",
 #endif
         NULL};

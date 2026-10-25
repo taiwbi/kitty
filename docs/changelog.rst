@@ -231,6 +231,10 @@ Detailed list of changes
 0.50.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- Linux portable builds: Reuse the systemd runtime library already loaded by
+  GTK/GIO instead of opening a different host version through its development
+  symlink. This fixes intermittent startup crashes and spurious allocation errors.
+
 - GTK window backend: Fix crashes when native timers and GLFW events are
   dispatched by a Python GTK event loop. Wait for the GLArea's initial allocation
   and avoid forwarding zero-sized resizes or changing GLFW's swap interval.
