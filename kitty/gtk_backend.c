@@ -297,7 +297,7 @@ gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
     PyObject *display_capsule = NULL, *surface_capsule = NULL;
     int blur_radius = 0;
     if (!PyArg_ParseTuple(args, "KOOi", &window_id, &display_capsule, &surface_capsule, &blur_radius)) return NULL;
-#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+#if defined(KITTY_WITH_GTK) && defined(KITTY_WITH_GTK_WAYLAND_BLUR)
     GdkDisplay *display = gtk_pointer_from_capsule(display_capsule);
     if (!display) return NULL;
     GdkSurface *surface = gtk_pointer_from_capsule(surface_capsule);
@@ -341,7 +341,7 @@ PyObject *
 gtk_backend_clear_window_blur(PyObject UNUSED *self, PyObject *args) {
     unsigned long long window_id = 0;
     if (!PyArg_ParseTuple(args, "K", &window_id)) return NULL;
-#ifdef KITTY_WITH_GTK_WAYLAND_BLUR
+#if defined(KITTY_WITH_GTK) && defined(KITTY_WITH_GTK_WAYLAND_BLUR)
     gtk_wayland_blur_remove((id_type)window_id);
 #else
     (void)window_id;
