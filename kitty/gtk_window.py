@@ -11,6 +11,7 @@ user actions through callbacks.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 from weakref import ReferenceType, ref
 
@@ -144,6 +145,7 @@ def initialize_gtk() -> None:
     if not _gtk_initialized:
         if not gtk_backend_available():
             raise RuntimeError('kitty was built without GTK 4 and libadwaita support')
+        GLib.set_prgname("com.taiwbi.kitty")
         gtk_backend_initialize()
         _gtk_initialized = True
 
@@ -227,7 +229,8 @@ class GtkTabHeaderBar:
         self.tab_bar.set_expand_tabs(True)
         self.tab_bar.set_halign(Gtk.Align.FILL)
 
-        self.new_tab_button = Gtk.Button.new_from_icon_name('tab-new-symbolic')
+        self.new_tab_button = Gtk.Button.new()
+        self.new_tab_button.set_child(Gtk.Image.new_from_file(str(Path(__file__).with_name("gtk-icons") / "tab-new-symbolic.svg")))
         self.new_tab_button.set_tooltip_text('New Tab')
         self.new_tab_button.update_property([Gtk.AccessibleProperty.LABEL], ['New Tab'])
         self.new_tab_button.connect('clicked', self._new_tab_clicked)
@@ -418,7 +421,7 @@ class GtkKittyWindow:
     ) -> None:
         initialize_gtk()
 
-        self.application_id = application_id
+        self.application_id = "com.taiwbi.kitty" if application_id == appname else application_id
         self.window = Gtk.Window.new()
         self.window.set_title(title)
         self.window.set_default_size(*initial_size)
