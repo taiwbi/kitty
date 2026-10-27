@@ -1,9 +1,11 @@
 Portable Linux kitty and standalone kitten builds from this tag.
 
-Fixes in v0.49.2.14:
+Fixes in v.0.49.2.15:
 
 - Set the default GTK window class and Wayland application ID to `com.taiwbi.kitty`.
-- Bundle the new-tab symbolic icon so it works without a system icon theme.
+- Draw the new-tab glyph using the theme foreground without external icon files or SVG loaders; use a flat button with no persistent background.
+- Add `StartupWMClass=com.taiwbi.kitty` to both desktop launchers.
+- Check the rendered new-tab glyph in the frozen portable runtime under Xvfb.
 
 - **kitty:** Linux amd64/arm64 bundles (`.txz`).
 - **kitten:** Linux amd64, arm64, arm, and 386.

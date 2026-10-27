@@ -2,7 +2,7 @@ FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-    ca-certificates xz-utils libfontconfig1 libgl1 libegl1 libdbus-1-3 \
+    xvfb xauth ca-certificates xz-utils libfontconfig1 libgl1 libegl1 libdbus-1-3 \
     libxcursor1 libxi6 libxinerama1 libxrandr2 libx11-xcb1 libxcb-xkb1 \
     && rm -rf /var/lib/apt/lists/*
 

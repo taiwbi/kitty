@@ -11,7 +11,6 @@ user actions through callbacks.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from pathlib import Path
 from typing import Any
 from weakref import ReferenceType, ref
 
@@ -230,7 +229,17 @@ class GtkTabHeaderBar:
         self.tab_bar.set_halign(Gtk.Align.FILL)
 
         self.new_tab_button = Gtk.Button.new()
-        self.new_tab_button.set_child(Gtk.Image.new_from_file(str(Path(__file__).with_name("gtk-icons") / "tab-new-symbolic.svg")))
+        self.new_tab_button.add_css_class('flat')
+        # Draw the simple symbolic glyph with the current theme foreground.
+        # The frozen runtime does not ship files beside Python modules, and
+        # SVG decoding additionally requires external pixbuf loaders.
+        icon = Gtk.DrawingArea()
+        icon.set_content_width(16)
+        icon.set_content_height(16)
+        icon.set_halign(Gtk.Align.CENTER)
+        icon.set_valign(Gtk.Align.CENTER)
+        icon.set_draw_func(self._draw_new_tab_icon)
+        self.new_tab_button.set_child(icon)
         self.new_tab_button.set_tooltip_text('New Tab')
         self.new_tab_button.update_property([Gtk.AccessibleProperty.LABEL], ['New Tab'])
         self.new_tab_button.connect('clicked', self._new_tab_clicked)
@@ -295,6 +304,14 @@ class GtkTabHeaderBar:
         self.tab_view.connect('notify::selected-page', self._selected_page_changed)
         self.tab_view.connect('close-page', self._close_page_requested)
         self.tab_view.connect('page-reordered', self._page_reordered)
+
+    @staticmethod
+    def _draw_new_tab_icon(area: Gtk.DrawingArea, cr: Any, width: int, height: int) -> None:
+        color = area.get_style_context().get_color()
+        cr.set_source_rgba(color.red, color.green, color.blue, color.alpha)
+        cr.rectangle(width / 2 - 1, height / 2 - 6, 2, 12)
+        cr.rectangle(width / 2 - 6, height / 2 - 1, 12, 2)
+        cr.fill()
 
     @staticmethod
     def _empty_page(_tab_id: int) -> Gtk.Widget:

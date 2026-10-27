@@ -72,7 +72,7 @@ def smoke_test(kitty: Path, kitten: Path) -> None:
     }
     env = {k: v for k, v in os.environ.items() if not k.startswith('PYTHON') and k not in build_vars}
     with tempfile.TemporaryDirectory() as tmp:
-        run(str(kitty), '+launch', str(SOURCE / '.github/release/smoke.py'), str(kitten), cwd=Path(tmp), env=env)
+        run('xvfb-run', '-a', str(kitty), '+launch', str(SOURCE / '.github/release/smoke.py'), str(kitten), cwd=Path(tmp), env=env)
 
 
 def preserve_library_aliases(destination: Path) -> None:

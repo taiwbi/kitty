@@ -22,7 +22,26 @@ for module in ('bz2', 'lzma', 'ctypes', 'sqlite3', 'cairo', 'kittens.transfer.rs
 # Importing the real window module also checks PyGObject, typelibs, libadwaita
 # versions and their shared libraries, without needing a display server.
 configure_gtk_runtime_paths()
-importlib.import_module('kitty.gtk_window')
+gtk_window = importlib.import_module('kitty.gtk_window')
+# Exercise the actual frozen window chrome with a display. No source resources
+# or system GTK/icon installation is available in the minimal runtime image.
+gtk_window.initialize_gtk()
+chrome = gtk_window.GtkTabHeaderBar(
+    on_new_tab=lambda: None, on_select_tab=lambda _: None,
+    on_close_tab=lambda _: None, on_reorder_tabs=lambda _: None,
+)
+assert chrome.new_tab_button.has_css_class('flat')
+icon = chrome.new_tab_button.get_child()
+assert icon.get_content_width() == icon.get_content_height() == 16
+import cairo
+surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 16, 16)
+chrome._draw_new_tab_icon(icon, cairo.Context(surface), 16, 16)
+surface.flush()
+pixels = bytes(surface.get_data())
+assert pixels[8 * surface.get_stride() + 8 * 4 + 3], 'New-tab glyph is invisible'
+assert not pixels[3], 'New-tab glyph has an opaque background'
+assert gtk_window.GLib.get_prgname() == 'com.taiwbi.kitty'
+
 kitty = Path(kitty_exe())
 # Emulate a development package on the host exposing an unversioned systemd
 # symlink. The portable process must keep using the runtime SONAME loaded by
