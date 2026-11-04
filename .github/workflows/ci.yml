@@ -124,7 +124,7 @@ jobs:
             run: go version && go vet -tags testing ./...
 
           - name: Build static kittens
-            run: python setup.py build-static-binaries
+            run: python setup.py build-static-binaries --static-binary-os=linux
 
     bundle:
         name: Bundle test (${{ matrix.os }})
