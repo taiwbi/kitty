@@ -18,7 +18,7 @@ import gi
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Adw, Gdk, GLib, Gtk  # type: ignore[import-not-found]
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # type: ignore[import-not-found]
 
 from .constants import appname, is_wayland
 from .fast_data_types import (
@@ -502,6 +502,11 @@ class GtkKittyWindow:
         self._cursor_hidden = False
         self._pressed_keys: set[int] = set()
         self._ime_filtered_keys: set[int] = set()
+        self._context_menu: Gtk.PopoverMenu | None = None
+        self._context_menu_keys: set[int] = set()
+        self._context_menu_target = 0
+        self._context_menu_target_getter: Callable[[float, float], tuple[int, bool]] | None = None
+        self._context_menu_action_handler: Callable[[int, str], None] | None = None
         self._scrollbar_state_getter: Callable[[], tuple[float, int, int, bool, str, bool]] | None = None
         self._scrollbar_scroll_handler: Callable[[float], None] | None = None
         self._scrollbar_state: tuple[float, int, int, bool, str, bool] = (0, 0, 0, False, 'never', False)
@@ -574,6 +579,7 @@ class GtkKittyWindow:
             self.events.gl_realized(area.get_context())
 
     def _area_unrealized(self, _area: Gtk.GLArea) -> None:
+        self._destroy_context_menu()
         self.events.gl_unrealized()
 
     def _window_realized(self, _window: Gtk.Window) -> None:
@@ -622,6 +628,10 @@ class GtkKittyWindow:
             gtk_input_focus(self.os_window_id, window.is_active())
 
     def _key_pressed(self, _controller: Gtk.EventControllerKey, keyval: int, keycode: int, state: Gdk.ModifierType) -> bool:
+        # Let GTK handle menu navigation and Escape before terminal shortcuts.
+        if self._context_menu_visible():
+            self._context_menu_keys.add(keycode)
+            return False
         event = _controller.get_current_event()
         # IM contexts may consume modified keys, including terminal controls
         # and kitty shortcuts. Only text input belongs to the IM context.
@@ -644,6 +654,12 @@ class GtkKittyWindow:
         return bool(gtk_input_key(self.os_window_id, key, shifted, 0, keyval, action, self._mods(state), text))
 
     def _key_released(self, _controller: Gtk.EventControllerKey, keyval: int, keycode: int, state: Gdk.ModifierType) -> bool:
+        # Escape or activation may have closed the menu during the key press.
+        if keycode in self._context_menu_keys:
+            self._context_menu_keys.discard(keycode)
+            return False
+        if self._context_menu_visible():
+            return False
         event = _controller.get_current_event()
         if event is not None and keycode in self._ime_filtered_keys:
             self.im_context.filter_keypress(event)
@@ -660,13 +676,89 @@ class GtkKittyWindow:
     def _pointer_pressed(self, gesture: Gtk.GestureClick, n_press: int, x: float, y: float) -> None:
         if self.os_window_id:
             self.gl_area.grab_focus()
+            if gesture.get_current_button() == 3:
+                gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+                self._show_context_menu(x, y)
+                return
             button = {1: GLFW_MOUSE_BUTTON_1, 2: GLFW_MOUSE_BUTTON_3, 3: GLFW_MOUSE_BUTTON_2}.get(gesture.get_current_button(), -1)
             gtk_input_mouse_button(self.os_window_id, button, GLFW_PRESS, self._mods(gesture.get_current_event_state()), x, y)
 
     def _pointer_released(self, gesture: Gtk.GestureClick, n_press: int, x: float, y: float) -> None:
+        if gesture.get_current_button() == 3:
+            return
         if self.os_window_id:
             button = {1: GLFW_MOUSE_BUTTON_1, 2: GLFW_MOUSE_BUTTON_3, 3: GLFW_MOUSE_BUTTON_2}.get(gesture.get_current_button(), -1)
             gtk_input_mouse_button(self.os_window_id, button, GLFW_RELEASE, self._mods(gesture.get_current_event_state()), x, y)
+
+    def set_context_menu_callbacks(
+        self,
+        target_getter: Callable[[float, float], tuple[int, bool]],
+        action_handler: Callable[[int, str], None],
+    ) -> None:
+        self._context_menu_target_getter = target_getter
+        self._context_menu_action_handler = action_handler
+
+    def _create_context_menu(self) -> Gtk.PopoverMenu:
+        model = Gio.Menu.new()
+        actions = Gio.SimpleActionGroup.new()
+        for items in (
+            (('Search', 'search'),),
+            (('Copy', 'copy'), ('Paste', 'paste'), ('Clear', 'clear')),
+            (('Set title', 'set-title'),),
+        ):
+            section = Gio.Menu.new()
+            for label, name in items:
+                section.append(label, f'terminal.{name}')
+                action = Gio.SimpleAction.new(name, None)
+                action.connect('activate', self._context_menu_action)
+                actions.add_action(action)
+            model.append_section(None, section)
+        self._context_menu_actions = actions
+        menu = Gtk.PopoverMenu.new_from_model(model)
+        menu.set_has_arrow(False)
+        menu.set_parent(self.gl_area)
+        menu.insert_action_group('terminal', actions)
+        menu.connect('closed', self._context_menu_closed)
+        return menu
+
+    def _show_context_menu(self, x: float, y: float) -> None:
+        if self._context_menu_target_getter is None:
+            return
+        target, has_selection = self._context_menu_target_getter(x * self._gtk_scale, y * self._gtk_scale)
+        if not target:
+            return
+        if self._context_menu is None:
+            self._context_menu = self._create_context_menu()
+        self._context_menu_target = target
+        self._context_menu_actions.lookup_action('copy').set_enabled(has_selection)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self._context_menu.set_pointing_to(rect)
+        self._context_menu.popup()
+
+    def _context_menu_visible(self) -> bool:
+        menu = getattr(self, '_context_menu', None)
+        return menu is not None and menu.get_visible()
+
+    def _context_menu_action(self, action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
+        target = self._context_menu_target
+        self._context_menu_target = 0
+        if self._context_menu is not None:
+            self._context_menu.popdown()
+        if target and self._context_menu_action_handler is not None:
+            self._context_menu_action_handler(target, action.get_name())
+
+    def _context_menu_closed(self, _menu: Gtk.PopoverMenu) -> None:
+        # GtkModelButton closes the popover before activating its action. Keep
+        # the target until that action runs or another menu replaces it.
+        self.gl_area.grab_focus()
+
+    def _destroy_context_menu(self) -> None:
+        if (menu := getattr(self, '_context_menu', None)) is not None:
+            menu.popdown()
+            menu.unparent()
+            self._context_menu = None
+            self._context_menu_target = 0
 
     def _pointer_moved(self, _controller: Gtk.EventControllerMotion, x: float, y: float) -> None:
         if self.os_window_id:
@@ -1070,6 +1162,7 @@ class GtkKittyWindow:
 
     def close(self) -> None:
         self._programmatic_close = True
+        self._destroy_context_menu()
         if self._scrollbar_sync_source:
             GLib.source_remove(self._scrollbar_sync_source)
             self._scrollbar_sync_source = 0

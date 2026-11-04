@@ -2213,6 +2213,10 @@ class Boss:
             lambda: self.gtk_scrollbar_state(os_window_id),
             lambda scrolled_by: self.gtk_scroll_to(os_window_id, scrolled_by),
         )
+        window.set_context_menu_callbacks(
+            lambda x, y: self.gtk_context_menu_target(os_window_id, x, y),
+            lambda window_id, action: self.gtk_context_menu_action(os_window_id, window_id, action),
+        )
         gtk_backend_register_window(os_window_id, window)
         self.gtk_windows[os_window_id] = window
         if tm := self.os_window_map.get(os_window_id):
@@ -2248,6 +2252,35 @@ class Boss:
             window.finish_scroll_animation()
             window.screen.scroll_to_absolute(scrolled_by)
             self.queue_gtk_render(os_window_id)
+
+    def gtk_context_menu_target(self, os_window_id: int, x: float, y: float) -> tuple[int, bool]:
+        if tm := self.os_window_map.get(os_window_id):
+            if (window := tm._find_window_at(int(x), int(y))) is not None and (tab := tm.active_tab) is not None:
+                tab.set_active_window(window)
+                self.queue_gtk_render(os_window_id)
+                return window.id, window.has_selection()
+        return 0, False
+
+    def gtk_context_menu_action(self, os_window_id: int, window_id: int, action: str) -> None:
+        window = self.window_id_map.get(window_id)
+        tm = self.os_window_map.get(os_window_id)
+        if window is None or window.os_window_id != os_window_id or tm is None or window.tabref() is not tm.active_tab:
+            return
+        if action == 'search':
+            if pager := window.show_scrollback():
+                pager.send_key('/')
+        elif action == 'copy':
+            window.copy_to_clipboard()
+        elif action == 'paste':
+            if text := window.text_for_selection():
+                window.paste_with_actions(text)
+            else:
+                self.combine('paste_from_clipboard', window)
+        elif action == 'clear':
+            self.combine('clear_terminal clear active', window)
+        elif action == 'set-title':
+            self.combine('set_tab_title', window)
+        self.queue_gtk_render(os_window_id)
 
     def create_gtk_window(self, os_window_id: int, title: str, size: tuple[int, int], events: Any) -> Any:
         from .gtk_window import GtkKittyWindow

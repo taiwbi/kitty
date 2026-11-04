@@ -58,6 +58,7 @@ class TestGtkWindow(BaseTest):
         window.os_window_id = 1
         window._pressed_keys = set()
         window._ime_filtered_keys = set()
+        window._context_menu_keys = set()
         controller = Mock()
         controller.get_current_event.return_value = None
 
@@ -109,6 +110,106 @@ assert len(fired) == 1
             resized.assert_not_called()
             events.resized(640, 480, 2)
             resized.assert_called_once_with(1, 640, 480, 2)
+
+    def test_gtk_context_menu_selection_and_target(self):
+        backend = self.backend
+        window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+        window.gl_area = Mock()
+        window._gtk_scale = 2
+        window._context_menu = None
+        target_getter, action_handler = Mock(return_value=(42, False)), Mock()
+        window.set_context_menu_callbacks(target_getter, action_handler)
+        menu = Mock()
+        menu.popdown.side_effect = lambda: window._context_menu_closed(menu)
+        with patch.object(backend.Gtk.PopoverMenu, 'new_from_model', return_value=menu):
+            window._show_context_menu(10.5, 20)
+        target_getter.assert_called_once_with(21, 40)
+        rect = menu.set_pointing_to.call_args.args[0]
+        self.ae((rect.x, rect.y, rect.width, rect.height), (10, 20, 1, 1))
+        copy = window._context_menu_actions.lookup_action('copy')
+        self.assertFalse(copy.get_enabled())
+        copy.activate(None)
+        action_handler.assert_not_called()
+
+        target_getter.return_value = (43, True)
+        window._show_context_menu(10, 20)
+        self.assertTrue(copy.get_enabled())
+        # Native GTK menu buttons emit closed before activating the action.
+        window._context_menu_closed(menu)
+        window.gl_area.grab_focus.reset_mock()
+        copy.activate(None)
+        action_handler.assert_called_once_with(43, 'copy')
+        self.ae(window._context_menu_target, 0)
+        window.gl_area.grab_focus.assert_called_once_with()
+
+    def test_gtk_context_menu_consumes_right_click(self):
+        backend = self.backend
+        window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+        window.os_window_id = 1
+        window.gl_area = Mock()
+        window._show_context_menu = Mock()
+        gesture = Mock()
+        gesture.get_current_button.return_value = 3
+        with patch.object(backend, 'gtk_input_mouse_button') as mouse_button:
+            window._pointer_pressed(gesture, 1, 10, 20)
+            window._pointer_released(gesture, 1, 10, 20)
+        mouse_button.assert_not_called()
+        window._show_context_menu.assert_called_once_with(10, 20)
+        gesture.set_state.assert_called_once_with(backend.Gtk.EventSequenceState.CLAIMED)
+
+    def test_gtk_context_menu_keyboard(self):
+        backend = self.backend
+        window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+        window._context_menu = Mock()
+        window._context_menu_keys = set()
+        window._context_menu.get_visible.return_value = True
+        controller = Mock()
+        with patch.object(backend, 'gtk_input_key') as input_key:
+            self.assertFalse(window._key_pressed(controller, backend.Gdk.KEY_Escape, 9, 0))
+            window._context_menu.get_visible.return_value = False
+            self.assertFalse(window._key_released(controller, backend.Gdk.KEY_Escape, 9, 0))
+        self.assertFalse(window._context_menu_keys)
+        input_key.assert_not_called()
+        controller.get_current_event.assert_not_called()
+
+    def test_gtk_context_menu_actions(self):
+        from kitty.boss import Boss
+
+        boss = Boss.__new__(Boss)
+        window = Mock(os_window_id=1)
+        tab = window.tabref.return_value
+        boss.window_id_map = {42: window}
+        boss.os_window_map = {1: SimpleNamespace(active_tab=tab, _find_window_at=Mock(return_value=window))}
+        boss.combine = Mock()
+        boss.queue_gtk_render = Mock()
+        window.id = 42
+        window.has_selection.return_value = True
+        self.ae(boss.gtk_context_menu_target(1, 10, 20), (42, True))
+        tab.set_active_window.assert_called_once_with(window)
+
+        boss.gtk_context_menu_action(1, 42, 'search')
+        window.show_scrollback.return_value.send_key.assert_called_once_with('/')
+        boss.gtk_context_menu_action(1, 42, 'copy')
+        window.copy_to_clipboard.assert_called_once_with()
+        window.text_for_selection.return_value = 'selected text'
+        boss.gtk_context_menu_action(1, 42, 'paste')
+        window.paste_with_actions.assert_called_once_with('selected text')
+        boss.combine.assert_not_called()
+        window.text_for_selection.return_value = ''
+        boss.gtk_context_menu_action(1, 42, 'paste')
+        boss.gtk_context_menu_action(1, 42, 'clear')
+        boss.gtk_context_menu_action(1, 42, 'set-title')
+        self.ae(boss.combine.call_args_list, [
+            call('paste_from_clipboard', window), call('clear_terminal clear active', window), call('set_tab_title', window),
+        ])
+
+        # A menu must not act on a pane that closed, moved, or changed tabs.
+        window.reset_mock()
+        for os_window_id, window_id in ((1, 99), (2, 42)):
+            boss.gtk_context_menu_action(os_window_id, window_id, 'copy')
+        boss.os_window_map[1].active_tab = Mock()
+        boss.gtk_context_menu_action(1, 42, 'copy')
+        window.copy_to_clipboard.assert_not_called()
 
     def test_gtk_scrollbar_sync_after_snapshot(self):
         backend = self.backend
