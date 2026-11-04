@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import cairo
+
 from kitty.constants import configure_gtk_runtime_paths, kitty_exe
 from kitty.fast_data_types import gtk_backend_available
 
@@ -33,7 +35,6 @@ chrome = gtk_window.GtkTabHeaderBar(
 assert chrome.new_tab_button.has_css_class('flat')
 icon = chrome.new_tab_button.get_child()
 assert icon.get_content_width() == icon.get_content_height() == 16
-import cairo
 surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 16, 16)
 chrome._draw_new_tab_icon(icon, cairo.Context(surface), 16, 16)
 surface.flush()
@@ -41,6 +42,14 @@ pixels = bytes(surface.get_data())
 assert pixels[8 * surface.get_stride() + 8 * 4 + 3], 'New-tab glyph is invisible'
 assert not pixels[3], 'New-tab glyph has an opaque background'
 assert gtk_window.GLib.get_prgname() == 'com.taiwbi.kitty'
+window = gtk_window.GtkKittyWindow(
+    'kitty release smoke', (640, 480), events=gtk_window.GtkKittyEvents(),
+    on_new_tab=lambda: None, on_select_tab=lambda _: None,
+    on_close_tab=lambda _: None, on_reorder_tabs=lambda _: None,
+)
+window.realize_gl_area()
+assert window.gl_area.get_realized(), 'GTK OpenGL window did not realize'
+window.close()
 
 kitty = Path(kitty_exe())
 # Emulate a development package on the host exposing an unversioned systemd

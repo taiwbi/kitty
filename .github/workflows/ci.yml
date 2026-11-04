@@ -131,7 +131,7 @@ jobs:
         runs-on: ${{ matrix.os }}
         strategy:
             matrix:
-                os: [ubuntu-latest, macos-latest]
+                os: [ubuntu-latest]
         env:
             KITTY_BUNDLE: 1
             KITTY_SANITIZE: 1
@@ -152,35 +152,6 @@ jobs:
 
           - name: Test kitty
             run: python3 .github/workflows/ci.py test
-
-    brew:
-        name: macOS Brew
-        runs-on: macos-latest
-        steps:
-          - name: Checkout source code
-            uses: actions/checkout@v7.0.1
-            with:
-              fetch-depth: 0  # needed for :commit: docs role
-              persist-credentials: false
-
-          - name: Set up Python
-            uses: actions/setup-python@v7.1.0
-            with:
-              python-version: "3.14"
-
-          - name: Install Go
-            uses: actions/setup-go@v7.0.0
-            with:
-              go-version-file: go.mod
-
-          - name: Install deps for docs
-            run: python3 -m pip install -r docs/requirements.txt
-
-          - name: Build kitty package
-            run: python3 .github/workflows/ci.py package
-
-          - name: Run benchmarks
-            run: ./benchmark.py
 
     linux-dev:
         name: Test ./dev.sh and benchmark

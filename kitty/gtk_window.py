@@ -19,10 +19,10 @@ import gi
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # type: ignore[import-not-found]
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # type: ignore[import-not-found]  # noqa: E402
 
-from .constants import appname, is_wayland
-from .fast_data_types import (
+from .constants import appname, is_wayland  # noqa: E402
+from .fast_data_types import (  # noqa: E402
     GLFW_FKEY_BACKSPACE,
     GLFW_FKEY_CAPS_LOCK,
     GLFW_FKEY_DELETE,
@@ -31,6 +31,14 @@ from .fast_data_types import (
     GLFW_FKEY_ENTER,
     GLFW_FKEY_ESCAPE,
     GLFW_FKEY_F1,
+    GLFW_FKEY_F2,
+    GLFW_FKEY_F3,
+    GLFW_FKEY_F4,
+    GLFW_FKEY_F5,
+    GLFW_FKEY_F6,
+    GLFW_FKEY_F7,
+    GLFW_FKEY_F8,
+    GLFW_FKEY_F9,
     GLFW_FKEY_F10,
     GLFW_FKEY_F11,
     GLFW_FKEY_F12,
@@ -41,7 +49,6 @@ from .fast_data_types import (
     GLFW_FKEY_F17,
     GLFW_FKEY_F18,
     GLFW_FKEY_F19,
-    GLFW_FKEY_F2,
     GLFW_FKEY_F20,
     GLFW_FKEY_F21,
     GLFW_FKEY_F22,
@@ -52,19 +59,12 @@ from .fast_data_types import (
     GLFW_FKEY_F27,
     GLFW_FKEY_F28,
     GLFW_FKEY_F29,
-    GLFW_FKEY_F3,
     GLFW_FKEY_F30,
     GLFW_FKEY_F31,
     GLFW_FKEY_F32,
     GLFW_FKEY_F33,
     GLFW_FKEY_F34,
     GLFW_FKEY_F35,
-    GLFW_FKEY_F4,
-    GLFW_FKEY_F5,
-    GLFW_FKEY_F6,
-    GLFW_FKEY_F7,
-    GLFW_FKEY_F8,
-    GLFW_FKEY_F9,
     GLFW_FKEY_HOME,
     GLFW_FKEY_INSERT,
     GLFW_FKEY_KP_BEGIN,
@@ -78,13 +78,13 @@ from .fast_data_types import (
     GLFW_FKEY_KP_PAGE_UP,
     GLFW_FKEY_KP_RIGHT,
     GLFW_FKEY_KP_UP,
+    GLFW_FKEY_LEFT,
     GLFW_FKEY_LEFT_ALT,
     GLFW_FKEY_LEFT_CONTROL,
     GLFW_FKEY_LEFT_HYPER,
     GLFW_FKEY_LEFT_META,
     GLFW_FKEY_LEFT_SHIFT,
     GLFW_FKEY_LEFT_SUPER,
-    GLFW_FKEY_LEFT,
     GLFW_FKEY_NUM_LOCK,
     GLFW_FKEY_PAGE_DOWN,
     GLFW_FKEY_PAGE_UP,
@@ -109,19 +109,17 @@ from .fast_data_types import (
     GLFW_MOD_META,
     GLFW_MOD_SHIFT,
     GLFW_MOD_SUPER,
-    GLFW_PRESS,
-    GLFW_RELEASE,
-    GLFW_REPEAT,
     GLFW_MOUSE_BUTTON_1,
     GLFW_MOUSE_BUTTON_2,
     GLFW_MOUSE_BUTTON_3,
+    GLFW_PRESS,
+    GLFW_RELEASE,
+    GLFW_REPEAT,
     gtk_backend_activate,
     gtk_backend_available,
     gtk_backend_clear_window_blur,
-    gtk_backend_has_wayland_blur,
     gtk_backend_initialize,
     gtk_backend_set_window_app_id,
-    gtk_backend_set_window_blur,
     gtk_input_close,
     gtk_input_focus,
     gtk_input_key,
@@ -131,14 +129,12 @@ from .fast_data_types import (
     gtk_input_scroll,
     gtk_render_os_window,
 )
-from .tab_bar import TabBarData
+from .tab_bar import TabBarData  # noqa: E402
 
-
-# Prefer kitty's region protocol whenever it was compiled in. GTK's CSS
-# backdrop filter cannot be constrained to the visible CSD window allocation.
-_use_gtk_css_wayland_blur = (
-    Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()
-) >= (4, 23, 3) and not gtk_backend_has_wayland_blur()
+# GTK owns this Wayland surface and may already have attached a background
+# effect to it. Use GTK's CSS filter where supported instead of sending a
+# second ext_background_effect_manager_v1 request for the same surface.
+_use_gtk_css_wayland_blur = (Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()) >= (4, 23, 3)
 
 if (Adw.get_major_version(), Adw.get_minor_version()) < (1, 4):
     raise RuntimeError('kitty GTK backend requires libadwaita 1.4 or newer')
@@ -585,7 +581,6 @@ class GtkKittyWindow:
 
     def _window_realized(self, _window: Gtk.Window) -> None:
         gtk_backend_set_window_app_id(self.window.__gpointer__, self.application_id)
-        self._apply_wayland_blur()
 
     def _window_unrealized(self, _window: Gtk.Window) -> None:
         if self.os_window_id:
@@ -595,7 +590,6 @@ class GtkKittyWindow:
         self._gtk_scale = max(1, self.gl_area.get_scale_factor())
         if self.os_window_id and width > 0 and height > 0:
             gtk_input_resize(self.os_window_id, width, height, self._gtk_scale)
-            self._apply_wayland_blur()
 
     def _area_rendered(self, _area: Gtk.GLArea, context: Any) -> bool:
         rendered = bool(self.events.render(context))
@@ -850,8 +844,6 @@ class GtkKittyWindow:
 
     @staticmethod
     def _mods(state: Gdk.ModifierType) -> int:
-        from .fast_data_types import GLFW_MOD_CAPS_LOCK
-
         ans = 0
         if state & Gdk.ModifierType.SHIFT_MASK:
             ans |= GLFW_MOD_SHIFT
@@ -935,7 +927,10 @@ class GtkKittyWindow:
         base_keyval = Gdk.keyval_to_lower(keyval)
         base = Gdk.keyval_to_unicode(base_keyval)
         actual_char = chr(actual) if actual else ''
-        base_chars = {'!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0', '_': '-', '+': '=', '{': '[', '}': ']', '|': '\\', ':': ';', '"': "'", '<': ',', '>': '.', '?': '/', '~': '`'}
+        base_chars = {
+            '!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
+            '_': '-', '+': '=', '{': '[', '}': ']', '|': '\\', ':': ';', '"': "'", '<': ',', '>': '.', '?': '/', '~': '`',
+        }
         if actual_char in base_chars:
             base = ord(base_chars[actual_char])
         key = special.get(keyval, base)
@@ -966,15 +961,9 @@ class GtkKittyWindow:
         topbar_visible = not bool(hide_window_decorations & 0b01) and self._tab_bar_visible
         self.tab_chrome.set_visible(topbar_visible)
 
-    def _apply_wayland_blur(self) -> None:
-        if _use_gtk_css_wayland_blur or not self.os_window_id or not self.window.get_realized():
-            return
-        gtk_backend_set_window_blur(self.os_window_id, self.window.__gpointer__, self._background_blur)
-
     def apply_chrome_style(self, background_color: int, background_opacity: float, background_blur: int) -> None:
         """Match GTK's header surface to kitty's active terminal background."""
         self._background_blur = max(0, int(background_blur)) if background_opacity < 1.0 else 0
-        self._apply_wayland_blur()
         style_key = (background_color, float(background_opacity), self._background_blur)
         if getattr(self, '_chrome_style_key', None) == style_key:
             return
@@ -1023,7 +1012,6 @@ class GtkKittyWindow:
         self._gtk_scale = max(1, self.gl_area.get_scale_factor())
         self.events.resized(self.gl_area.get_width(), self.gl_area.get_height(), self._gtk_scale)
         self.events.focus_changed(self.window.is_active())
-        self._apply_wayland_blur()
 
     def set_tab_actions(
         self,
@@ -1165,9 +1153,6 @@ class GtkKittyWindow:
 
     def get_scale(self) -> float:
         return float(max(1, self.gl_area.get_scale_factor()))
-
-    def set_title(self, title: str) -> None:
-        self.window.set_title(title)
 
     def queue_render(self) -> None:
         self.gl_area.queue_render()

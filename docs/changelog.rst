@@ -9,6 +9,13 @@ To update |kitty|, :doc:`follow the instructions <binary>`.
 Recent major new features
 ---------------------------
 
+GTK windows on Wayland [0.50.0]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use GTK's supported CSS backdrop filter for the optional GNOME Wayland
+backend. Avoid creating a second background-effect object on a surface that
+the GTK display may already own.
+
 GTK window startup [unreleased]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

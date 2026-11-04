@@ -202,7 +202,10 @@ else:
                         cgroup_pids = {int(x) for x in f.read().split() if x}
                     descendants = _get_descendants_of(pid)
                     descendants.add(pid)
-                    use_cgroup = cgroup_pids <= descendants
+                    # Some container runtimes expose the cgroup memory files
+                    # while hiding its process list. An empty list cannot
+                    # establish that this process tree owns the whole cgroup.
+                    use_cgroup = bool(cgroup_pids) and cgroup_pids <= descendants
 
             if use_cgroup:
                 target_keys = {'anon', 'shmem', 'kernel', 'sock', 'zswap'}

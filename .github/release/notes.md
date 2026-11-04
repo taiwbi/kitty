@@ -1,11 +1,13 @@
 Portable Linux kitty and standalone kitten builds from this tag.
 
-Fixes in v.0.49.2.15:
+Changes in 0.50.0.0:
 
 - Set the default GTK window class and Wayland application ID to `com.taiwbi.kitty`.
 - Draw the new-tab glyph using the theme foreground without external icon files or SVG loaders; use a flat button with no persistent background.
 - Add `StartupWMClass=com.taiwbi.kitty` to both desktop launchers.
 - Check the rendered new-tab glyph in the frozen portable runtime under Xvfb.
+- Avoid duplicate Wayland background-effect requests from GTK windows, which could make Fedora's compositor terminate the display connection during startup.
+- Run CI builds and package tests on Linux only.
 
 - **kitty:** Linux amd64/arm64 bundles (`.txz`).
 - **kitten:** Linux amd64, arm64, arm, and 386.

@@ -71,6 +71,7 @@ jobs:
               mkdir /tmp/kitty
               tar -xf /dist/kitty-*.txz -C /tmp/kitty
               xvfb-run -a /tmp/kitty/bin/kitty +launch /checks/smoke.py
+              printf 'Portable runtime smoke test passed.\n'
             '
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

@@ -111,6 +111,11 @@ assert len(fired) == 1
             events.resized(640, 480, 2)
             resized.assert_called_once_with(1, 640, 480, 2)
 
+    def test_gtk_blur_uses_css_capability(self):
+        version = (self.backend.Gtk.get_major_version(), self.backend.Gtk.get_minor_version(), self.backend.Gtk.get_micro_version())
+        self.ae(self.backend._use_gtk_css_wayland_blur, version >= (4, 23, 3))
+        self.assertFalse(hasattr(self.backend, 'gtk_backend_set_window_blur'))
+
     def test_gtk_realization_wait(self):
         backend = self.backend
         for present in (False, True):
