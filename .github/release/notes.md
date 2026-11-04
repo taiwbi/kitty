@@ -1,5 +1,11 @@
 Portable Linux kitty and standalone kitten builds from this tag.
 
+Changes in 0.50.0.2:
+
+- Restore background blur on GTK versions older than 4.23.3, including the portable Linux builds.
+- Keep GTK's CSS blur on newer versions to avoid duplicate Wayland background-effect requests and compositor disconnects.
+- Refresh blur after resizing or recreating a window and when background opacity changes.
+
 Changes in 0.50.0.1:
 
 - Fix GTK startup failing with `RuntimeError: The GTK window callback did not return a GTK window` on GNOME Wayland.

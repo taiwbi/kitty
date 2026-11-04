@@ -309,6 +309,10 @@ def main() -> None:
     OUTPUT.mkdir(exist_ok=True)
     build_fribidi()
     run(sys.executable, 'setup.py', 'build')
+    # GTK is optional in regular CI. Release builders have the real bindings,
+    # so require them and exercise both blur ownership paths before freezing.
+    run('kitty/launcher/kitty', '+runpy', 'import kitty.gtk_window')
+    run('./test.py', '--module', 'gtk_window')
     check_gtk_fallback()
     docs_env = dict(os.environ, PYTHONPATH=os.environ['RELEASE_DOCS_DEPS'])
     run('make', 'docs', f'SPHINXBUILD={shlex.quote(sys.executable)} -m sphinx', env=docs_env)

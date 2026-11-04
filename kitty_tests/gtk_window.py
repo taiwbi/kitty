@@ -119,7 +119,89 @@ assert len(fired) == 1
     def test_gtk_blur_uses_css_capability(self):
         version = (self.backend.Gtk.get_major_version(), self.backend.Gtk.get_minor_version(), self.backend.Gtk.get_micro_version())
         self.ae(self.backend._use_gtk_css_wayland_blur, version >= (4, 23, 3))
-        self.assertFalse(hasattr(self.backend, 'gtk_backend_set_window_blur'))
+
+    def test_gtk_blur_protocol_ownership(self):
+        backend = self.backend
+        window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+        window.window = Mock()
+        window.window.__gpointer__ = object()
+        window._background_blur = 20
+        for css_blur, wayland, window_id, realized in (
+            (False, True, 1, True),
+            (True, True, 1, True),
+            (False, False, 1, True),
+            (False, True, 0, True),
+            (False, True, 1, False),
+        ):
+            with (
+                self.subTest(css_blur=css_blur, wayland=wayland, window_id=window_id, realized=realized),
+                patch.object(backend, '_use_gtk_css_wayland_blur', css_blur),
+                patch.object(backend, 'is_wayland', return_value=wayland),
+                patch.object(backend, 'gtk_backend_set_window_blur') as set_blur,
+            ):
+                window.os_window_id = window_id
+                window.window.get_realized.return_value = realized
+                window._apply_wayland_blur()
+                if not css_blur and wayland and window_id and realized:
+                    set_blur.assert_called_once_with(1, window.window.__gpointer__, 20)
+                else:
+                    set_blur.assert_not_called()
+
+    def test_gtk_blur_style_changes(self):
+        backend = self.backend
+        for css_blur in (False, True):
+            with (
+                self.subTest(css_blur=css_blur),
+                patch.object(backend, '_use_gtk_css_wayland_blur', css_blur),
+                patch.object(backend, 'is_wayland', return_value=True),
+                patch.object(backend, 'gtk_backend_set_window_blur') as set_blur,
+                patch.object(backend.Gtk, 'CssProvider') as provider,
+            ):
+                window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+                window.window, window.gl_area, window.tab_chrome = Mock(), Mock(), Mock()
+                window.window.__gpointer__ = object()
+                window.os_window_id = 1
+                for opacity, blur, expected in ((0.8, 20, 20), (1.0, 20, 0), (0.8, 0, 0), (0.8, 30, 30)):
+                    window.apply_chrome_style(0x112233, opacity, blur)
+                    css = provider.return_value.load_from_data.call_args.args[0].decode()
+                    if css_blur:
+                        self.assertIn(f'backdrop-filter: {"blur(20px)" if expected else "none"};', css)
+                        set_blur.assert_not_called()
+                    else:
+                        self.assertNotIn('backdrop-filter', css)
+                        set_blur.assert_called_with(1, window.window.__gpointer__, expected)
+
+    def test_gtk_blur_surface_lifecycle(self):
+        backend = self.backend
+        window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+        window.window, window.gl_area, window.events = Mock(), Mock(), Mock()
+        window.window.__gpointer__ = object()
+        window.application_id = 'com.taiwbi.kitty'
+        window.gl_area.get_scale_factor.return_value = 1
+        window.gl_area.get_width.return_value = 640
+        window.gl_area.get_height.return_value = 480
+        window._background_blur = 20
+        window.os_window_id = 0
+        with (
+            patch.object(backend, '_use_gtk_css_wayland_blur', False),
+            patch.object(backend, 'is_wayland', return_value=True),
+            patch.object(backend, 'gtk_backend_set_window_app_id'),
+            patch.object(backend, 'gtk_input_resize'),
+            patch.object(backend, 'gtk_backend_set_window_blur') as set_blur,
+            patch.object(backend, 'gtk_backend_clear_window_blur') as clear_blur,
+        ):
+            window._window_realized(window.window)
+            set_blur.assert_not_called()
+            window.bind(1)
+            set_blur.assert_called_once_with(1, window.window.__gpointer__, 20)
+            set_blur.reset_mock()
+            window._area_resized(window.gl_area, 800, 600)
+            set_blur.assert_called_once_with(1, window.window.__gpointer__, 20)
+            window._window_unrealized(window.window)
+            clear_blur.assert_called_once_with(1)
+            set_blur.reset_mock()
+            window._window_realized(window.window)
+            set_blur.assert_called_once_with(1, window.window.__gpointer__, 20)
 
     def test_gtk_realization_wait(self):
         backend = self.backend
