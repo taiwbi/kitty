@@ -14,11 +14,12 @@ import (
 )
 
 type ControlMaster struct {
-	conn         *SSHConnectionData
-	remote_path  string
-	tdir         string
-	Dest         string
-	LastErrorLog string
+	conn            *SSHConnectionData
+	remote_path     string
+	tdir            string
+	keep_local_copy bool
+	Dest            string
+	LastErrorLog    string
 }
 
 func new_control_master(conn *SSHConnectionData, remote_path, dest string) *ControlMaster {
@@ -60,7 +61,7 @@ func (m *ControlMaster) Close() {
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 		_ = cmd.Run()
 	}
-	if m.tdir != "" {
+	if m.tdir != "" && !m.keep_local_copy {
 		_ = os.RemoveAll(m.tdir)
 	}
 }
@@ -161,10 +162,23 @@ func get_editor() []string {
 	return []string{"vim"}
 }
 
-func edit_loop(master *ControlMaster, editor []string) error {
+// edit_and_upload runs the edit loop and, if the final upload fails after the
+// editor was started, keeps the local copy so the user's edits are not lost.
+func edit_and_upload(master *ControlMaster, editor []string) error {
+	editor_started, err := edit_loop(master, editor)
+	if err != nil && editor_started {
+		master.keep_local_copy = true
+		return fmt.Errorf("%w\nYour edited file is saved at: %s", err, master.Dest)
+	}
+	return err
+}
+
+// edit_loop returns whether the editor was started, so callers can tell
+// failures before editing from failures to upload the edits.
+func edit_loop(master *ControlMaster, editor []string) (editor_started bool, err error) {
 	st, err := os.Stat(master.Dest)
 	if err != nil {
-		return err
+		return false, err
 	}
 	mtime := st.ModTime()
 	// Mirrors main.py handle_action's edit branch: reset the terminal (clear
@@ -175,7 +189,7 @@ func edit_loop(master *ControlMaster, editor []string) error {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Start(); err != nil {
-		return err
+		return false, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -185,11 +199,11 @@ func edit_loop(master *ControlMaster, editor []string) error {
 			reset_terminal()
 			if master.IsAlive() {
 				if err := master.Upload(false); err != nil {
-					return fmt.Errorf("failed to upload %s: %w", master.remote_path, err)
+					return true, fmt.Errorf("failed to upload %s: %w", master.remote_path, err)
 				}
-				return nil
+				return true, nil
 			}
-			return fmt.Errorf("failed to upload %s, SSH master process died", master.remote_path)
+			return true, fmt.Errorf("failed to upload %s, SSH master process died", master.remote_path)
 		case <-time.After(100 * time.Millisecond):
 			if st, err := os.Stat(master.Dest); err == nil && st.ModTime().After(mtime) {
 				mtime = st.ModTime()

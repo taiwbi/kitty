@@ -84,62 +84,78 @@ func (self *Output) add_data(data []byte) {
 }
 
 func (self *Output) write_image(img image.Image) (err error) {
-	var output *os.File
 	if self.arg_is_stream {
-		output = os.Stdout
+		output := os.Stdout
 		if self.arg == "/dev/stderr" {
 			output = os.Stderr
 		}
-	} else {
-		output, err = os.Create(self.arg)
-		if err != nil {
-			return err
-		}
+		return images.Encode(output, img, self.mime_type)
 	}
-	defer func() {
-		output.Close()
-		if err != nil && !self.arg_is_stream {
-			os.Remove(output.Name())
-		}
-	}()
-	return images.Encode(output, img, self.mime_type)
+	// Encode into memory first so that an encoding failure leaves any
+	// existing destination file untouched.
+	var buf bytes.Buffer
+	if err = images.Encode(&buf, img, self.mime_type); err != nil {
+		return err
+	}
+	return utils.AtomicUpdateFile(self.arg, &buf)
 }
 
-func (self *Output) commit() {
-	if self.err != nil {
-		return
+// The downloaded data for a remote MIME type, shared by all outputs saved from it
+type downloaded_data struct {
+	file        *os.File
+	img         image.Image
+	img_err     error
+	img_decoded bool
+}
+
+func (self *downloaded_data) image() (image.Image, error) {
+	if !self.img_decoded {
+		self.img_decoded = true
+		if _, self.img_err = self.file.Seek(0, io.SeekStart); self.img_err == nil {
+			self.img, _, self.img_err = image.Decode(self.file)
+		}
 	}
+	return self.img, self.img_err
+}
+
+func (self *Output) save(src *downloaded_data) {
 	if self.image_needs_conversion {
-		self.dest.Seek(0, io.SeekStart)
-		img, _, err := image.Decode(self.dest)
-		self.dest.Close()
-		os.Remove(self.dest.Name())
+		img, err := src.image()
 		if err == nil {
 			err = self.write_image(img)
 		}
 		if err != nil {
 			self.err = fmt.Errorf("Failed to encode image data to %s with error: %w", self.mime_type, err)
 		}
-	} else {
-		self.dest.Close()
-		if !self.is_stream {
-			f, err := os.OpenFile(self.arg, os.O_CREATE|os.O_RDONLY, 0666)
-			if err == nil {
-				fi, err := f.Stat()
-				if err == nil {
-					self.dest.Chmod(fi.Mode().Perm())
-				}
-				f.Close()
-				os.Remove(f.Name())
-			}
-			self.err = os.Rename(self.dest.Name(), self.arg)
-			if self.err != nil {
-				os.Remove(self.dest.Name())
-				self.err = fmt.Errorf("Failed to rename temporary file used for downloading to destination: %s with error: %w", self.arg, self.err)
-			}
-		}
+		return
 	}
-	self.dest = nil
+	// Copy the downloaded data into place atomically, preserving the
+	// permissions of and following symlinks at the destination.
+	_, err := src.file.Seek(0, io.SeekStart)
+	if err == nil {
+		err = utils.AtomicUpdateFile(self.arg, src.file)
+	}
+	if err != nil {
+		self.err = fmt.Errorf("Failed to write downloaded data to destination: %s with error: %w", self.arg, err)
+	}
+}
+
+func (self *Output) commit() {
+	if self.err != nil {
+		return
+	}
+	if self.is_stream {
+		self.dest = nil
+		return
+	}
+	self.save(&downloaded_data{file: self.dest})
+	self.cleanup()
+}
+
+func (self *Output) write_mime_list(available_mimes []string) {
+	self.add_data(utils.UnsafeStringToBytes(strings.Join(available_mimes, "\n")))
+	self.all_data_received = true
+	self.commit()
 }
 
 func (self *Output) assign_mime_type(available_mimes []string, aliases map[string][]string) (err error) {
@@ -286,6 +302,204 @@ func parse_aliases(raw []string) (map[string][]string, error) {
 	return ans, nil
 }
 
+func (self *Output) writes_directly_to_stream() bool {
+	return self.arg_is_stream && !self.image_needs_conversion
+}
+
+// All the outputs for a single remote MIME type. Outputs that write directly
+// to a stream receive data as it arrives, all others are saved from a single
+// temporary file holding the downloaded data, once all of it is received.
+type read_group struct {
+	outputs           []*Output
+	downloaded        *os.File
+	err               error
+	all_data_received bool
+}
+
+// Create the temporary file in the directory of the first output where that
+// is possible, so a missing output directory does not affect other outputs
+func (self *read_group) create_download_file() (f *os.File, err error) {
+	for _, o := range self.outputs {
+		if o.writes_directly_to_stream() {
+			continue
+		}
+		d := cwd
+		if strings.ContainsRune(o.arg, os.PathSeparator) && !o.arg_is_stream {
+			d = filepath.Dir(o.arg)
+		}
+		if f, err = os.CreateTemp(d, "."+filepath.Base(o.arg)); err == nil {
+			return
+		}
+	}
+	return
+}
+
+func (self *read_group) add_data(data []byte) {
+	if self.all_data_received {
+		return
+	}
+	needs_download := false
+	for _, o := range self.outputs {
+		if o.writes_directly_to_stream() {
+			o.add_data(data)
+		} else {
+			// Any errors are reported for this output when committing
+			o.started = true
+			needs_download = true
+		}
+	}
+	if !needs_download || self.err != nil {
+		return
+	}
+	if self.downloaded == nil {
+		if self.downloaded, self.err = self.create_download_file(); self.err != nil {
+			return
+		}
+	}
+	_, self.err = self.downloaded.Write(data)
+}
+
+func (self *read_group) commit() {
+	defer self.cleanup()
+	src := downloaded_data{file: self.downloaded}
+	for _, o := range self.outputs {
+		switch {
+		case o.writes_directly_to_stream():
+		case self.err != nil:
+			o.err = self.err
+		case self.downloaded != nil:
+			o.save(&src)
+		}
+	}
+}
+
+func (self *read_group) cleanup() {
+	if self.downloaded != nil {
+		self.downloaded.Close()
+		os.Remove(self.downloaded.Name())
+		self.downloaded = nil
+	}
+}
+
+type read_outputs map[string]*read_group
+
+func (self read_outputs) add(o *Output) error {
+	g := self[o.remote_mime_type]
+	if g == nil {
+		g = &read_group{}
+		self[o.remote_mime_type] = g
+	}
+	if o.arg_is_stream {
+		// Stream outputs write data as it arrives, so two of them sharing a
+		// remote MIME type would interleave their data in the same stream.
+		for _, x := range g.outputs {
+			if x.arg_is_stream && x.arg == o.arg {
+				return fmt.Errorf("Cannot write the clipboard MIME type %s to %s more than once", o.remote_mime_type, o.arg)
+			}
+		}
+	}
+	g.outputs = append(g.outputs, o)
+	return nil
+}
+
+func (self read_outputs) add_data(mime_type string, data []byte) {
+	if g := self[mime_type]; g != nil {
+		g.add_data(data)
+	}
+}
+
+func (self read_outputs) commit(mime_type string, wg *sync.WaitGroup) {
+	if g := self[mime_type]; g != nil && !g.all_data_received {
+		g.all_data_received = true
+		for _, o := range g.outputs {
+			o.all_data_received = true
+		}
+		wg.Go(g.commit)
+	}
+}
+
+func (self read_outputs) cleanup() {
+	for _, g := range self {
+		g.cleanup()
+	}
+}
+
+// Resolve the path in the same order as utils.AtomicUpdateFile, then resolve
+// symlinks in the absolute working-directory prefix as well.
+func resolved_output_path(path string) (string, error) {
+	path, err := utils.EvalSymlinksThatExist(path)
+	if err != nil {
+		return "", err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return utils.EvalSymlinksThatExist(path)
+}
+
+func check_for_duplicate_output_files(outputs []*Output) error {
+	type resolved_output struct {
+		path, arg string
+	}
+	seen := make(map[string]string, len(outputs))
+	resolved := make([]resolved_output, 0, len(outputs))
+	for _, o := range outputs {
+		if o.arg_is_stream {
+			continue
+		}
+		path, err := resolved_output_path(o.arg)
+		if err != nil {
+			return fmt.Errorf("Failed to resolve the output path %s with error: %w", o.arg, err)
+		}
+		if prev, found := seen[path]; found {
+			return fmt.Errorf("The output files %s and %s are the same file", prev, o.arg)
+		}
+		seen[path] = o.arg
+		resolved = append(resolved, resolved_output{path, o.arg})
+	}
+	if len(resolved) < 2 {
+		// Avoid creating probe files when there is nothing to compare
+		return nil
+	}
+
+	// Let the destination filesystem compare the names, including case
+	// and Unicode normalization, without touching the output files.
+	type created_probe struct {
+		info os.FileInfo
+		arg  string
+	}
+	probe_prefix := "." + utils.RandomFilename() + "-"
+	probes := make([]created_probe, 0, len(resolved))
+	for _, r := range resolved {
+		probe := filepath.Join(filepath.Dir(r.path), probe_prefix+filepath.Base(r.path))
+		f, err := os.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if os.IsExist(err) {
+				if s, serr := os.Stat(probe); serr == nil {
+					for _, p := range probes {
+						if os.SameFile(p.info, s) {
+							return fmt.Errorf("The output files %s and %s are the same file", p.arg, r.arg)
+						}
+					}
+				}
+				return fmt.Errorf("The output file %s refers to the same file as another output", r.arg)
+			}
+			// If no temporary file can be created, let this output report
+			// its write error without preventing other outputs.
+			continue
+		}
+		defer os.Remove(probe)
+		s, err := f.Stat()
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("Failed to stat the temporary file %s with error: %w", probe, err)
+		}
+		probes = append(probes, created_probe{s, r.arg})
+	}
+	return nil
+}
+
 func run_get_loop(opts *Options, args []string) (err error) {
 	lp, err := loop.NewForSimpleInteraction()
 	if err != nil {
@@ -294,7 +508,7 @@ func run_get_loop(opts *Options, args []string) (err error) {
 	var available_mimes []string
 	var wg sync.WaitGroup
 	var getting_data_for string
-	requested_mimes := make(map[string]*Output)
+	requested_mimes := make(read_outputs)
 	reading_available_mimes := true
 	outputs := make([]*Output, len(args))
 	aliases, merr := parse_aliases(opts.Alias)
@@ -317,8 +531,12 @@ func run_get_loop(opts *Options, args []string) (err error) {
 			return fmt.Errorf("Could not detect the MIME type for: %s use --mime to specify it manually", arg)
 		}
 	}
+	if err = check_for_duplicate_output_files(outputs); err != nil {
+		return err
+	}
 
 	defer func() {
+		requested_mimes.cleanup()
 		for _, o := range outputs {
 			if o.dest != nil {
 				o.cleanup()
@@ -365,11 +583,9 @@ func run_get_loop(opts *Options, args []string) (err error) {
 						return err
 					}
 					if o.remote_mime_type == "." {
-						o.started = true
-						o.add_data(utils.UnsafeStringToBytes(strings.Join(available_mimes, "\n")))
-						o.all_data_received = true
-					} else {
-						requested_mimes[o.remote_mime_type] = o
+						o.write_mime_list(available_mimes)
+					} else if err = requested_mimes.add(o); err != nil {
+						return err
 					}
 				}
 				if len(requested_mimes) > 0 {
@@ -384,31 +600,17 @@ func run_get_loop(opts *Options, args []string) (err error) {
 			switch metadata["status"] {
 			case "DATA":
 				current_mime := metadata["mime"]
-				o := requested_mimes[current_mime]
-				if o != nil {
+				if _, found := requested_mimes[current_mime]; found {
 					if getting_data_for != current_mime {
-						if prev := requested_mimes[getting_data_for]; prev != nil && !prev.all_data_received {
-							prev.all_data_received = true
-							wg.Go(func() {
-								prev.commit()
-							})
-
-						}
+						requested_mimes.commit(getting_data_for, &wg)
 						getting_data_for = current_mime
 					}
-					if !o.all_data_received {
-						o.add_data(payload)
-					}
+					requested_mimes.add_data(current_mime, payload)
 				}
 			case "OK":
 			case "DONE":
-				if prev := requested_mimes[getting_data_for]; getting_data_for != "" && prev != nil && !prev.all_data_received {
-					prev.all_data_received = true
-					wg.Go(func() {
-						prev.commit()
-					})
-					getting_data_for = ""
-				}
+				requested_mimes.commit(getting_data_for, &wg)
+				getting_data_for = ""
 				lp.Quit(0)
 			default:
 				return fmt.Errorf("Failed to read data from the clipboard with error: %w", error_from_status(metadata["status"]))

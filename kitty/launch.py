@@ -14,7 +14,7 @@ from .cli import parse_args
 from .cli_stub import LaunchCLIOptions
 from .clipboard import set_clipboard_string, set_primary_selection
 from .constants import is_wayland
-from .fast_data_types import add_timer, get_boss, get_options, get_os_window_title, patch_color_profiles
+from .fast_data_types import COLOR_LAYER_WINDOW, add_timer, get_boss, get_options, get_os_window_title, patch_color_profiles
 from .options.utils import env as parse_env
 from .tabs import Tab, TabManager
 from .types import DockSpec, LayerShellConfig, OverlayType, dock_edges, parse_dock_spec, run_once
@@ -61,6 +61,8 @@ This option was added to kitty in version 0.26.0
 
 @run_once
 def options_spec() -> str:
+    from .rc.set_spacing import SPACING_SETTINGS_DOC
+
     return f"""
 --source-window
 A match expression to select the window from which data such as title, colors, env vars,
@@ -201,6 +203,10 @@ by the shell (needs :ref:`shell_integration` to work). The special value
 oldest foreground process associated with the currently active window rather
 than the newest foreground process. Finally, the special value :code:`root`
 refers to the process that was originally started when the window was created.
+If kitty itself started that process via a wrapper, such as :file:`/usr/bin/login`
+on macOS, the wrapper is ignored and its first child is used instead. The
+working directory reported by the shell is used only when the root process is in
+the foreground.
 
 When opening in the same working directory as the current window causes the new
 window to connect to a remote host, you can use the :option:`--hold-after-ssh`
@@ -457,8 +463,7 @@ from, or specify them individually, for example::
 --spacing
 type=list
 Set the margin and padding for the newly created window.
-For example: :code:`margin=20` or :code:`padding-left=10` or :code:`margin-h=30`. The shorthand form sets
-all values, the :code:`*-h` and :code:`*-v` variants set horizontal and vertical values.
+{SPACING_SETTINGS_DOC}
 Can be specified multiple times. Note that this is ignored for overlay windows as these use the settings
 from the base window.
 
@@ -667,7 +672,7 @@ def apply_colors(window: Window, spec: Sequence[str]) -> None:
 
     colors, transparent_background_colors = parse_colors(spec)
     profiles = (window.screen.color_profile,)
-    patch_color_profiles(colors, transparent_background_colors, profiles, True)
+    patch_color_profiles(colors, transparent_background_colors, profiles, COLOR_LAYER_WINDOW)
 
 
 def parse_var(defn: Iterable[str]) -> Iterator[tuple[str, str]]:
@@ -743,6 +748,7 @@ def _launch(
     base_env: dict[str, str] | None = None,
     child_death_callback: Callable[[int, Exception | None], None] | None = None,
     startup_command_via_shell_integration: Sequence[str] | str = (),
+    restored_scrollback: bytes = b'',
 ) -> Window | None:
     source_window = boss.active_window_for_cwd
     if opts.source_window:
@@ -960,6 +966,7 @@ def _launch(
                 is_clone_launch=is_clone_launch,
                 next_to=next_to,
                 startup_command_via_shell_integration=startup_command_via_shell_integration,
+                restored_scrollback=restored_scrollback,
                 dock_owner=dock_owner,
                 **kw,
             )
@@ -1008,6 +1015,7 @@ def launch(
     base_env: dict[str, str] | None = None,
     child_death_callback: Callable[[int, Exception | None], None] | None = None,
     startup_command_via_shell_integration: Sequence[str] | str = (),
+    restored_scrollback: bytes = b'',
 ) -> Window | None:
     active = boss.active_window
     if opts.keep_focus and active:
@@ -1024,6 +1032,7 @@ def launch(
             base_env,
             child_death_callback,
             startup_command_via_shell_integration,
+            restored_scrollback,
         )
     finally:
         if opts.keep_focus and active:

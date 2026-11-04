@@ -1420,8 +1420,14 @@ typedef struct GLFWLayerShellConfig {
     } related;
 } GLFWLayerShellConfig;
 
+typedef struct GLFWTitlebarFont {
+    const char *family; // NULL means use the default font
+    double point_size, text_scale;
+    bool bold, italic;
+} GLFWTitlebarFont;
+
 typedef struct GLFWDBUSNotificationData {
-    const char *app_name, *icon, *summary, *body, *category, **actions;
+    const char *app_name, *icon, *summary, *body, *category, *desktop_entry, **actions;
     size_t num_actions;
     int32_t timeout;
     uint8_t urgency;
@@ -1563,13 +1569,19 @@ typedef void (*GLFWwindowclosefun)(GLFWwindow *);
  *  void function_name(int flags)
  *  @endcode
  *
- *  @param[in] flags 0 for a user requested application quit, 1 if a fatal error occurred and application should quit ASAP
+ *  @param[in] flags 0 for a user requested application quit, otherwise a
+ *  combination of the GLFW_APPLICATION_CLOSE_* flags
  *
  *  @sa @ref glfwSetApplicationCloseCallback
  *
  *  @ingroup window
  */
 typedef void (*GLFWapplicationclosefun)(int);
+
+/*! A fatal error occurred and the application should quit ASAP */
+#define GLFW_APPLICATION_CLOSE_FATAL_ERROR 1
+/*! The OS asked the application to quit because the user is logging out, restarting or shutting down */
+#define GLFW_APPLICATION_CLOSE_LOGOUT 2
 
 
 /*! @brief The function pointer type for system color theme change callbacks.
@@ -4212,6 +4224,10 @@ GLFWAPI GLFWapplicationclosefun glfwSetApplicationCloseCallback(GLFWapplicationc
 GLFWAPI GLFWsystemcolorthemechangefun glfwSetSystemColorThemeChangeCallback(GLFWsystemcolorthemechangefun callback);
 GLFWAPI GLFWclipboardlostfun glfwSetClipboardLostCallback(GLFWclipboardlostfun callback);
 GLFWAPI GLFWColorScheme glfwGetCurrentSystemColorTheme(bool query_if_unintialized);
+
+/*! @brief Returns the font to use for client side decoration titlebars, as
+ * configured in the desktop settings. */
+GLFWAPI GLFWTitlebarFont glfwGetTitlebarFont(void);
 
 /*! @brief Sets the refresh callback for the specified window.
  *

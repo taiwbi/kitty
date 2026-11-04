@@ -10,9 +10,10 @@ import sys
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import suppress
 from functools import lru_cache, partial
+from heapq import heappop, heappush
 from time import time_ns
 from types import GeneratorType
-from typing import TYPE_CHECKING, Any, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, TypeVar, cast
 
 from .cli import parse_args
 from .cli_stub import RCOptions
@@ -30,10 +31,22 @@ from .fast_data_types import (
 from .rc.base import NoResponse, PayloadGetter, all_command_names, command_for_name
 from .types import AsyncResponse
 from .typing_compat import BossType, WindowType
-from .utils import TTYIO, log_error, parse_address_spec, resolve_custom_file
+from .utils import TTYIO, log_error, parse_address_spec, resolve_custom_file, shlex_split
 
 active_async_requests: dict[str, float] = {}
-active_streams: dict[str, str] = {}
+
+
+class ActiveStream(NamedTuple):
+    cmd: str
+    # The origin of the request that opened the stream: the socket peer or the
+    # window the request was received from
+    peer_id: int
+    window_id: int
+    # The parts of the request that must be the same for every chunk of the stream
+    fingerprint: str
+
+
+active_streams: dict[str, ActiveStream] = {}
 T = TypeVar('T')
 if TYPE_CHECKING:
     from .window import Window
@@ -41,6 +54,44 @@ if TYPE_CHECKING:
 
 def encode_response_for_peer(response: Any) -> bytes:
     return b'\x1bP@kitty-cmd' + json.dumps(response).encode('utf-8') + b'\x1b\\'
+
+
+# Encrypted commands are accepted if their timestamp is within this many
+# nanoseconds of the current time
+ENCRYPTED_CMD_MAX_AGE = 5 * 60 * 10**9
+# Upper bound on the number of encrypted commands remembered for replay
+# detection. Every chunk of a streamed command is a separate encrypted command.
+MAX_SEEN_ENCRYPTED_CMDS = 1 << 16
+
+
+class SeenEncryptedCommands:
+    """Remembers recently accepted encrypted commands so that they cannot be
+    replayed while their timestamps are still acceptable."""
+
+    def __init__(self) -> None:
+        self.seen: set[bytes] = set()
+        self.expiry_heap: list[tuple[int, bytes]] = []
+
+    def clear(self) -> None:
+        self.seen.clear()
+        self.expiry_heap.clear()
+
+    def check_and_add(self, key: bytes, timestamp: int, now: int) -> str:
+        "Return an error message if the command must be rejected, otherwise remember it and return an empty string"
+        heap = self.expiry_heap
+        while heap and heap[0][0] < now:
+            self.seen.discard(heappop(heap)[1])
+        if key in self.seen:
+            return 'Ignoring encrypted rc command that has already been received. Could be an attempt at a replay attack.'
+        if len(self.seen) >= MAX_SEEN_ENCRYPTED_CMDS:
+            # Forgetting unexpired commands would allow them to be replayed, so refuse new ones instead
+            return 'Ignoring encrypted rc command as too many encrypted commands have been received recently.'
+        self.seen.add(key)
+        heappush(heap, (timestamp + ENCRYPTED_CMD_MAX_AGE, key))
+        return ''
+
+
+seen_encrypted_commands = SeenEncryptedCommands()
 
 
 def parse_cmd(serialized_cmd: memoryview, encryption_key: EllipticCurveKey) -> dict[str, Any]:
@@ -63,17 +114,32 @@ def parse_cmd(serialized_cmd: memoryview, encryption_key: EllipticCurveKey) -> d
         if not pubkey:
             log_error('Ignoring encrypted rc command without a public key')
             return {}
-        d = AES256GCMDecrypt(encryption_key.derive_secret(base64.b85decode(pubkey)), base64.b85decode(pcmd['iv']), base64.b85decode(pcmd['tag']))
+        iv, tag = base64.b85decode(pcmd['iv']), base64.b85decode(pcmd['tag'])
+        d = AES256GCMDecrypt(encryption_key.derive_secret(base64.b85decode(pubkey)), iv, tag)
         data = d.add_data_to_be_decrypted(base64.b85decode(pcmd['encrypted']), True)
         pcmd = json.loads(data)
         if not isinstance(pcmd, dict) or 'version' not in pcmd:
             return {}
-        delta = time_ns() - pcmd.pop('timestamp')
-        if abs(delta) > 5 * 60 * 1e9:
+        timestamp = pcmd.pop('timestamp', None)
+        if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+            log_error('Ignoring encrypted rc command without a valid timestamp')
+            return {}
+        now = time_ns()
+        delta = now - timestamp
+        if abs(delta) > ENCRYPTED_CMD_MAX_AGE:
             log_error(
                 f'Ignoring encrypted rc command with timestamp {delta / 1e9:.1f} seconds from now.'
                 ' Could be an attempt at a replay attack or an incorrect clock on a remote machine.'
             )
+            return {}
+        # The GCM tag authenticates the ciphertext, so an attacker cannot
+        # change it without knowing the key, while a replayed command has
+        # the same iv and tag as the original.
+        if err := seen_encrypted_commands.check_and_add(iv + tag, timestamp, now):
+            log_error(err)
+            return {}
+        if not isinstance(pcmd.get('password', ''), str):
+            log_error('Ignoring encrypted rc command with a password that is not a string')
             return {}
     return pcmd
 
@@ -103,11 +169,18 @@ def fnmatch_pattern(pat: str) -> 're.Pattern[str]':
     return re.compile(translate(pat))
 
 
+def password_as_bytes(pw: str) -> bytes:
+    # surrogatepass as JSON can contain lone surrogates
+    return pw.encode('utf-8', 'surrogatepass')
+
+
 def constant_time_lookup(passwords: dict[str, T], pw: str) -> T | None:
+    # Compare as bytes, since hmac.compare_digest() raises for str with non-ASCII characters
     result = None
     c = hmac.compare_digest
+    q = password_as_bytes(pw)
     for k, v in passwords.items():
-        if c(k, pw):
+        if c(password_as_bytes(k), q):
             result = v
     return result
 
@@ -131,6 +204,15 @@ def remote_control_allowed(
     if not pa.is_cmd_allowed(pcmd, window, False, extra_data):
         raise PermissionError()
     return True
+
+
+def kitten_password_restrictions(remote_control_password: str | bool) -> tuple[str, ...]:
+    # A string is a space separated list of allowed actions, same as for
+    # remote_control_password in kitty.conf. It must not be passed as is to
+    # PasswordAuthorizer as that would treat every character as a pattern.
+    if isinstance(remote_control_password, str):
+        return tuple(x for x in shlex_split(remote_control_password) if x)
+    return ()
 
 
 class PasswordAuthorizer:
@@ -176,16 +258,20 @@ def password_authorizer(auth_items: frozenset[str]) -> PasswordAuthorizer:
 user_password_allowed: dict[str, bool] = {}
 
 
-def is_cmd_allowed(pcmd: dict[str, Any], window: Optional['Window'], from_socket: bool, extra_data: dict[str, Any]) -> bool | None:
-    sid = pcmd.get('stream_id', '')
-    if sid and active_streams.get(sid, '') == pcmd['cmd']:
+def is_cmd_allowed(pcmd: dict[str, Any], window: Optional['Window'], from_socket: bool, extra_data: dict[str, Any], peer_id: int = 0) -> bool | None:
+    if is_stream_continuation(pcmd, window, peer_id):
+        # The request that opened the stream was authorized
         return True
-    if 'cancel_async' in pcmd and pcmd.get('async_id'):
+    if 'cancel_async' in pcmd and str(pcmd.get('async', '')):
         # we allow these without authentication as they are sent on error
         # conditions and we can't have users prompted for these. The worst side
         # effect of a malicious cancel_async request is that it can prevent
-        # another async request from getting a result, if it knows the async_id
-        # of that request.
+        # another async request from getting a result or cancel it, if it knows
+        # the async_id of that request. Implementations of
+        # cancel_async_request() must therefore only cancel the request with
+        # the specified async_id. The condition here must match the one in
+        # handle_cmd() exactly, so that these requests are guaranteed to only
+        # cancel and never execute the command.
         return True
     pw = pcmd.get('password', '')
     if not pw:
@@ -208,8 +294,54 @@ def set_user_password_allowed(pwd: str, allowed: bool = True) -> None:
     user_password_allowed[pwd] = allowed
 
 
+def stream_fingerprint(pcmd: dict[str, Any]) -> str:
+    # Every chunk of a stream repeats the request with only the data changed,
+    # so everything else must match the authorized request that opened the stream
+    payload = pcmd.get('payload') or {}
+    if isinstance(payload, dict):
+        # peer_id, stream_id and async_id are added to the payload by handle_cmd()
+        payload = {k: v for k, v in payload.items() if k not in ('data', 'peer_id', 'stream_id', 'async_id')}
+    return json.dumps({'cmd': pcmd.get('cmd'), 'async': str(pcmd.get('async', '')), 'payload': payload}, sort_keys=True)
+
+
+def window_id_of(window: WindowType | None) -> int:
+    return 0 if window is None else window.id
+
+
+def is_stream_continuation(pcmd: dict[str, Any], window: WindowType | None, peer_id: int) -> bool:
+    sid = str(pcmd.get('stream_id', ''))
+    s = active_streams.get(sid) if sid else None
+    return (
+        s is not None
+        and s.cmd == pcmd.get('cmd')
+        and s.peer_id == peer_id
+        and s.window_id == window_id_of(window)
+        and s.fingerprint == stream_fingerprint(pcmd)
+    )
+
+
+def register_active_stream(stream_id: str, pcmd: dict[str, Any], window: WindowType | None, peer_id: int) -> None:
+    active_streams[stream_id] = ActiveStream(pcmd['cmd'], peer_id, window_id_of(window), stream_fingerprint(pcmd))
+    while len(active_streams) > 32:
+        abort_active_stream(next(iter(active_streams)))
+
+
 def close_active_stream(stream_id: str) -> None:
     active_streams.pop(stream_id, None)
+
+
+def abort_active_stream(stream_id: str) -> None:
+    # Close the stream and discard any data already received on it
+    s = active_streams.pop(stream_id, None)
+    if s is not None:
+        command_for_name(s.cmd).stream_in_flight.discard(stream_id)
+
+
+def abort_active_streams_from(peer_id: int = 0, window_id: int = 0) -> None:
+    # Called when the socket peer or window that opened streams goes away, as
+    # the streams can no longer be completed
+    for sid in [sid for sid, s in active_streams.items() if s.peer_id == peer_id and s.window_id == window_id]:
+        abort_active_stream(sid)
 
 
 def handle_cmd(
@@ -231,20 +363,26 @@ def handle_cmd(
         return {'ok': False, 'error': 'Streaming send of data is not supported for this command'}
     if stream_id:
         payload['stream_id'] = stream_id
-        active_streams[stream_id] = cmd['cmd']
-        if len(active_streams) > 32:
-            oldest = next(iter(active_streams))
-            del active_streams[oldest]
     if async_id:
         payload['async_id'] = async_id
         if 'cancel_async' in cmd:
             active_async_requests.pop(async_id, None)
+            # Cancellations are allowed without authentication, so only let
+            # them abort a stream opened from the same origin
+            s = active_streams.get(stream_id) if stream_id else None
+            if s is not None and s.peer_id == peer_id and s.window_id == window_id_of(window):
+                abort_active_stream(stream_id)
             c.cancel_async_request(boss, self_window or window, PayloadGetter(c, payload))
             return None
         active_async_requests[async_id] = monotonic()
         if len(active_async_requests) > 32:
             oldest = next(iter(active_async_requests))
             del active_async_requests[oldest]
+    if stream_id:
+        # Register the stream only after cancellations have returned, as they
+        # are allowed without authentication and requests on a registered
+        # stream are allowed without authentication as well
+        register_active_stream(stream_id, cmd, window, peer_id)
     try:
         ans = c.response_from_kitty(boss, self_window or window, PayloadGetter(c, payload))
     except Exception:

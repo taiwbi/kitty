@@ -726,7 +726,7 @@ parse_kitty_dcs(PS *self, uint8_t *buf, size_t bufsz) {
     dispatch("cmd{", handle_remote_cmd, 1);
     dispatch("overlay-ready|", handle_overlay_ready, 0) dispatch("kitten-result|", handle_kitten_result, 0) dispatch("print|", handle_remote_print, 0)
         dispatch("echo|", handle_remote_echo, 0) dispatch("ssh|", handle_remote_ssh, 0) dispatch("ask|", handle_remote_askpass, 0)
-            dispatch("clone|", handle_remote_clone, 0) dispatch("edit|", handle_remote_edit, 0)
+            dispatch("clone|", handle_remote_clone, 0) dispatch("edit|", handle_remote_edit, 0) dispatch("color-scheme|", handle_remote_color_scheme, 0)
                 dispatch("restore-cursor-appearance|", handle_restore_cursor_appearance, 0)
 
                     return false;
@@ -1645,19 +1645,32 @@ run_worker(void *p, ParseData *pd, bool flush) {
 
 #ifndef DUMP_COMMANDS
 
-uint8_t *
-vt_parser_create_write_buffer(Parser *p, size_t *sz) {
+static uint8_t *
+create_write_buffer(Parser *p, size_t *sz) {
     PS *self = (PS *)p->state;
-    uint8_t *ans;
+    uint8_t *ans = NULL;
     with_lock {
-        if (self->write.sz) fatal("vt_parser_create_write_buffer() called with an already existing write buffer");
-        self->write.offset = self->read.sz + self->write.pending;
-        *sz = BUF_SZ - self->write.offset;
-        self->write.sz = *sz;
-        ans = self->buf + self->write.offset;
+        if (!self->write.sz) {
+            self->write.offset = self->read.sz + self->write.pending;
+            *sz = BUF_SZ - self->write.offset;
+            self->write.sz = *sz;
+            ans = self->buf + self->write.offset;
+        }
     }
     end_with_lock;
     return ans;
+}
+
+uint8_t *
+vt_parser_create_write_buffer(Parser *p, size_t *sz) {
+    uint8_t *ans = create_write_buffer(p, sz);
+    if (!ans) fatal("vt_parser_create_write_buffer() called with an already existing write buffer");
+    return ans;
+}
+
+uint8_t *
+vt_parser_create_write_buffer_if_none(Parser *p, size_t *sz) {
+    return create_write_buffer(p, sz);
 }
 
 void

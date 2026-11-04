@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable, Container, Iterable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, fields
+from math import isfinite
 from typing import (
     Any,
     Generic,
@@ -46,6 +47,7 @@ from kitty.utils import expandvars, log_error, resolve_abs_or_config_path, shlex
 
 KeyMap = dict[SingleKey, list['KeyDefinition']]
 MouseMap = dict[MouseEvent, str]
+URLMappings = dict[bool, int]
 KeySequence = tuple[SingleKey, ...]
 MINIMUM_FONT_SIZE = 4
 # Zooming is limited to a multiple of the configured font size, or to this
@@ -259,12 +261,18 @@ def parse_change_font_size(func: str, rest: str) -> tuple[str, tuple[bool, str |
         log_error(f'Invalid change_font_size specification: {rest}, treating it as default')
         return func, (True, None, 0)
     c_all = vals[0].lower() == 'all'
+    sign, amt = parse_font_size_change(vals[1])
+    return func, (c_all, sign, amt)
+
+
+def parse_font_size_change(spec: str) -> tuple[str | None, float]:
     sign: str | None = None
-    amt = vals[1]
-    if amt[0] in '+-*/':
-        sign = amt[0]
-        amt = amt[1:]
-    return func, (c_all, sign, float(amt.strip()))
+    if spec and spec[0] in '+-*/':
+        sign, spec = spec[0], spec[1:]
+    amt = float(spec.strip())
+    if not isfinite(amt):
+        raise ValueError(f'{spec} is not a finite number')
+    return sign, amt
 
 
 @func_with_args('clear_terminal')
@@ -280,6 +288,29 @@ def clear_terminal(func: str, rest: str) -> FuncArgsType:
             action = 'reset'
         args = [action, vals[1].lower() == 'active']
     return func, args
+
+
+USER_ANIMATION_EVENT_PREFIX = 'user:'
+user_animation_event_name_pat = re.compile(r'[a-zA-Z0-9_.-]+')
+
+
+def is_valid_user_animation_event_name(name: str) -> bool:
+    "Whether name, without the user: prefix, is valid as the name of a custom shader user event"
+    return len(name) <= defines.MAX_SHADER_ANIM_USER_EVENT_NAME_LEN and user_animation_event_name_pat.fullmatch(name) is not None
+
+
+@func_with_args('shader_event')
+def shader_event(func: str, rest: str) -> FuncArgsType:
+    vals = rest.split()
+    if not vals or len(vals) > 2:
+        raise ValueError(f'shader_event needs an event name and optionally one of active or all, not: {rest}')
+    name = vals[0].removeprefix(USER_ANIMATION_EVENT_PREFIX)
+    if not is_valid_user_animation_event_name(name):
+        raise ValueError(f'{name!r} is not a valid custom shader user event name')
+    scope = vals[1].lower() if len(vals) > 1 else 'active'
+    if scope not in ('active', 'all'):
+        raise ValueError(f'{scope} is not valid for shader_event, must be one of active or all')
+    return func, [name, scope]
 
 
 @func_with_args('copy_to_buffer')

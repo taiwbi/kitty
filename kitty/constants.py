@@ -22,7 +22,7 @@ class Version(NamedTuple):
 
 appname: str = 'kitty'
 kitty_face = '🐱'
-version: Version = Version(0, 49, 2)
+version: Version = Version(0, 50, 0)
 str_version: str = '.'.join(map(str, version))
 _plat = sys.platform.lower()
 is_macos: bool = 'darwin' in _plat
@@ -153,6 +153,19 @@ def _get_config_dir() -> str:
 config_dir = _get_config_dir()
 del _get_config_dir
 defconf = os.path.join(config_dir, 'kitty.conf')
+# When True, auxiliary files in config_dir that kitty loads implicitly, such as
+# the automatic color theme files, open-actions.conf, etc. are ignored. Set when
+# kitty is run with --config=NONE.
+_ignore_config_dir_files = False
+
+
+def set_ignore_config_dir_files(val: bool) -> None:
+    global _ignore_config_dir_files
+    _ignore_config_dir_files = val
+
+
+def config_dir_files_ignored() -> bool:
+    return _ignore_config_dir_files
 
 
 @run_once

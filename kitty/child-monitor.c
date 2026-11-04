@@ -551,7 +551,9 @@ parse_input_once(ChildMonitor *self, PyObject *a UNUSED) {
 static bool
 do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     ParseData pd = {.dump_callback = self->dump_callback, .now = now};
+    const bool had_url_highlight = screen->url_ranges.count > 0;
     self->parse_func(screen, &pd, flush);
+    if (had_url_highlight && !screen->url_ranges.count) link_hover_cleared_by_output(screen);
     if (pd.input_read) {
         if (is_gtk_backend_enabled()) screen_scroll_to_bottom(screen);
         if (pd.write_space_created) wakeup_io_loop(self, false);
@@ -1033,7 +1035,7 @@ prepare_to_render_os_window(
         }
     }
     {
-        unsigned events = os_window->shader_anim_event_registry;
+        ShaderAnimEventMask events = os_window->shader_anim_event_registry;
         if (os_window->active_tab != os_window->last_active_tab)
             events |= (1u << SHADER_ANIM_EVENT_TAB_CHANGE) | (1u << SHADER_ANIM_EVENT_WINDOW_FOCUS_IN) | (1u << SHADER_ANIM_EVENT_WINDOW_FOCUS_OUT);
         if (*active_window_id && *active_window_id != os_window->last_active_window_id)
@@ -1216,6 +1218,7 @@ render(monotonic_t now, bool input_read) {
     const bool scan_for_animated_images = global_state.check_for_active_animated_images;
     global_state.check_for_active_animated_images = false;
     call_boss(cache_process_data, "O", Py_True);
+    bool waiting_for_frame = false;
 
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
         OSWindow *w = global_state.os_windows + i;
@@ -1233,6 +1236,10 @@ render(monotonic_t now, bool input_read) {
             if (should_os_window_be_rendered(w)) call_boss(queue_gtk_render, "K", w->id);
             continue;
         }
+        // A window waiting for a render frame cannot paint now, so it must not delay the
+        // paint when the frame arrives, otherwise the next output paints it mid-burst
+        if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY && should_os_window_be_rendered(w))
+            waiting_for_frame = true;
         if (!render_os_window(w, now, scan_for_animated_images)) {
             // since we didn't scan the window for animations, force a rescan on next wakeup/render frame
             if (scan_for_animated_images) global_state.check_for_active_animated_images = true;
@@ -1244,7 +1251,7 @@ render(monotonic_t now, bool input_read) {
             w->keep_rendering_till_swap--;
         }
     }
-    last_render_at = now;
+    if (!waiting_for_frame) last_render_at = now;
     call_boss(cache_process_data, "O", Py_False);
 #undef TD
 }

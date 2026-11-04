@@ -3,12 +3,16 @@
 package ssh
 
 import (
+	"archive/tar"
 	"fmt"
 	"github.com/kovidgoyal/kitty/tools/utils"
+	"github.com/kovidgoyal/kitty/tools/utils/paths"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -156,4 +160,116 @@ func TestSSHConfigParsing(t *testing.T) {
 		}
 	}
 
+}
+
+func TestSSHCopyArcnames(t *testing.T) {
+	for _, tc := range []struct {
+		name, loc, dest, home, expected string
+	}{
+		{"home", "/home/alice", "", "/home/alice", "home/."},
+		{"inside home", "/home/alice/.config/app", "", "/home/alice", "home/.config/app"},
+		{"sibling directory", "/home/alice-backup/config", "", "/home/alice", "root/home/alice-backup/config"},
+		{"sibling user", "/home/alice2/config", "", "/home/alice", "root/home/alice2/config"},
+		{"outside home", "/etc/config", "", "/home/alice", "root/etc/config"},
+		{"cleaned path", "/home/alice/../alice-backup/config", "", "/home/alice", "root/home/alice-backup/config"},
+		{"trailing slash", "/home/alice/.config/app", "", "/home/alice/", "home/.config/app"},
+		{"root home", "/etc/config", "", "/", "home/etc/config"},
+		{"relative destination", "/home/alice-backup/config", "config", "/home/alice", "home/config"},
+		{"absolute destination", "/home/alice/config", "/etc/config", "/home/alice", "root/etc/config"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if actual := get_arcname(tc.loc, tc.dest, tc.home); actual != tc.expected {
+				t.Fatalf("Incorrect arcname: %q != %q", actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestSSHCopySymlinkedHome(t *testing.T) {
+	tdir := t.TempDir()
+	real_home := filepath.Join(tdir, "usr", "home", "alice")
+	if err := os.MkdirAll(real_home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tdir, "usr", "home"), filepath.Join(tdir, "home")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real_home, "config"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(tdir, "home", "alice")
+	orig_paths_ctx := paths_ctx
+	defer func() { paths_ctx = orig_paths_ctx }()
+	paths_ctx = &paths.Ctx{}
+	paths_ctx.SetHome(home)
+	for _, strategy := range []string{"preserve", "keep-path", "resolve"} {
+		t.Run(strategy, func(t *testing.T) {
+			ci, err := ParseCopyInstruction("--symlink-strategy=" + strategy + " " + filepath.Join(home, "config"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ci[0].arcname != "home/config" {
+				t.Fatalf("Incorrect arcname: %q != %q", ci[0].arcname, "home/config")
+			}
+		})
+	}
+}
+
+func TestSSHCopyDirectoryMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tree")
+	dirs := []struct {
+		name string
+		mode os.FileMode
+	}{
+		{"", 0o755},
+		{"private", 0o700},
+		{"private/nested", 0o750},
+		{"other", 0o711},
+	}
+	for _, d := range dirs {
+		name := filepath.Join(root, d.name)
+		if err := os.MkdirAll(name, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(name, d.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// symlinks to directories must be copied as symlinks
+	if err := os.Symlink("private", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	for i, d := range dirs {
+		stamp := time.Unix(1600000000+int64(i)*60, 0)
+		if err := os.Chtimes(filepath.Join(root, d.name), stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	headers := make(map[string]tar.Header)
+	ci := CopyInstruction{local_path: root, arcname: "home/tree"}
+	if err := ci.get_file_data(func(h *tar.Header, data []byte) error {
+		headers[strings.TrimSuffix(h.Name, "/")] = *h
+		return nil
+	}, make(map[file_unique_id]string)); err != nil {
+		t.Fatal(err)
+	}
+	for i, d := range dirs {
+		name := filepath.ToSlash(filepath.Join("home/tree", d.name))
+		h, found := headers[name]
+		if !found {
+			t.Fatalf("Missing directory: %s", name)
+		}
+		if h.Typeflag != tar.TypeDir {
+			t.Errorf("%s: not a directory", name)
+		}
+		if h.Mode != int64(d.mode) {
+			t.Errorf("%s: permissions %04o != %04o", name, h.Mode, d.mode)
+		}
+		if expected := time.Unix(1600000000+int64(i)*60, 0); !h.ModTime.Equal(expected) {
+			t.Errorf("%s: modification time %s != %s", name, h.ModTime, expected)
+		}
+	}
+	if h := headers["home/tree/link"]; h.Typeflag != tar.TypeSymlink || h.Linkname != "private" {
+		t.Errorf("Symlink to directory not copied as symlink: %#v", h)
+	}
 }

@@ -269,6 +269,9 @@ load_glfw(const char* path) {
     *(void **) (&glfwGetCurrentSystemColorTheme_impl) = dlsym(handle, "glfwGetCurrentSystemColorTheme");
     if (glfwGetCurrentSystemColorTheme_impl == NULL) fail("Failed to load glfw function glfwGetCurrentSystemColorTheme with error: %s", dlerror());
 
+    *(void **) (&glfwGetTitlebarFont_impl) = dlsym(handle, "glfwGetTitlebarFont");
+    if (glfwGetTitlebarFont_impl == NULL) fail("Failed to load glfw function glfwGetTitlebarFont with error: %s", dlerror());
+
     *(void **) (&glfwSetWindowRefreshCallback_impl) = dlsym(handle, "glfwSetWindowRefreshCallback");
     if (glfwSetWindowRefreshCallback_impl == NULL) fail("Failed to load glfw function glfwSetWindowRefreshCallback with error: %s", dlerror());
 
@@ -577,6 +580,9 @@ load_glfw(const char* path) {
 
     *(void **) (&glfwDBusSetUserNotificationHandler_impl) = dlsym(handle, "glfwDBusSetUserNotificationHandler");
     if (glfwDBusSetUserNotificationHandler_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwDBusMonitorSessionState_impl) = dlsym(handle, "glfwDBusMonitorSessionState");
+    if (glfwDBusMonitorSessionState_impl == NULL) dlerror(); // clear error indicator
 
     *(void **) (&glfwSetX11LaunchCommand_impl) = dlsym(handle, "glfwSetX11LaunchCommand");
     if (glfwSetX11LaunchCommand_impl == NULL) dlerror(); // clear error indicator

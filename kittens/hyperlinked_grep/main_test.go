@@ -4,10 +4,10 @@ package hyperlinked_grep
 
 import (
 	"fmt"
-	"github.com/kovidgoyal/kitty/tools/utils/shlex"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/kovidgoyal/kitty/tools/utils/shlex"
 )
 
 var _ = fmt.Print
@@ -88,6 +88,17 @@ func TestRgArgParsing(t *testing.T) {
 	check_args("--max-depth=10 --kitten hyperlink=none abcd", "--max-depth=10 abcd")
 	check_args("-m 10 abcd", "--max-count 10 abcd")
 	check_args("-nm 10 abcd", "-n --max-count 10 abcd")
-	check_args("-mn 10 abcd", "-n --max-count 10 abcd")
-
+	check_args("-mn 10 abcd", "--max-count n 10 abcd")
+	check_args("-efoo a", "--regexp foo a")
+	check_args("-nefoo a", "-n --regexp foo a")
+	check_args("-e-f a", "--regexp -f a")
+	check_args("-eπ a", "--regexp π a")
+	check_args("-e=foo a", "--regexp foo a")
+	check_args("-e==foo a", "--regexp =foo a")
+	check_args("-e= a", "--regexp '' a")
+	check_args("'-g*.txt' foo .", "--glob '*.txt' foo .")
+	check_args("foo - a", "foo - a")
+	check_args("-e - a", "--regexp - a")
+	check_args("'-n?' foo", "'-n?' foo")
+	check_args("foo -- -n -", "foo -- -n -")
 }

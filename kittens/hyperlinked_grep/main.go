@@ -232,14 +232,23 @@ func parse_args(args ...string) (delegate_to_rg bool, sanitized_args []string, k
 						sanitized_args = append(sanitized_args, x)
 					}
 				}
-			} else if strings.HasPrefix(x, "-") {
+			} else if x != "-" && strings.HasPrefix(x, "-") {
+				// rg semantics: everything after the first short option that
+				// takes a value is that value, with an optional leading = stripped
 				ok := true
-				chars := make([]string, len(x)-1)
-				for i, ch := range x[1:] {
-					chars[i] = string(ch)
-					_, ok = alias_map[string(ch)]
-					if !ok {
+				chars := make([]string, 0, len(x)-1)
+				option_arg, has_option_arg := "", false
+				for j, ch := range x[1:] {
+					chars = append(chars, string(ch))
+					var target string
+					if target, ok = alias_map[string(ch)]; !ok {
 						sanitized_args = append(sanitized_args, x)
+						break
+					}
+					if options_that_expect_args[target] {
+						if rest := x[j+2:]; rest != "" {
+							option_arg, has_option_arg = strings.TrimPrefix(rest, "="), true
+						}
 						break
 					}
 				}
@@ -247,7 +256,11 @@ func parse_args(args ...string) (delegate_to_rg bool, sanitized_args []string, k
 					for _, ch := range chars {
 						target := alias_map[ch]
 						if options_that_expect_args[target] {
-							expecting_option_arg = target
+							if !has_option_arg {
+								expecting_option_arg = target
+							} else if err = handle_option_arg(target, option_arg, false); err != nil {
+								return
+							}
 						} else {
 							handle_bool_option(target)
 							sanitized_args = append(sanitized_args, "-"+ch)

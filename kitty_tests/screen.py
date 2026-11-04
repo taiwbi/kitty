@@ -13,6 +13,58 @@ from .base import BaseTest, draw_multicell, parse_bytes
 
 
 class TestScreen(BaseTest):
+    def test_wide_character_after_scaled_text_collision(self) -> None:
+        for lines in (2, 4):
+            with self.subTest(lines=lines):
+                s = self.create_screen(cols=4, lines=lines)
+                s.cursor_position(1, 2)
+                draw_multicell(s, 'X', scale=2)
+                lower_row = str(s.line(1))
+                s.cursor_position(2, 1)
+                s.draw('界')
+                row = min(2, lines - 1)
+                self.ae((s.cursor.x, s.cursor.y), (2, row))
+                self.ae(str(s.line(row)), '界')
+                if lines == 4:
+                    self.ae(str(s.line(1)), lower_row)
+        # grapheme clusters must not be split by the cursor move
+        for text in ('\U0001f1fa\U0001f1f8', '\U0001f468‍\U0001f469'):
+            with self.subTest(text=text):
+                s = self.create_screen(cols=4, lines=4)
+                s.cursor_position(1, 2)
+                draw_multicell(s, 'X', scale=2)
+                s.cursor_position(2, 1)
+                s.draw(text)
+                self.ae((s.cursor.x, s.cursor.y), (2, 2))
+                self.ae(s.cpu_cells(2, 0)['text'], text)
+        s = self.create_screen(cols=4, lines=4)
+        s.cursor_position(1, 4)
+        s.draw('\U0001f468‍\U0001f469')
+        self.ae((s.cursor.x, s.cursor.y), (2, 1))
+        self.ae(s.cpu_cells(1, 0)['text'], '\U0001f468‍\U0001f469')
+
+    def test_wide_collision_at_scroll_margin(self) -> None:
+        for alternate in (False, True):
+            with self.subTest(alternate=alternate):
+                s = self.create_screen(cols=4, lines=6)
+                if alternate:
+                    s.toggle_alt_screen()
+                s.draw('top')
+                s.cursor_position(6, 1)
+                s.draw('last')
+                parse_bytes(s, b'\x1b[2;4r')
+                s.cursor_position(3, 2)
+                draw_multicell(s, 'X', scale=2)
+                s.cursor_position(4, 1)
+                s.select_graphic_rendition(31)
+                s.draw('界\u0301a')
+                self.ae((s.cursor.x, s.cursor.y), (3, 3))
+                self.ae(str(s.line(3)), '界\u0301a')
+                self.ae(str(s.line(0)), 'top')
+                self.ae(str(s.line(5)), 'last')
+                for x in (0, 1, 2):
+                    self.ae(s.line(3).cursor_from(x).fg, (1 << 8) | 1)
+
     def test_draw_fast(self):
         s = self.create_screen()
 
@@ -334,6 +386,20 @@ class TestScreen(BaseTest):
         s.scroll_to_absolute(float('inf'))
         self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (s.historybuf.count, 0))
 
+        # Pausing rendering must not change the pixel scrolled geometry,
+        # otherwise programs using synchronized output cause jitter when the
+        # user is pixel scrolled into the scrollback, see #10794
+        s.scroll_to_absolute(2.5)
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (2, 10))
+        s.start_selection(0, 0)
+        s.update_selection(2, 1)
+        before = s.current_selections()
+        self.ae(len(before), (s.lines + 1) * s.columns)
+        self.assertTrue(s.pause_rendering(True, 5000))
+        self.ae(s.current_selections(), before)
+        self.assertTrue(s.pause_rendering(False))
+        self.ae(s.current_selections(), before)
+
     def test_emoji_skin_tone_modifiers(self):
         s = self.create_screen()
         q = chr(0x1F469) + chr(0x1F3FD)
@@ -646,6 +712,35 @@ class TestScreen(BaseTest):
         c.clear()
         parse_bytes(s, b'\x1b[?2033l\x1b[?2033$p')  # ]]
         self.ae(c.wtcbuf, b'\x1b[?2033;2$y')  # ]
+
+    def test_cursor_position_report_origin_mode(self):
+        s = self.create_screen(cols=10, lines=10)
+
+        def report(private=''):
+            s.callbacks.clear()
+            parse_bytes(s, f'\x1b[{private}6n'.encode())  # ]
+            return s.callbacks.wtcbuf.decode()
+
+        for top in (1, 3):
+            for origin in (False, True):
+                parse_bytes(s, f'\x1b[{top};8r\x1b[?6{"h" if origin else "l"}'.encode())  # ]]
+                for row in (1, 4):
+                    parse_bytes(s, f'\x1b[{row};5H'.encode())  # ]
+                    for private in ('', '?'):
+                        with self.subTest(top=top, origin=origin, row=row, private=private):
+                            self.ae(report(private), f'\x1b[{private}{row};5R')  # ]
+        # cursor addressing is clamped to the bottom margin in origin mode
+        parse_bytes(s, b'\x1b[3;8r\x1b[?6h\x1b[99;5H')  # ]]]
+        self.ae(report(), '\x1b[6;5R')  # ]
+        # pending wrap at the bottom margin stays on the same row
+        parse_bytes(s, b'\x1b[6;10Hx')  # ]
+        self.ae(report(), '\x1b[6;10R')  # ]
+        # pending wrap inside the region moves to the start of the next row
+        parse_bytes(s, b'\x1b[2;10Hx')  # ]
+        self.ae(report(), '\x1b[3;1R')  # ]
+        # pending wrap at the bottom of the screen outside the region
+        parse_bytes(s, b'\x1b[?6l\x1b[10;10Hx')  # ]]
+        self.ae(report(), '\x1b[10;10R')  # ]
 
     def test_da1(self):
         s = self.create_screen()
@@ -1141,13 +1236,46 @@ class TestScreen(BaseTest):
         s.start_selection(0, 0)
         s.update_selection(2, 1)
         self.assertTrue(s.has_selection())
+        before = s.current_selections()
         self.assertTrue(s.pause_rendering(True, 5000))
-        # Must not crash and must return the visible-area buffer.
+        # Must not crash and must return the same render buffer as before pausing
         result = s.current_selections()
-        self.ae(len(result), s.lines * s.columns)
+        self.ae(result, before)
         # The visible portion of the selection must have at least one byte
         # marked (set_mask = 1 for plain selections).
         self.assertIn(1, result)
+
+    def test_selection_not_dirty_after_render(self):
+        # Regression test for https://github.com/kovidgoyal/kitty/issues/10714
+        # selections were considered dirty on every frame when scrolled back,
+        # causing continuous re-rendering
+        s = self.create_screen(cols=10, lines=3, scrollback=50)
+        for i in range(40):
+            s.draw(f'row{i:03d}')
+            s.carriage_return()
+            s.linefeed()
+
+        def check(msg):
+            s.current_selections()
+            self.assertFalse(s.is_selection_dirty(), msg)
+
+        s.start_selection(0, 0)
+        s.update_selection(2, 1)
+        check('not scrolled')
+        for amt in (1, 2, 5, 20):
+            s.scroll(amt, True)
+            self.assertTrue(s.is_selection_dirty())
+            check(f'scrolled by {s.scrolled_by}')
+        s.clear_selection()
+        s.start_selection(0, 0)
+        s.update_selection(2, 1)
+        check('selection in scrollback')
+        s.scroll(20, False)
+        self.assertTrue(s.is_selection_dirty())
+        check('selection above visible area')
+        s.update_selection(3, 1)
+        self.assertTrue(s.is_selection_dirty())
+        check('updated selection above visible area')
 
     def test_soft_hyphen(self):
         s = self.create_screen()
@@ -2307,6 +2435,113 @@ class TestScreen(BaseTest):
             for i, row in enumerate(rows):
                 self.assertEqual('continued' in row, which_screen == 0 and i == 1, row)
 
+    def test_live_mark_colors(self):
+        from kitty.fast_data_types import COLOR_LAYER_GLOBAL, MARK_MASK, patch_color_profiles
+
+        opts = self.set_options({'palette_generate': 'fixed'})
+        profiles = tuple(ColorProfile(opts) for _ in range(3))
+        marks = range(1, MARK_MASK + 1)
+        channels = ('foreground', 'background')
+
+        def configured():
+            return [[int(getattr(opts, f'mark{m}_{ch}')) for ch in channels] for m in marks]
+
+        def ae(cp, expected):
+            self.ae([list(pair) for pair in cp.test_mark_colors()], expected)
+
+        for cp in profiles:
+            ae(cp, configured())
+        # Patch all marks in the first two profiles, the third must be unaffected
+        for base in (0x123400, 0x567800):
+            spec = {f'mark{m}_{ch}': base + 2 * m + j for m in marks for j, ch in enumerate(channels)}
+            patch_color_profiles(spec, None, profiles[:2], COLOR_LAYER_GLOBAL)
+            expected = [[spec[f'mark{m}_{ch}'] for ch in channels] for m in marks]
+            for cp in profiles[:2]:
+                ae(cp, expected)
+            ae(profiles[2], configured())
+        # Patching a single channel of a single mark must not affect the others
+        for i, m in enumerate(marks):
+            for j, ch in enumerate(channels):
+                expected[i][j] = 0xABCD00 + 2 * i + j
+                patch_color_profiles({f'mark{m}_{ch}': expected[i][j]}, None, profiles[:1], COLOR_LAYER_GLOBAL)
+                ae(profiles[0], expected)
+        for reset in (False, True):
+            profiles[0].reload_from_opts(opts, reset_overriden_colors=reset)
+            ae(profiles[0], configured())
+
+    def test_mark_color_layers(self):
+        from kitty.fast_data_types import COLOR_LAYER_GLOBAL, COLOR_LAYER_OVERRIDE, COLOR_LAYER_SESSION, COLOR_LAYER_WINDOW, patch_color_profiles
+
+        opts = self.set_options({'palette_generate': 'fixed'})
+        s = self.create_screen()
+        cp = s.color_profile
+        cp.reload_from_opts(opts)
+        configured = cp.test_mark_colors()
+
+        def theme(bg, layer=COLOR_LAYER_GLOBAL, clear=False, profile=cp):
+            patch_color_profiles({'mark1_background': bg}, None, (profile,), layer, clear)
+
+        def check(bg, profile=cp):
+            # only the background of mark1 is ever changed
+            self.ae(profile.test_mark_colors(), ((configured[0][0], bg),) + configured[1:])
+
+        theme(1)
+        check(1)
+        self.assertNotIn('mark1_background', cp.as_dict())
+        # colors set by the program survive changes to the configured colors
+        theme(2, COLOR_LAYER_OVERRIDE)
+        theme(3)
+        check(2)
+        # and are restored by popping the color stack and removed by a full reset
+        parse_bytes(s, b'\x1b[#P')
+        theme(4, COLOR_LAYER_OVERRIDE)
+        check(4)
+        parse_bytes(s, b'\x1b[#Q')
+        check(2)
+        parse_bytes(s, b'\x1bc')
+        check(3)
+        # window layer colors survive changes to the global layer and full reset
+        theme(5, COLOR_LAYER_WINDOW)
+        theme(6)
+        check(5)
+        self.ae(cp.as_dict()['mark1_background'], 5)
+        self.assertNotIn('mark1_foreground', cp.as_dict())
+        theme(7, COLOR_LAYER_OVERRIDE)
+        parse_bytes(s, b'\x1bc')
+        check(5)
+        # session layer colors are above the window layer
+        theme(8, COLOR_LAYER_SESSION)
+        check(8)
+        cp.reset_layer(COLOR_LAYER_SESSION)
+        check(5)
+        # reloading from opts keeps the window layer, and program colors unless reset
+        theme(9, COLOR_LAYER_OVERRIDE)
+        cp.reload_from_opts(opts, reset_overriden_colors=False)
+        check(9)
+        cp.reload_from_opts(opts)
+        check(5)
+        # copying colors copies all layers
+        theme(10, COLOR_LAYER_OVERRIDE)
+        s2 = self.create_screen()
+        s2.copy_colors_from(s)
+        check(10, s2.color_profile)
+        parse_bytes(s2, b'\x1bc')
+        check(5, s2.color_profile)
+        parse_bytes(s, b'\x1bc')
+        cp.reset_layer(COLOR_LAYER_WINDOW)
+        check(configured[0][1])
+        # changing the global layer and clearing upper layers replaces colors
+        # from all layers above it, like set-colors --configured
+        theme(11, COLOR_LAYER_WINDOW)
+        theme(12, COLOR_LAYER_SESSION)
+        theme(13, COLOR_LAYER_OVERRIDE)
+        theme(14, clear=True)
+        check(14)
+        cp.reset_layer(COLOR_LAYER_SESSION)
+        cp.reset_layer(COLOR_LAYER_WINDOW)
+        check(14)
+        self.assertNotIn('mark1_background', cp.as_dict())
+
     def test_color_profile(self):
         from kitty.fast_data_types import patch_color_profiles
 
@@ -2364,7 +2599,247 @@ class TestScreen(BaseTest):
         patch_color_profiles({'background': Color(255, 255, 255), 'foreground': Color(0, 0, 0)}, (), (s.color_profile,), True)
         self.assertTrue(s.color_profile.palette_color_is_generated(213))
         self.assertFalse(s.color_profile.palette_color_is_generated(114))
-        q({'213': '?'}, {'213': Color(216, 125, 215)})
+        # the generated colors are re-generated from the new configured colors
+        opts.background, opts.foreground = Color(255, 255, 255), Color(0, 0, 0)
+        q({'213': '?'}, {'213': ColorProfile(opts).as_color(213 << 8 | 1)})
+
+    def test_color_layers(self):
+        from kitty.fast_data_types import COLOR_LAYER_GLOBAL, COLOR_LAYER_OVERRIDE, COLOR_LAYER_WINDOW, patch_color_profiles
+
+        opts = self.set_options({'palette_generate': 'fixed'})
+        s = self.create_screen()
+        cp = s.color_profile
+        cp.reload_from_opts(opts)
+        red, green, blue, white, black = Color(255, 0, 0), Color(0, 255, 0), Color(0, 0, 255), Color(255, 255, 255), Color(0, 0, 0)
+        dark = {'background': int(black), 'foreground': int(white), 'color1': int(Color(1, 1, 1)), 'color2': int(Color(2, 2, 2))}
+        light = {'background': int(white), 'foreground': int(black), 'color1': int(Color(11, 11, 11)), 'color2': int(Color(12, 12, 12))}
+
+        def pal(i):
+            return cp.as_color(i << 8 | 1)
+
+        def osc21(**kw):
+            parse_bytes(s, b'\x1b]21;' + ';'.join(f'{k}={v}' for k, v in kw.items()).encode() + b'\a')
+
+        def theme(spec, layer=COLOR_LAYER_GLOBAL, clear=False, tbc=None):
+            patch_color_profiles(spec, tbc, (cp,), layer, clear)
+
+        def check(bg, fg, c1, c2):
+            self.ae((cp.default_bg, cp.default_fg, pal(1), pal(2)), (bg, fg, c1, c2))
+
+        theme(dark)
+        check(black, white, Color(1, 1, 1), Color(2, 2, 2))
+        # colors set by the program survive changes to the configured colors
+        osc21(background='#ff0000', **{'1': '#00ff00'})
+        theme(light)
+        check(red, black, green, Color(12, 12, 12))
+        # and are reset to the new configured colors
+        parse_bytes(s, b'\x1b]21;background;1\a')
+        check(white, black, Color(11, 11, 11), Color(12, 12, 12))
+
+        # the color stack restores the current configured colors for colors
+        # not set by the program
+        theme(dark)
+        osc21(**{'2': '#0000ff'})
+        parse_bytes(s, b'\x1b[#P')
+        osc21(background='#ff0000', foreground='#00ff00', **{'1': '#ff0000', '2': '#00ff00'})
+        theme(light)
+        check(red, green, red, green)
+        parse_bytes(s, b'\x1b[#Q')
+        check(white, black, Color(11, 11, 11), blue)
+        cp.reset_color(2)
+        check(white, black, Color(11, 11, 11), Color(12, 12, 12))
+
+        # window layer colors survive changes to the global layer and are reset to
+        theme({'background': int(blue), 'color2': int(red)}, COLOR_LAYER_WINDOW)
+        check(blue, black, Color(11, 11, 11), red)
+        self.ae(cp.as_dict()['background'], int(blue))
+        self.assertNotIn('foreground', cp.as_dict())
+        theme(dark)
+        check(blue, white, Color(1, 1, 1), red)
+        osc21(background='#00ff00', **{'2': '#00ff00'})
+        check(green, white, Color(1, 1, 1), green)
+        parse_bytes(s, b'\x1b]21;background;2\a')
+        check(blue, white, Color(1, 1, 1), red)
+        osc21(background='#00ff00', **{'2': '#00ff00'})
+        parse_bytes(s, b'\x1bc')  # full reset
+        check(blue, white, Color(1, 1, 1), red)
+        # window layer survives reloading the global layer from opts
+        osc21(background='#00ff00')
+        cp.reload_from_opts(opts)
+        check(blue, opts.foreground, opts.color1, red)
+        theme(dark)
+        # copying colors copies all layers
+        s2 = self.create_screen()
+        s2.copy_colors_from(s)
+        theme(light)
+        patch_color_profiles(light, None, (s2.color_profile,), COLOR_LAYER_GLOBAL)
+        self.ae((s2.color_profile.default_bg, s2.color_profile.default_fg, s2.color_profile.as_color(2 << 8 | 1)), (blue, black, red))
+
+        # changing the global layer and clearing upper layers replaces colors
+        # from the window layer and the program, like set-colors --configured
+        osc21(foreground='#ff0000', **{'1': '#ff0000'})
+        check(blue, red, red, red)
+        theme({'foreground': int(green), 'color1': int(green)}, clear=True)
+        check(blue, green, green, red)
+        theme({'background': int(white), 'color2': int(white)}, clear=True)
+        check(white, green, green, white)
+        self.assertNotIn('background', cp.as_dict())
+        # the override layer is like set-colors without --configured
+        theme({'background': int(red), 'color2': int(red)}, COLOR_LAYER_OVERRIDE)
+        theme(dark)
+        check(red, white, Color(1, 1, 1), red)
+
+        # transparent background colors
+        theme(dark, tbc=((Color(1, 2, 3), 0.5),))
+        self.ae(cp.get_transparent_background_color(0), Color(1, 2, 3, 127))
+        osc21(transparent_background_color1='#ff0000@0.5')
+        theme(light, tbc=((Color(3, 2, 1), 0.5),))
+        self.ae(cp.get_transparent_background_color(0), Color(255, 0, 0, 127))
+        theme({}, COLOR_LAYER_WINDOW, tbc=((Color(4, 4, 4), 1.0),))
+        parse_bytes(s, b'\x1b]21;transparent_background_color1\a')
+        self.ae(cp.get_transparent_background_color(0), Color(4, 4, 4, 255))
+        theme(dark, tbc=((Color(1, 2, 3), 0.5),))
+        self.ae(cp.get_transparent_background_color(0), Color(4, 4, 4, 255))
+        theme({}, tbc=((Color(1, 2, 3), 0.5),), clear=True)
+        self.ae(cp.get_transparent_background_color(0), Color(1, 2, 3, 127))
+
+        # generated palette colors
+        opts = self.set_options({'palette_generate': 'semantic'})
+        cp.reload_from_opts(opts)
+        theme(dark)
+
+        def generated(spec, idx=213):
+            o = self.set_options({'palette_generate': 'semantic', **{k: Color(v >> 16, (v >> 8) & 0xFF, v & 0xFF) for k, v in spec.items()}})
+            return ColorProfile(o).as_color(idx << 8 | 1)
+
+        self.assertTrue(cp.palette_color_is_generated(213))
+        self.ae(pal(213), generated(dark))
+        osc21(**{'100': '#ff0000'})
+        theme(light)
+        self.ae(pal(213), generated(light))
+        self.ae(pal(100), red)
+        self.assertTrue(cp.palette_color_is_generated(213))
+        # generated from the window layer colors
+        theme({'background': int(blue)}, COLOR_LAYER_WINDOW)
+        self.ae(pal(213), generated({**light, 'background': int(blue)}))
+
+    def test_session_color_schemes(self):
+        from kitty.colors import SessionColorSchemes, parse_color_scheme_variants
+        from kitty.fast_data_types import COLOR_LAYER_GLOBAL, COLOR_LAYER_SESSION, COLOR_LAYER_WINDOW, patch_color_profiles
+
+        opts = self.set_options({'palette_generate': 'fixed'})
+        s = self.create_screen()
+        cp = s.color_profile
+        cp.reload_from_opts(opts)
+        red, green, blue, white, black = Color(255, 0, 0), Color(0, 255, 0), Color(0, 0, 255), Color(255, 255, 255), Color(0, 0, 0)
+        patch_color_profiles({'background': int(black), 'foreground': int(white), 'color1': 1}, None, (cp,), COLOR_LAYER_GLOBAL)
+
+        # validation of untrusted data
+        for bad in (
+            [],
+            {'dusk': {}},
+            {'dark': []},
+            {'dark': {'background_image': 1}},
+            {'dark': {'url_color': 1}},
+            {'dark': {'background': None}},
+            {'dark': {'color1': None}},
+            {'dark': {'color1': -1}},
+            {'dark': {'color1': 0x1000000}},
+            {'dark': {'color1': True}},
+            {'dark': {'color1': '#ff0000'}},
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                parse_color_scheme_variants(bad)
+        variants = parse_color_scheme_variants(
+            {
+                'dark': {'background': int(blue), 'color1': int(red), 'color16': None, 'cursor': None},
+                'light': {'background': int(white), 'foreground': int(black), 'color1': int(green)},
+            }
+        )
+
+        def pal(i):
+            return cp.as_color(i << 8 | 1)
+
+        def check(bg, fg, c1):
+            self.ae((cp.default_bg, cp.default_fg, pal(1)), (bg, fg, c1))
+
+        scs = SessionColorSchemes()
+        self.assertFalse(scs)
+        parse_bytes(s, b'\x1b[#P')  # the ssh kitten pushes colors first
+        scs.add(cp.color_stack_depth(), variants)
+        scs.apply(cp, 'dark')
+        check(blue, white, red)
+        self.assertIsNone(cp.cursor_color)
+        self.assertTrue(cp.palette_color_is_generated(16))
+        self.ae(cp.as_dict()['background'], int(blue))
+        scs.apply(cp, 'light')
+        check(white, black, green)
+        # no variant for the system color scheme uses the configured colors
+        scs.apply(cp, 'no_preference')
+        check(black, white, Color(0, 0, 1))
+        self.assertNotIn('background', cp.as_dict())
+
+        # the session layer is above the window layer, below program colors and
+        # is not affected by changes to the global layer
+        scs.apply(cp, 'dark')
+        patch_color_profiles({'background': int(green), 'foreground': int(green)}, None, (cp,), COLOR_LAYER_WINDOW)
+        check(blue, green, red)
+        parse_bytes(s, b'\x1b]21;background=#ffffff\a')
+        self.ae(cp.default_bg, white)
+        parse_bytes(s, b'\x1b]21;background\a')  # resets to the session color
+        self.ae(cp.default_bg, blue)
+        patch_color_profiles({'background': int(white), 'color1': int(white)}, None, (cp,), COLOR_LAYER_GLOBAL)
+        check(blue, green, red)
+
+        # a nested session, such as ssh from the remote host, replaces the colors
+        # till it ends
+        parse_bytes(s, b'\x1b[#P')
+        scs.add(cp.color_stack_depth(), parse_color_scheme_variants({'dark': {'background': int(red)}}))
+        scs.apply(cp, 'dark')
+        check(red, green, Color(255, 255, 255))
+        # programs pushing and popping colors in the session do not end it
+        parse_bytes(s, b'\x1b[#P\x1b]21;background=#00ff00\a')
+        self.ae(cp.default_bg, green)
+        parse_bytes(s, b'\x1b[#Q')
+        self.assertFalse(scs.color_stack_popped(cp.color_stack_depth()))
+        self.ae(cp.default_bg, red)
+        parse_bytes(s, b'\x1b[#Q')
+        self.assertTrue(scs.color_stack_popped(cp.color_stack_depth()))
+        scs.apply(cp, 'dark')
+        check(blue, green, red)
+        parse_bytes(s, b'\x1b[#Q')
+        self.assertTrue(scs.color_stack_popped(cp.color_stack_depth()))
+        self.assertFalse(scs)
+        scs.apply(cp, 'dark')
+        check(green, green, white)
+
+        # copying colors, as for launch --copy-colors
+        parse_bytes(s, b'\x1b[#P')
+        scs.add(cp.color_stack_depth(), variants)
+        scs.apply(cp, 'light')
+        s2 = self.create_screen()
+        s2.copy_colors_from(s)
+        scs2 = SessionColorSchemes()
+        scs2.copy_from(scs)
+        self.ae(s2.color_profile.default_bg, white)
+        self.assertFalse(scs2.color_stack_popped(s2.color_profile.color_stack_depth()))
+        scs2.apply(s2.color_profile, 'dark')
+        self.ae(s2.color_profile.default_bg, blue)
+
+        # a full reset clears the color stack and the session
+        parse_bytes(s, b'\x1bc')
+        self.ae(cp.color_stack_depth(), 0)
+        self.assertTrue(scs.clear())
+        scs.apply(cp, 'light')
+        check(green, green, white)
+        cp.reset_layer(COLOR_LAYER_WINDOW)
+        check(white, white, white)
+        with self.assertRaises(ValueError):
+            cp.reset_layer(COLOR_LAYER_GLOBAL)
+        patch_color_profiles({'background': int(red)}, None, (cp,), COLOR_LAYER_SESSION)
+        self.ae(cp.default_bg, red)
+        cp.reset_layer(COLOR_LAYER_SESSION)
+        self.ae(cp.default_bg, white)
 
     def test_multi_cursors(self):
         s = self.create_screen()

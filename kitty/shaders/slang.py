@@ -20,9 +20,9 @@ from enum import StrEnum, auto
 from functools import lru_cache, partial
 from itertools import chain, product
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Iterator, Literal, NamedTuple, TypedDict, TypeGuard
+from typing import Any, Callable, Iterable, Iterator, Literal, NamedTuple, Sequence, TypedDict, TypeGuard
 
-from kitty.constants import read_kitty_resource, shaders_dir, slangc
+from kitty.constants import config_dir, read_kitty_resource, shaders_dir, slangc
 from kitty.fast_data_types import (
     ANIMATION_SAMPLE_WAIT,
     BGIMAGE_PROGRAM,
@@ -42,11 +42,16 @@ from kitty.fast_data_types import (
     DIM,
     GLSL_VERSION,
     GRAPHICS_ALPHA_MASK_PROGRAM,
+    GRAPHICS_INDEXED_PROGRAM,
+    GRAPHICS_INDEXED_UNSCALED_PROGRAM,
     GRAPHICS_PREMULT_PROGRAM,
     GRAPHICS_PROGRAM,
     MARK,
     MARK_MASK,
     MAX_CUSTOM_SHADER_GROUPS,
+    MAX_SHADER_ANIM_USER_EVENT_NAME_LEN,
+    MAX_SHADER_ANIM_USER_EVENTS,
+    NUM_INDEXED_IMAGE_SPECIAL_COLORS,
     PADDING_PROGRAM,
     POINTER_MAP_SIZE,
     REVERSE,
@@ -59,9 +64,9 @@ from kitty.fast_data_types import (
     get_options,
 )
 from kitty.options.types import Options, defaults
-from kitty.options.utils import EasingFunction
+from kitty.options.utils import USER_ANIMATION_EVENT_PREFIX, EasingFunction, is_valid_user_animation_event_name
 from kitty.types import run_once
-from kitty.utils import lock_with_file, log_error, resolve_custom_file
+from kitty.utils import expandvars, lock_with_file, log_error
 
 
 @lru_cache(maxsize=64)
@@ -274,6 +279,9 @@ class LoadShaderPrograms:
         }.items():
             vert, frag = glsl_shaders('graphics', vname)
             compile_program(prog, (vert,), (frag,), metadata['graphics'], allow_recompile)
+        for prog, vname in {GRAPHICS_INDEXED_PROGRAM: '', GRAPHICS_INDEXED_UNSCALED_PROGRAM: 'unscaled'}.items():
+            vert, frag = glsl_shaders('indexed_graphics', vname)
+            compile_program(prog, (vert,), (frag,), metadata['indexed_graphics'], allow_recompile)
         for name, prog in {
             'bgimage': BGIMAGE_PROGRAM,
             'tint': TINT_PROGRAM,
@@ -306,9 +314,14 @@ class LoadShaderPrograms:
         for k in self.custom_shaders:
             try:
                 d = parse_pipeline(k)
-            except FileNotFoundError:
+            except FileNotFoundError as pe:
                 try:
                     custom_shader(k)
+                except CustomFileNotFound as e:
+                    # Report the pipeline locations searched as well, not just the shader ones
+                    tried = (pe.tried if isinstance(pe, CustomFileNotFound) else ()) + e.tried
+                    err(f'Failed to find custom shader or pipeline {k} with error: {CustomFileNotFound(k, tried)}')
+                    continue
                 except Exception as e:
                     err(f'Failed to read custom shader pipeline definition from {k} with error: {e}')
                     continue
@@ -732,6 +745,7 @@ class SlangFile(NamedTuple):
         match os.path.basename(self.path):
             case 'background.slang' | 'cell.slang':
                 ans['MARK_MASK'] = str(MARK_MASK)
+                ans['NUM_INDEXED_IMAGE_SPECIAL_COLORS'] = str(NUM_INDEXED_IMAGE_SPECIAL_COLORS)
                 ans['REVERSE_SHIFT'] = str(REVERSE)
                 ans['STRIKE_SHIFT'] = str(STRIKETHROUGH)
                 ans['DIM_SHIFT'] = str(DIM)
@@ -755,6 +769,9 @@ class SlangFile(NamedTuple):
                 yield s()
                 yield s('alpha_mask', is_alpha_mask='true')
                 yield s('premult', texture_is_not_premultiplied='false')
+            case 'indexed_graphics.slang':
+                yield s()
+                yield s('unscaled', is_scaled='false')
             case 'cell.slang':
                 d = cell_variant()
                 seen = set()
@@ -1410,65 +1427,81 @@ def key(*items: str | bytes) -> bytes:
     return h.hexdigest().encode()
 
 
-@lru_cache(maxsize=64)
-def custom_shader(name: str = '', pipeline_dir: str = '') -> tuple[str, str, bytes, bytes]:
-    import_dir = ''
-    if not name:
-        src = get_custom_shader_src('types')
-        return name, import_dir, src, key(src)
+def _expand_custom_path(name: str) -> str:
+    opts: Options | None = None
+    with suppress(RuntimeError):
+        opts = get_options()
+    return expandvars(os.path.expanduser(name), opts.env if opts else {})
 
-    found_path = ''
-    src = b''
 
-    if pipeline_dir:
-        candidate = os.path.join(pipeline_dir, f'{name}.slang')
+def _custom_file_candidates(name: str, ext: str, search_dirs: Iterable[str]) -> Iterator[str]:
+    # Exact name first, then with the extension added, so that names that
+    # already have the extension or are absolute paths work as expected
+    name = _expand_custom_path(name)
+    names = (name,) if name.endswith(ext) else (name, name + ext)
+    if os.path.isabs(name):
+        yield from names
+        return
+    seen: set[str] = set()
+    for d in search_dirs:
+        if d:
+            d = os.path.normpath(os.path.abspath(d))
+            if d not in seen:
+                seen.add(d)
+                for n in names:
+                    yield os.path.join(d, n)
+
+
+def _read_first(candidates: Iterable[str], tried: list[str]) -> tuple[str, bytes]:
+    for candidate in candidates:
+        tried.append(candidate)
         try:
             with open(candidate, 'rb') as f:
-                src = f.read()
-            found_path = os.path.abspath(candidate)
-            import_dir = os.path.dirname(found_path)
-        except FileNotFoundError:
+                return os.path.abspath(candidate), f.read()
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
             pass
+    return '', b''
 
-    if not found_path:
-        config_path = resolve_custom_file(f'{name}.slang')
-        config_shader_dir = os.path.dirname(os.path.abspath(config_path))
-        if not pipeline_dir or os.path.normpath(os.path.abspath(pipeline_dir)) != os.path.normpath(config_shader_dir):
-            try:
-                with open(config_path, 'rb') as f:
-                    src = f.read()
-                found_path = os.path.abspath(config_path)
-                import_dir = os.path.dirname(found_path)
-            except FileNotFoundError:
-                pass
 
-    if not found_path:
-        src = get_custom_shader_src(name)
-        return name, import_dir, src, key(src)
+class CustomFileNotFound(FileNotFoundError):
+    def __init__(self, name: str, tried: Sequence[str]):
+        self.tried = tuple(tried)
+        super().__init__(f'Could not find {name!r} amongst the builtins or at any of: {", ".join(self.tried)}')
 
-    return found_path, import_dir, src, key(src)
+
+def _builtin_src(reader: Callable[[str], bytes], name: str, tried: list[str]) -> bytes:
+    try:
+        return reader(name)
+    except FileNotFoundError:
+        raise CustomFileNotFound(name, tried) from None
+
+
+@lru_cache(maxsize=64)
+def custom_shader(name: str = '', pipeline_dir: str = '') -> tuple[str, str, bytes, bytes]:
+    if not name:
+        src = get_custom_shader_src('types')
+        return name, '', src, key(src)
+
+    tried: list[str] = []
+    found_path, src = _read_first(_custom_file_candidates(name, '.slang', (pipeline_dir, os.path.join(config_dir, 'shaders'))), tried)
+    if found_path:
+        return found_path, os.path.dirname(found_path), src, key(src)
+    src = _builtin_src(get_custom_shader_src, name.removesuffix('.slang'), tried)
+    return name, '', src, key(src)
 
 
 @lru_cache(maxsize=64)
 def pipeline_definition(name: str) -> tuple[tuple[str, ...], str]:
-    name = os.path.expanduser(name)
-    if os.path.isabs(name):
-        pipeline_path = name if name.endswith('.pipeline') else name + '.pipeline'
-        with open(pipeline_path, 'rb') as f:
-            src = f.read()
-        return tuple(src.decode().splitlines()), os.path.dirname(os.path.abspath(pipeline_path))
-
-    filename = name if name.endswith('.pipeline') else f'{name}.pipeline'
-    path = resolve_custom_file(f'shaders/{filename}')
-    try:
-        with open(path, 'rb') as f:
-            src = f.read()
-        pipeline_dir = os.path.dirname(os.path.abspath(path))
-    except FileNotFoundError:
-        base_name = name[: -len('.pipeline')] if name.endswith('.pipeline') else name
-        src = get_custom_pipeline_src(base_name)
-        pipeline_dir = ''
-    return tuple(src.decode().splitlines()), pipeline_dir
+    if name.endswith('.slang'):
+        raise FileNotFoundError(f'{name} is a shader not a pipeline')
+    tried: list[str] = []
+    found_path, src = _read_first(
+        (c for c in _custom_file_candidates(name, '.pipeline', (os.path.join(config_dir, 'shaders'),)) if c.endswith('.pipeline')), tried
+    )
+    if found_path:
+        return tuple(src.decode().splitlines()), os.path.dirname(found_path)
+    src = _builtin_src(get_custom_pipeline_src, name.removesuffix('.pipeline'), tried)
+    return tuple(src.decode().splitlines()), ''
 
 
 class NamedTexture(StrEnum):
@@ -1509,6 +1542,8 @@ SHADER_ANIMATION_EVENTS: frozenset[str] = frozenset(
 
 
 def is_valid_animation_event(name: str) -> bool:
+    if name.startswith(USER_ANIMATION_EVENT_PREFIX):
+        return is_valid_user_animation_event_name(name[len(USER_ANIMATION_EVENT_PREFIX) :])
     return name in SHADER_ANIMATION_EVENTS
 
 
@@ -1516,7 +1551,15 @@ def parse_animation_events(raw: str) -> tuple[str, ...]:
     events = raw.split('|')
     for e in events:
         if not is_valid_animation_event(e):
-            raise ValueError(f'{e!r} is not a valid animation event name; valid names: {", ".join(sorted(SHADER_ANIMATION_EVENTS))}')
+            if e.startswith(USER_ANIMATION_EVENT_PREFIX):
+                raise ValueError(
+                    f'{e!r} is not a valid user event name, the part after {USER_ANIMATION_EVENT_PREFIX} must be at most'
+                    f' {MAX_SHADER_ANIM_USER_EVENT_NAME_LEN} letters, digits, underscores, hyphens or periods'
+                )
+            raise ValueError(
+                f'{e!r} is not a valid animation event name; valid names: {", ".join(sorted(SHADER_ANIMATION_EVENTS))}'
+                f' or {USER_ANIMATION_EVENT_PREFIX}<name> for events sent by the shader_event action'
+            )
     return tuple(events)
 
 
@@ -1596,10 +1639,14 @@ class Group(TypedDict):
     shaders: tuple[str, ...]
     vars: dict[str, tuple[str, str]]
     animation_start: tuple[str, ...]  # empty = no animation
+    animation_toggle: tuple[str, ...]  # events that start the animation if stopped and stop it if running
     animation_curve: EasingFunction  # parsed easing curve
     animation_step: int  # nanoseconds between animation samples
     animation_end_events: tuple[str, ...]  # events that stop the animation
     animation_end_duration: int  # nanoseconds; 0 = no time limit, negative = use cursor_stop_blinking_after
+    animation_duration: int  # nanoseconds for animation_progress to reach one; negative = same as animation_end_duration
+    animation_reverse: int  # nanoseconds to play the animation in reverse when stopped; 0 = no, negative = same as animation_duration
+    animation_loops: int  # times to play the animation forwards and in reverse, only used with animation_reverse
     attached: bool  # if True, this group is always active when the previous group is active
 
 
@@ -1611,12 +1658,18 @@ class Pipeline(TypedDict):
     pipeline_dir: str
 
 
+@run_once
+def trailing_comment_pat() -> re.Pattern[str]:
+    return re.compile(r'\s#.*')
+
+
 def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline_dir: str = '') -> Pipeline:
     slot = Slot.end
     textures: tuple[NamedTexture, ...] = ()
     groups: list[Group] = []
     current_group: Group | None = None
     pipeline_vars: dict[str, tuple[str, str]] = {}
+    has_animation_stop = False
 
     def unit_float(x: str) -> float:
         return max(0, min(float(x), 1))
@@ -1624,6 +1677,11 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
     def commit_group() -> None:
         nonlocal current_group
         if current_group is not None:
+            if current_group['animation_toggle'] and not current_group['animation_start'] and not has_animation_stop:
+                # A group turned on and off by toggling should stay on until toggled off
+                current_group['animation_end_duration'] = 0
+            if current_group['animation_loops'] > 1 and not current_group['animation_reverse']:
+                raise ValueError('animation_loops can only be used together with animation_reverse')
             groups.append(current_group)
             current_group = None
 
@@ -1636,15 +1694,20 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
             'shaders': shaders,
             'vars': {},
             'animation_start': (),
+            'animation_toggle': (),
             'animation_curve': EasingFunction(),
             'animation_step': ANIMATION_SAMPLE_WAIT,
             'animation_end_events': (),
             'animation_end_duration': -1,
+            'animation_duration': -1,
+            'animation_reverse': 0,
+            'animation_loops': 1,
             'attached': False,
         }
 
     for line in lines:
-        line = line.strip()
+        # A # at the start of the line or preceded by whitespace starts a comment
+        line = trailing_comment_pat().sub('', line).strip()
         if not line or line.startswith('#'):
             continue
         parts = line.split()
@@ -1659,6 +1722,7 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
                 case 'startgroup':
                     commit_group()
                     current_group = init_group()
+                    has_animation_stop = False
                 case 'var':
                     var_type, var_name, value = parse_var_directive(parts)
                     pipeline_vars[var_name] = (var_type, value)
@@ -1682,6 +1746,9 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
                 case 'animation_start':
                     val = ''.join(parts[1:]) if len(parts) > 1 else 'none'
                     current_group['animation_start'] = () if val == 'none' else parse_animation_events(val)
+                case 'animation_toggle':
+                    val = ''.join(parts[1:]) if len(parts) > 1 else 'none'
+                    current_group['animation_toggle'] = () if val == 'none' else parse_animation_events(val)
                 case 'animation_curve':
                     if len(parts) < 2:
                         raise ValueError('animation_curve requires a CSS curve name')
@@ -1694,6 +1761,7 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
                         raise ValueError(f'animation_step must be non-negative, not: {step_ms}')
                     current_group['animation_step'] = step_ms * 1_000_000
                 case 'animation_stop':
+                    has_animation_stop = True
                     val = ''.join(parts[1:]) if len(parts) > 1 else 'never'
                     if val == 'never':
                         current_group['animation_end_events'] = ()
@@ -1708,6 +1776,35 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
                                 end_events.extend(parse_animation_events(token))
                         current_group['animation_end_events'] = tuple(end_events)
                         current_group['animation_end_duration'] = end_duration
+                case 'animation_duration':
+                    if len(parts) < 2:
+                        raise ValueError('animation_duration requires a millisecond value')
+                    duration_ms = int(parts[1])
+                    if duration_ms < 0:
+                        raise ValueError(f'animation_duration must be non-negative, not: {duration_ms}')
+                    current_group['animation_duration'] = duration_ms * 1_000_000
+                case 'animation_reverse':
+                    val = parts[1] if len(parts) > 1 else 'yes'
+                    match val:
+                        case 'yes':
+                            current_group['animation_reverse'] = -1
+                        case 'no':
+                            current_group['animation_reverse'] = 0
+                        case _:
+                            try:
+                                reverse_ms = int(val)
+                            except ValueError:
+                                reverse_ms = -1
+                            if reverse_ms < 0:
+                                raise ValueError(f'animation_reverse must be yes, no or a non-negative number of milliseconds, not: {val}')
+                            current_group['animation_reverse'] = reverse_ms * 1_000_000
+                case 'animation_loops':
+                    if len(parts) < 2:
+                        raise ValueError('animation_loops requires a number')
+                    loops = int(parts[1])
+                    if not 1 <= loops < 2**31:
+                        raise ValueError(f'animation_loops must be a positive number, not: {loops}')
+                    current_group['animation_loops'] = loops
                 case 'attach':
                     current_group['attached'] = True
                 case 'endgroup':
@@ -1725,6 +1822,7 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
         raise ValueError('The final group cannot output to a named texture')
     if groups[-1]['viewport_pos'] != (0, 0) or groups[-1]['viewport_size'] != (1, 1):
         raise ValueError('The final group must not specify a viewport')
+    check_user_animation_events(groups, f'Pipeline {pipeline_name!r}')
 
     return {'slot': slot, 'textures': textures, 'groups': tuple(groups), 'vars': pipeline_vars, 'pipeline_dir': pipeline_dir}
 
@@ -1733,6 +1831,21 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
 def parse_pipeline(name: str) -> Pipeline:
     lines, pipeline_dir = pipeline_definition(name)
     return parse_pipeline_definition(lines, name, pipeline_dir)
+
+
+def user_animation_events(groups: Iterable[Group]) -> tuple[str, ...]:
+    "The names, without the user: prefix, of all user events used by groups, in order of first use"
+    ans: dict[str, None] = {}
+    for g in groups:
+        for e in chain(g['animation_start'], g['animation_toggle'], g['animation_end_events']):
+            if e.startswith(USER_ANIMATION_EVENT_PREFIX):
+                ans[e[len(USER_ANIMATION_EVENT_PREFIX) :]] = None
+    return tuple(ans)
+
+
+def check_user_animation_events(groups: Iterable[Group], what: str) -> None:
+    if (n := len(user_animation_events(groups))) > MAX_SHADER_ANIM_USER_EVENTS:
+        raise ValueError(f'{what} uses {n} user events but the maximum is {MAX_SHADER_ANIM_USER_EVENTS}')
 
 
 def merge_pipelines(pipelines: list[Pipeline]) -> Pipeline:
@@ -1758,6 +1871,7 @@ def merge_pipelines(pipelines: list[Pipeline]) -> Pipeline:
         raise ValueError('The final group of the last pipeline cannot output to a named texture')
     if all_groups[-1]['viewport_pos'] != (0, 0) or all_groups[-1]['viewport_size'] != (1, 1):
         raise ValueError('The final group of the last pipeline must not specify a viewport')
+    check_user_animation_events(all_groups, 'Chained pipelines')
     merged_vars: dict[str, tuple[str, str]] = {}
     for p in pipelines:
         merged_vars.update(p['vars'])
@@ -1770,22 +1884,31 @@ def merge_pipelines(pipelines: list[Pipeline]) -> Pipeline:
     }
 
 
+def group_has_own_animation(group: Group) -> bool:
+    "Whether the group is turned on and off by events of its own"
+    return bool(group['animation_start'] or group['animation_toggle'])
+
+
 def group_moves_content(group: Group) -> bool:
-    "Whether whatever the shaders in a group do to the content is visible on the whole screen at all times"
+    """Whether whatever the shaders in a group do to the content is visible on
+    the whole screen for as long as the group is active, which is either always
+    or until an event turns the group off, as opposed to a transient effect that
+    lasts for a fixed duration"""
     return (
-        not group['animation_start']
-        and not group['attached']
+        not group['attached']
         and group['output_texture'] is NamedTexture.default
         and group['viewport_pos'] == (0, 0)
         and group['viewport_size'] == (1, 1)
+        and (not group_has_own_animation(group) or group['animation_end_duration'] == 0)
     )
 
 
 def pointer_map_shaders(pipeline: Pipeline, defines_pointer_map: Callable[[int, int], bool]) -> tuple[tuple[int, int], ...]:
     """The (group, shader) indices of the shaders whose pointer_map() decides
     where pointer events land, in the order they must be applied. Only groups
-    that draw to the whole screen and are always active move content
-    permanently, so only they count. The last shader to run decides what is
+    that draw to the whole screen and are active either always or until an
+    event turns them off move content for any length of time, so only they
+    count. The last shader to run decides what is
     visible at a given position, so it is applied first. defines_pointer_map()
     is called with the (group, shader) indices of the shaders that count."""
     ans: list[tuple[int, int]] = []
@@ -1907,7 +2030,15 @@ def build_custom_shader_pipeline_ir(pipeline: Pipeline, cache_dir: str, invocati
     mod_src = mod_src.replace('// IMPORTS', '\n'.join(f'import {imp};' for imp in imports), 1)
     mod_src = mod_src.replace('// PIPELINE', pipeline_code, 1)
     pm = pointer_map_shaders(pipeline, lambda g, s: defines_pointer_map(queries[(g, s)]))
-    pointer_map_code = '\n    '.join(f'pos = {entry_point(g, s, "pointer_map")}(pos, csd);' for g, s in pm)
+
+    def pointer_map_call(g: int, s: int) -> str:
+        call = f'pos = {entry_point(g, s, "pointer_map")}(pos, csd);'
+        if group_has_own_animation(pipeline['groups'][g]):
+            # Applies only while the group is active
+            call = f'if ((active_groups & {1 << g}u) != 0u) {call}'
+        return call
+
+    pointer_map_code = '\n    '.join(pointer_map_call(g, s) for g, s in pm)
     mod_src = mod_src.replace('// POINTER_MAP', pointer_map_code, 1)
     # subprocess.run(['bat', '-P', '-l', 'cpp'], input=mod_src.encode())
 
@@ -1949,9 +2080,10 @@ float4 fmain_wrap(
     uniform int group,
     uniform float4 viewport,
     uniform float animation_progress,
-    uniform bool convert_to_srgb
+    uniform bool convert_to_srgb,
+    uniform uint active_groups
 ) : SV_Target {
-    return pipeline_fragment_main(texcoord, group, viewport, animation_progress, convert_to_srgb);
+    return pipeline_fragment_main(texcoord, group, viewport, animation_progress, convert_to_srgb, active_groups);
 }
         """.replace('MODULE', slot.replace('-', '_')).encode()
 
@@ -2022,6 +2154,7 @@ def build_custom_shader_pipeline_glsl(
             m = glsl_metadata_for_shader(metadata)
             m['pipeline'] = pipeline
             m['has_pointer_map'] = bool(pipeline_ir.pointer_map_shaders)
+            m['pointer_map_groups'] = sorted({g for g, _ in pipeline_ir.pointer_map_shaders})
             return vf.read(), ff.read(), m
 
 

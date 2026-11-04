@@ -1055,6 +1055,14 @@ class Parser:
     def hide_window_decorations(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['hide_window_decorations'] = hide_window_decorations(val)
 
+    def hyperlink_target_position(self, val: str, ans: dict[str, typing.Any]) -> None:
+        val = val.lower()
+        if val not in self.choices_for_hyperlink_target_position:
+            raise ValueError(f"The value {val} is not a valid choice for hyperlink_target_position")
+        ans["hyperlink_target_position"] = val
+
+    choices_for_hyperlink_target_position = frozenset(('top', 'bottom', 'below', 'tooltip'))
+
     def inactive_border_color(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['inactive_border_color'] = to_color(val)
 
@@ -1276,6 +1284,9 @@ class Parser:
 
     def resize_in_steps(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['resize_in_steps'] = to_bool(val)
+
+    def restore_session_after_logout(self, val: str, ans: dict[str, typing.Any]) -> None:
+        ans['restore_session_after_logout'] = to_bool(val)
 
     def scrollback_fill_enlarged_window(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['scrollback_fill_enlarged_window'] = to_bool(val)

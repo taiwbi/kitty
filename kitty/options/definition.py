@@ -17,7 +17,7 @@ definition = Definition(
         {'keyboard_modes': 'KeyboardModeMap', 'alias_map': 'AliasMap'},
         ['KeyDefinition', 'KeyMapOptions', 'kitty.fast_data_types.SingleKey'],
     ),
-    Action('mouse_map', 'parse_mouse_map', {'mousemap': 'MouseMap'}, ['MouseMapping']),
+    Action('mouse_map', 'parse_mouse_map', {'mousemap': 'MouseMap', 'url_mappings': 'URLMappings'}, ['MouseMapping']),
     has_color_table=True,
 )
 definition.add_deprecation('deprecated_hide_window_decorations_aliases', 'x11_hide_window_decorations', 'macos_hide_titlebar')
@@ -266,7 +266,8 @@ opt(
 The sizes of the lines used for the box drawing Unicode characters. These values
 are in pts. They will be scaled by the monitor DPI to arrive at a pixel value.
 There must be four values corresponding to thin, normal, thick, and very thick
-lines.
+lines. The values apply at the configured :opt:`font_size`, when the font size
+is changed, for example by zooming, the lines are scaled proportionally.
 """,
 )
 
@@ -436,9 +437,21 @@ cursor shape can be one of :code:`block`, :code:`beam`, :code:`underline`,
 """,
 )
 
-opt('cursor_beam_thickness', '1.5', option_type='positive_float', ctype='float', long_text='The thickness of the beam cursor (in pts).')
+opt(
+    'cursor_beam_thickness',
+    '1.5',
+    option_type='positive_float',
+    ctype='float',
+    long_text='The thickness of the beam cursor (in pts). Scaled proportionally when the font size is changed from :opt:`font_size`.',
+)
 
-opt('cursor_underline_thickness', '2.0', option_type='positive_float', ctype='float', long_text='The thickness of the underline cursor (in pts).')
+opt(
+    'cursor_underline_thickness',
+    '2.0',
+    option_type='positive_float',
+    ctype='float',
+    long_text='The thickness of the underline cursor (in pts). Scaled proportionally when the font size is changed from :opt:`font_size`.',
+)
 
 opt(
     'cursor_blink_interval',
@@ -1045,6 +1058,22 @@ are pressed, the URL is shown as long as the configured modifier is among them.
 
 
 opt(
+    'hyperlink_target_position',
+    'top',
+    choices=('top', 'bottom', 'below', 'tooltip'),
+    ctype='hyperlink_target_position',
+    long_text="""
+Where to display the URL shown by :opt:`show_hyperlink_targets`. :code:`top`
+and :code:`bottom` display it along that edge of the window, :code:`below`
+displays it immediately below the hovered line. :code:`tooltip` displays it
+in a small box, sized to fit the URL, just below the mouse cursor, like a web
+browser tooltip. In all cases, if the URL would cover the hovered line, it is
+displayed on the opposite side instead.
+""",
+)
+
+
+opt(
     'underline_hyperlinks',
     'hover',
     choices=('hover', 'always', 'never'),
@@ -1302,6 +1331,12 @@ grabbed by the program running in the terminal, or not. The values are
 :code:`grabbed` refers to when the program running in the terminal has requested
 mouse events. Note that the click and double click events have a delay of
 :opt:`click_interval` to disambiguate from double and triple presses.
+
+The mouse pointer changes to a hand and links are highlighted on hover only when
+the current keyboard modifiers and grabbed/ungrabbed mode match a mouse mapping
+that opens the link on a single :code:`press`, :code:`release` or :code:`click`.
+Both update when modifiers are pressed or released, even if the mouse does not
+move. Mappings that require a double or triple click do not enable hover feedback.
 
 You can run kitty with the :option:`kitty --debug-input` command line option
 to see mouse events. See the builtin actions below to get a sense of what is
@@ -2397,7 +2432,10 @@ opt(
 The maximum number of cells that can be used to render the text in a tab.
 A value of zero means that no limit is applied. For vertical tab bars, kitty
 uses a default sidebar width sized for about twenty title cells when this is
-left unset.
+left unset. When it is set, the sidebar is made just wide enough to fit titles
+of this length along with the decorations drawn by :opt:`tab_bar_style`. With
+the :code:`fade` style, use fewer values in :opt:`tab_fade` for a narrower
+sidebar.
 """,
 )
 
@@ -3204,6 +3242,26 @@ arguments specifying a command to run, this option is ignored.
 )
 
 opt(
+    'restore_session_after_logout',
+    'no',
+    option_type='to_bool',
+    long_text="""
+If enabled, when you log out, restart or shut down the computer while kitty is running,
+kitty saves its current state as a :ref:`session <sessions>`, including the size, position
+and state of every :term:`OS Window <os_window>` and the scrollback of every window. The next
+time kitty is started, it restores that session, instead of using :opt:`startup_session`.
+If several kitty instances were running, each is restored as a separate kitty instance, with the
+command line arguments and environment it originally had. Programs that were running in windows,
+other than the shell, are not started again. The saved session is used only once, and only when
+kitty is started without :option:`kitty --session` or a command to run. The saved state is deleted
+once it has been restored. On macOS, it is encrypted, with a key stored in your login keychain. Note
+that despite the encryption any process that runs as you can access the stored session data.
+On Linux, it is not encrypted and this requires a desktop portal that supports monitoring the
+session state. See :ref:`restore_after_logout` for details.
+""",
+)
+
+opt(
     'clipboard_control',
     'write-clipboard write-primary read-clipboard-ask read-primary-ask',
     option_type='clipboard_control',
@@ -3464,9 +3522,15 @@ opt(
     long_text="""
 The color of the kitty window's titlebar on Wayland systems with client
 side window decorations such as GNOME. A value of :code:`system` means to use
-the default system colors, a value of :code:`background` means to use the
+the default system colors, following the desktop light/dark preference. If the
+desktop has no preference, the titlebar follows the background color of the
+currently active kitty window. A value of :code:`background` means to always use the
 background color of the currently active kitty window and finally you can use an
 arbitrary color, such as :code:`#12af59` or :code:`red`.
+
+The titlebar font, its size, the placement of the buttons and the actions
+performed when clicking on the titlebar are read from the GNOME desktop settings,
+via the desktop portal.
 """,
 )
 
@@ -3788,7 +3852,7 @@ application wide: kitty's own keyboard shortcuts, :opt:`kitty_mod`,
 :code:`mouse_map` and the keys sent to the program running in the terminal all
 see the remapped modifier. Every mapping in :file:`kitty.conf` is therefore
 written in terms of the modifier a key *becomes*, not the one printed on the
-keycap — including the built-in shortcuts, so :code:`remap_modifiers ctrl super`
+keycap — including the built-in shortcuts, so :code:`remap_modifiers super:ctrl`
 moves every default :code:`ctrl+shift+…` binding onto the physical Super key
 unless you also change :opt:`kitty_mod`.
 
@@ -4802,7 +4866,7 @@ require a full restart of kitty. Particularly, when changing shortcuts for
 actions located on the macOS global menu bar, a full restart is needed. You can
 also map a keybinding to load a different config file, for example::
 
-    map f5 load_config /path/to/alternative/kitty.conf
+    map f5 load_config_file /path/to/alternative/kitty.conf
 
 Note that all options from the original :file:`kitty.conf` are discarded, in
 other words the new configuration *replace* the old ones.

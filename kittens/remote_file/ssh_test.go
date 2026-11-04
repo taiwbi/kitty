@@ -5,7 +5,9 @@ package remote_file
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -125,5 +127,104 @@ func TestPythonSplitExt(t *testing.T) {
 			t.Fatalf("pythonSplitExt(%q):\n  got (%q, %q)\n  want (%q, %q)",
 				tc.input, base, ext, tc.wantBase, tc.wantExt)
 		}
+	}
+}
+
+func TestRemoteEditFinalUpload(t *testing.T) {
+	const ssh_script = `#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        -fN) exit 0 ;;
+        check)
+            if [ "$KITTY_TEST_SSH_MODE" = master-died ] && [ -f "$KITTY_TEST_EDITED_PATH" ]; then exit 255; fi
+            exit 0 ;;
+        exit) touch "$KITTY_TEST_SSH_CLOSED"; exit 0 ;;
+        hostname) printf 'test-host\n'; exit 0 ;;
+        '>')
+            if [ "$KITTY_TEST_SSH_MODE" != success ]; then cat >/dev/null; exit 255; fi
+            cat > "$KITTY_TEST_REMOTE_FILE"; exit $? ;;
+    esac
+done
+cat "$KITTY_TEST_REMOTE_FILE"
+`
+	const editor_script = `#!/bin/sh
+printf 'edited content\n' > "$1"
+printf '%s' "$1" > "$KITTY_TEST_EDITED_PATH"
+`
+	for _, tc := range []struct {
+		name, mode                 string
+		ssh_kitten, editor_missing bool
+		want_error, want_copy      bool
+	}{
+		{name: "uploaded", mode: "success"},
+		{name: "upload_failed", mode: "upload-failed", want_error: true, want_copy: true},
+		{name: "master_died", mode: "master-died", want_error: true, want_copy: true},
+		{name: "editor_start_failed", mode: "success", editor_missing: true, want_error: true},
+		{name: "ssh_kitten_uploaded", mode: "success", ssh_kitten: true},
+		{name: "ssh_kitten_upload_failed", mode: "upload-failed", ssh_kitten: true, want_error: true, want_copy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			directory := t.TempDir()
+			remote := filepath.Join(directory, "remote.txt")
+			ssh := filepath.Join(directory, "ssh")
+			editor := filepath.Join(directory, "editor")
+			closed := filepath.Join(directory, "closed")
+			t.Setenv("KITTY_TEST_REMOTE_FILE", remote)
+			t.Setenv("KITTY_TEST_EDITED_PATH", filepath.Join(directory, "edited-path"))
+			t.Setenv("KITTY_TEST_SSH_CLOSED", closed)
+			t.Setenv("KITTY_TEST_SSH_MODE", tc.mode)
+			for path, data := range map[string]string{remote: "original content\n", ssh: ssh_script, editor: editor_script} {
+				if err := os.WriteFile(path, []byte(data), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			conn := &SSHConnectionData{Binary: ssh, Hostname: "test-host", IsSSHKitten: tc.ssh_kitten, SSHKittenCmdline: []string{ssh}}
+			master := new_control_master(conn, "/remote/note with spaces.txt", "")
+			if err := master.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				master.Close()
+				_ = os.RemoveAll(master.tdir)
+			})
+			if err := master.Download(); err != nil {
+				t.Fatal(err)
+			}
+			if tc.editor_missing {
+				editor = filepath.Join(directory, "missing-editor")
+			}
+			err := func() error {
+				defer master.Close()
+				return edit_and_upload(master, []string{editor})
+			}()
+			if (err != nil) != tc.want_error {
+				t.Fatalf("edit_loop error: %v, want error: %v", err, tc.want_error)
+			}
+			data, read_err := os.ReadFile(master.Dest)
+			if tc.want_copy {
+				if read_err != nil || string(data) != "edited content\n" {
+					t.Errorf("edited copy was not retained after cleanup: %q, %v", data, read_err)
+				}
+				if !strings.Contains(err.Error(), master.Dest) {
+					t.Errorf("upload error does not identify the recovery path: %v", err)
+				}
+			} else if !os.IsNotExist(read_err) {
+				t.Errorf("temporary copy was not cleaned up: %v", read_err)
+			}
+			data, read_err = os.ReadFile(remote)
+			want := "original content\n"
+			if !tc.want_error {
+				want = "edited content\n"
+			}
+			if read_err != nil || string(data) != want {
+				t.Errorf("remote contents: %q, %v, want %q", data, read_err, want)
+			}
+			_, close_err := os.Stat(closed)
+			if !tc.ssh_kitten && close_err != nil {
+				t.Error("SSH control connection was not closed:", close_err)
+			} else if tc.ssh_kitten && !os.IsNotExist(close_err) {
+				t.Error("borrowed ssh kitten connection was closed")
+			}
+		})
 	}
 }

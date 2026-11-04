@@ -9,12 +9,14 @@
 #include "state.h"
 #include "cleanup.h"
 #include "cocoa_window.h"
+#include "crypto.h"
 #include <Availability.h>
 #include <Carbon/Carbon.h>
 #include <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
 #include <UserNotifications/UserNotifications.h>
 #import <AudioToolbox/AudioServices.h>
+#include <Security/Security.h>
 
 #include <AvailabilityMacros.h>
 // Needed for _NSGetProgname
@@ -804,17 +806,110 @@ add_user_global_menu_entry(struct MenuItem *e, NSMenu *bar, size_t action_index)
 }
 
 static void
+add_user_global_menu_entries(NSMenu *bar) {
+    if (OPT(global_menu.entries)) {
+        for (size_t i = 0; i < OPT(global_menu.count); i++) {
+            struct MenuItem *e = OPT(global_menu.entries) + i;
+            if (e->definition && e->location && e->location_count > 1) { add_user_global_menu_entry(e, bar, i); }
+        }
+    }
+}
+
+static void
+remove_user_global_menu_entries(NSMenu *menu) {
+    for (NSInteger i = [menu numberOfItems] - 1; i >= 0; i--) {
+        NSMenuItem *item = [menu itemAtIndex:i];
+        if ([item isKindOfClass:[UserMenuItem class]]) [menu removeItem:item];
+        else if ([item hasSubmenu]) remove_user_global_menu_entries([item submenu]);
+    }
+}
+
+static GlobalShortcut *
+global_shortcut_for_action(GlobalShortcuts *shortcuts, SEL action) {
+#define Q(x) \
+    if (action == @selector(x:)) return &shortcuts->x;
+    Q(new_os_window);
+    Q(close_os_window);
+    Q(close_tab);
+    Q(edit_config_file);
+    Q(reload_config);
+    Q(previous_tab);
+    Q(next_tab);
+    Q(new_tab);
+    Q(new_window);
+    Q(close_window);
+    Q(reset_terminal);
+    Q(clear_terminal_and_scrollback);
+    Q(clear_screen);
+    Q(clear_scrollback);
+    Q(clear_last_command);
+    Q(toggle_macos_secure_keyboard_entry);
+    Q(toggle_fullscreen);
+    Q(open_kitty_website);
+    Q(hide_macos_app);
+    Q(hide_macos_other_apps);
+    Q(minimize_macos_window);
+    Q(quit);
+    Q(search_scrollback);
+    Q(macos_cycle_through_os_windows);
+    Q(macos_cycle_through_os_windows_backwards);
+    Q(paste_from_clipboard);
+    Q(copy_or_noop);
+#undef Q
+    return NULL;
+}
+
+// The menu items we create that have global shortcuts and the shortcuts
+// that were applied to them.
+static NSMutableArray<NSMenuItem *> *global_shortcut_menu_items = nil;
+static GlobalShortcuts applied_global_shortcuts;
+
+static bool
+menu_item_has_shortcut(NSMenuItem *item, const GlobalShortcut *gs) {
+    return [item.keyEquivalent isEqualToString:@(gs->key)] && item.keyEquivalentModifierMask == gs->mods;
+}
+
+static void
+update_global_shortcuts_in_menu(void) {
+    // Cocoa modifies some of our menu items, for example, it gives Enter Full
+    // Screen the Globe+F shortcut and moves our shortcut to a hidden copy of the
+    // item. So only change shortcuts that were actually changed in the config
+    // and change them on whichever item has the old shortcut, see
+    // https://github.com/kovidgoyal/kitty/issues/10793
+    for (NSMenuItem *item in global_shortcut_menu_items) {
+        GlobalShortcut *gs = global_shortcut_for_action(&global_shortcuts, item.action);
+        GlobalShortcut *old = global_shortcut_for_action(&applied_global_shortcuts, item.action);
+        if (!gs || !old || (strcmp(gs->key, old->key) == 0 && gs->mods == old->mods)) continue;
+        NSMenuItem *target_item = item;
+        if (!menu_item_has_shortcut(item, old)) {
+            for (NSMenuItem *q in [item.menu itemArray]) {
+                if (q != item && q.action == item.action && q.target == item.target && menu_item_has_shortcut(q, old)) {
+                    target_item = q;
+                    break;
+                }
+            }
+        }
+        [target_item setKeyEquivalent:@(gs->key)];
+        [target_item setKeyEquivalentModifierMask:gs->mods];
+    }
+    applied_global_shortcuts = global_shortcuts;
+}
+
+static void
 cocoa_create_global_menu(void) {
     NSString *app_name = find_app_name();
     NSMenu *bar = [[NSMenu alloc] init];
     GlobalMenuTarget *global_menu_target = [GlobalMenuTarget shared_instance];
     [NSApp setMainMenu:bar];
+    if (global_shortcut_menu_items) [global_shortcut_menu_items removeAllObjects];
+    else global_shortcut_menu_items = [[NSMutableArray alloc] init];
 
 #define MENU_ITEM(menu, title, name)                                                                                         \
     {                                                                                                                        \
         NSMenuItem *__mi = [menu addItemWithTitle:title action:@selector(name:) keyEquivalent:@(global_shortcuts.name.key)]; \
         [__mi setKeyEquivalentModifierMask:global_shortcuts.name.mods];                                                      \
         [__mi setTarget:global_menu_target];                                                                                 \
+        [global_shortcut_menu_items addObject:__mi];                                                                         \
     }
 
     NSMenuItem *appMenuItem = [bar addItemWithTitle:@"" action:NULL keyEquivalent:@""];
@@ -900,13 +995,9 @@ cocoa_create_global_menu(void) {
     [NSApp setHelpMenu:helpMenu];
     [helpMenu release];
 
-    if (OPT(global_menu.entries)) {
-        for (size_t i = 0; i < OPT(global_menu.count); i++) {
-            struct MenuItem *e = OPT(global_menu.entries) + i;
-            if (e->definition && e->location && e->location_count > 1) { add_user_global_menu_entry(e, bar, i); }
-        }
-    }
+    add_user_global_menu_entries(bar);
     [bar release];
+    applied_global_shortcuts = global_shortcuts;
 
 
     class_addMethod(object_getClass([NSApp delegate]), @selector(applicationDockMenu:), (IMP)get_dock_menu, "@@:@");
@@ -965,7 +1056,15 @@ cocoa_recreate_global_menu(void) {
         [bar removeItem:secure_input_title_menu];
     }
     secure_input_title_menu = NULL;
-    cocoa_create_global_menu();
+    // Update the existing menu in place rather than replacing it, as replacing
+    // the main menu and windows menu breaks the Globe key shortcuts that
+    // Cocoa injects into the windows menu, see https://github.com/kovidgoyal/kitty/issues/10793
+    NSMenu *bar = [NSApp mainMenu];
+    if (bar) {
+        update_global_shortcuts_in_menu();
+        remove_user_global_menu_entries(bar);
+        add_user_global_menu_entries(bar);
+    } else cocoa_create_global_menu();
     SecureKeyboardEntryController *k = [SecureKeyboardEntryController sharedInstance];
     update_secure_input_menu_bar_indicator(k.isDesired);
 }
@@ -1494,7 +1593,187 @@ cocoa_get_machine_id(PyObject *self UNUSED, PyObject *args UNUSED) {
     return PyUnicode_FromString(ans);
 }
 
+// Keychain {{{
+// These never show any UI, such as a prompt to unlock the keychain or to allow kitty to access an item, failing instead.
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+// The legacy file based keychain, which is the one used by default, shows its prompts unless interaction is disallowed with this
+// deprecated, process wide, API, which has no replacement.
+typedef struct {
+    Boolean previous;
+    bool is_set;
+} KeychainInteraction;
+
+static KeychainInteraction
+disallow_keychain_interaction(void) {
+    KeychainInteraction ans = {0};
+    if (SecKeychainGetUserInteractionAllowed(&ans.previous) == errSecSuccess) ans.is_set = SecKeychainSetUserInteractionAllowed(false) == errSecSuccess;
+    return ans;
+}
+
+static void
+restore_keychain_interaction(KeychainInteraction x) {
+    if (x.is_set) SecKeychainSetUserInteractionAllowed(x.previous);
+}
+
+static void
+set_keychain_query_ui_fail(CFMutableDictionaryRef q) {
+    CFDictionarySetValue(q, kSecUseAuthenticationUI, kSecUseAuthenticationUIFail);
+}
+#pragma clang diagnostic pop
+
+static CFMutableDictionaryRef
+keychain_query(const char *service, const char *account) {
+    // account can be NULL to match all items of service
+    CFMutableDictionaryRef q = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFStringRef s = CFStringCreateWithCString(NULL, service, kCFStringEncodingUTF8);
+    CFStringRef a = account ? CFStringCreateWithCString(NULL, account, kCFStringEncodingUTF8) : NULL;
+    if (!q || !s || (account && !a)) {
+        if (q) CFRelease(q);
+        if (s) CFRelease(s);
+        if (a) CFRelease(a);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    CFDictionarySetValue(q, kSecClass, kSecClassGenericPassword);
+    CFDictionarySetValue(q, kSecAttrService, s);
+    CFRelease(s);
+    if (a) {
+        CFDictionarySetValue(q, kSecAttrAccount, a);
+        CFRelease(a);
+    }
+    return q;
+}
+
+static PyObject *
+set_keychain_error(OSStatus status, const char *action) {
+    char msg[512] = {0};
+    CFStringRef m = SecCopyErrorMessageString(status, NULL);
+    if (m) {
+        CFStringGetCString(m, msg, sizeof(msg), kCFStringEncodingUTF8);
+        CFRelease(m);
+    }
+    PyErr_Format(PyExc_OSError, "Failed to %s the keychain: %s (error code: %d)", action, msg, (int)status);
+    return NULL;
+}
+
+static PyObject *
+cocoa_keychain_store_secret(PyObject *self UNUSED, PyObject *args) {
+    const char *service, *account, *label;
+    PyObject *secret;
+    if (!PyArg_ParseTuple(args, "sssO", &service, &account, &label, &secret)) return NULL;
+    const void *data;
+    size_t len;
+    if (!secret_data(secret, &data, &len)) return NULL;
+    CFMutableDictionaryRef q = keychain_query(service, account);
+    if (!q) return NULL;
+    // Do not copy the secret into memory that is not cleared when freed
+    CFDataRef d = CFDataCreateWithBytesNoCopy(NULL, data, (CFIndex)len, kCFAllocatorNull);
+    CFStringRef l = CFStringCreateWithCString(NULL, label, kCFStringEncodingUTF8);
+    if (!d || !l) {
+        CFRelease(q);
+        if (d) CFRelease(d);
+        if (l) CFRelease(l);
+        return PyErr_NoMemory();
+    }
+    CFDictionarySetValue(q, kSecValueData, d);
+    CFDictionarySetValue(q, kSecAttrLabel, l);
+    CFRelease(d);
+    CFRelease(l);
+    KeychainInteraction ki = disallow_keychain_interaction();
+    OSStatus status = SecItemAdd(q, NULL);
+    restore_keychain_interaction(ki);
+    CFRelease(q);
+    if (status != errSecSuccess) return set_keychain_error(status, "store an item in");
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+cocoa_keychain_read_secret(PyObject *self UNUSED, PyObject *args) {
+    const char *service, *account;
+    if (!PyArg_ParseTuple(args, "ss", &service, &account)) return NULL;
+    CFMutableDictionaryRef q = keychain_query(service, account);
+    if (!q) return NULL;
+    CFDictionarySetValue(q, kSecReturnData, kCFBooleanTrue);
+    CFDictionarySetValue(q, kSecMatchLimit, kSecMatchLimitOne);
+    set_keychain_query_ui_fail(q);
+    CFTypeRef result = NULL;
+    KeychainInteraction ki = disallow_keychain_interaction();
+    OSStatus status = SecItemCopyMatching(q, &result);
+    restore_keychain_interaction(ki);
+    CFRelease(q);
+    if (status == errSecItemNotFound) Py_RETURN_NONE;
+    if (status != errSecSuccess) return set_keychain_error(status, "read an item from");
+    if (!result || CFGetTypeID(result) != CFDataGetTypeID()) {
+        if (result) CFRelease(result);
+        PyErr_SetString(PyExc_OSError, "The item read from the keychain has no data");
+        return NULL;
+    }
+    PyObject *ans = secret_from_data(CFDataGetBytePtr((CFDataRef)result), (size_t)CFDataGetLength((CFDataRef)result));
+    CFRelease(result);
+    return ans;
+}
+
+static PyObject *
+cocoa_keychain_delete(PyObject *self UNUSED, PyObject *args) {
+    const char *service, *account;
+    if (!PyArg_ParseTuple(args, "ss", &service, &account)) return NULL;
+    CFMutableDictionaryRef q = keychain_query(service, account);
+    if (!q) return NULL;
+    set_keychain_query_ui_fail(q);
+    KeychainInteraction ki = disallow_keychain_interaction();
+    OSStatus status = SecItemDelete(q);
+    restore_keychain_interaction(ki);
+    CFRelease(q);
+    if (status == errSecItemNotFound) Py_RETURN_FALSE;
+    if (status != errSecSuccess) return set_keychain_error(status, "delete an item from");
+    Py_RETURN_TRUE;
+}
+static PyObject *
+cocoa_keychain_list_accounts(PyObject *self UNUSED, PyObject *args) {
+    const char *service;
+    if (!PyArg_ParseTuple(args, "s", &service)) return NULL;
+    CFMutableDictionaryRef q = keychain_query(service, NULL);
+    if (!q) return NULL;
+    // Only the attributes are read, which does not need access to the secret data of the items
+    CFDictionarySetValue(q, kSecReturnAttributes, kCFBooleanTrue);
+    CFDictionarySetValue(q, kSecMatchLimit, kSecMatchLimitAll);
+    set_keychain_query_ui_fail(q);
+    CFTypeRef result = NULL;
+    KeychainInteraction ki = disallow_keychain_interaction();
+    OSStatus status = SecItemCopyMatching(q, &result);
+    restore_keychain_interaction(ki);
+    CFRelease(q);
+    if (status == errSecItemNotFound) return PyList_New(0);
+    if (status != errSecSuccess) return set_keychain_error(status, "list the items in");
+    if (!result || CFGetTypeID(result) != CFArrayGetTypeID()) {
+        if (result) CFRelease(result);
+        PyErr_SetString(PyExc_OSError, "Listing the items in the keychain did not return a list");
+        return NULL;
+    }
+    PyObject *ans = PyList_New(0);
+    CFArrayRef items = (CFArrayRef)result;
+    for (CFIndex i = 0; ans && i < CFArrayGetCount(items); i++) {
+        CFTypeRef item = CFArrayGetValueAtIndex(items, i);
+        if (!item || CFGetTypeID(item) != CFDictionaryGetTypeID()) continue;
+        CFTypeRef account = CFDictionaryGetValue((CFDictionaryRef)item, kSecAttrAccount);
+        if (!account || CFGetTypeID(account) != CFStringGetTypeID()) continue;
+        char buf[1024];
+        if (!CFStringGetCString((CFStringRef)account, buf, sizeof(buf), kCFStringEncodingUTF8)) continue;
+        RAII_PyObject(a, PyUnicode_FromString(buf));
+        if (!a || PyList_Append(ans, a) != 0) Py_CLEAR(ans);
+    }
+    CFRelease(result);
+    return ans;
+}
+// }}}
+
 static PyMethodDef module_methods[] = {
+    {"cocoa_keychain_list_accounts", (PyCFunction)cocoa_keychain_list_accounts, METH_VARARGS, ""},
+    {"cocoa_keychain_store_secret", (PyCFunction)cocoa_keychain_store_secret, METH_VARARGS, ""},
+    {"cocoa_keychain_read_secret", (PyCFunction)cocoa_keychain_read_secret, METH_VARARGS, ""},
+    {"cocoa_keychain_delete", (PyCFunction)cocoa_keychain_delete, METH_VARARGS, ""},
     {"cocoa_play_system_sound_by_id_async", play_system_sound_by_id_async, METH_O, ""},
     {"cocoa_get_lang", (PyCFunction)cocoa_get_lang, METH_NOARGS, ""},
     {"cocoa_get_machine_id", (PyCFunction)cocoa_get_machine_id, METH_NOARGS, ""},

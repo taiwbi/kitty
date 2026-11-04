@@ -28,12 +28,14 @@ if TYPE_CHECKING:
 
 
 def get_os_window_sizing_data(opts: Options, session: Optional['Session'] = None) -> WindowSizeData:
+    remember_window_size = opts.remember_window_size
     if session is None or session.os_window_size is None:
         sizes = WindowSizes(WindowSize(*opts.initial_window_width), WindowSize(*opts.initial_window_height))
     else:
         sizes = session.os_window_size
+        remember_window_size = False  # a size specified in the session takes precedence over the remembered size
     return WindowSizeData(
-        sizes, opts.remember_window_size, opts.single_window_margin_width, opts.window_margin_width, opts.single_window_padding_width, opts.window_padding_width
+        sizes, remember_window_size, opts.single_window_margin_width, opts.window_margin_width, opts.single_window_padding_width, opts.window_padding_width
     )
 
 
@@ -50,6 +52,7 @@ class WindowSpec:
         self.is_background_process = False
         self.serialized_id = serialized_id
         self.run_command_at_shell_startup = run_command_at_shell_startup
+        self.restored_scrollback = b''
         if hasattr(launch_spec, 'opts'):  # LaunchSpec
             from .launch import LaunchSpec
 
@@ -88,6 +91,7 @@ class Session:
         self.focus_tab_spec: str | None = None
         self.default_title = default_title
         self.os_window_size: WindowSizes | None = None
+        self.os_window_position: tuple[int, int] | None = None
         self.os_window_class: str | None = None
         self.os_window_name: str | None = None
         self.os_window_state: str | None = None
@@ -276,6 +280,11 @@ def parse_session(
             elif cmd == 'os_window_size':
                 w, h = map(window_size, rest.split(maxsplit=1))
                 ans.os_window_size = WindowSizes(WindowSize(*w), WindowSize(*h))
+            elif cmd == 'os_window_position':
+                x, sep, y = rest.lower().partition('x')
+                if not sep:
+                    raise ValueError(f'Invalid os_window_position: {rest!r}, must be of the form XxY, for example: 100x50')
+                ans.os_window_position = int(x), int(y)
             elif cmd == 'os_window_class':
                 ans.os_window_class = rest
             elif cmd == 'os_window_name':
@@ -662,8 +671,8 @@ both the shell **and** the process running inside it are re-started. This is mos
 when you have opened programs like editors or similar inside windows that started out running
 the shell and you want to preserve that. WARNING: Be careful when using this option, if you are
 running some dangerous command like :file:`rm` or :file:`mv` or similar in a shell, it will be re-run when
-the session is executed if you use this option. Note that this option requires :ref:`shell_integration`
-to work.
+the session is executed if you use this option and it is unsafe to use if you are connected to untrusted hosts.
+Note that this option requires :ref:`shell_integration` to work.
 
 
 --relocatable
@@ -686,6 +695,13 @@ working directory. This is useful when kitty is launched from locations where th
 is not your home directory, such as from system-wide shortcuts. Note that :code:`--relocatable` is
 typically not used with :code:`--base-dir`, since relocatable is meant for session files that are
 co-located with their project directories.
+
+
+--os-window-geometry
+type=bool-set
+Save the size, position and state (maximized, fullscreen, etc.) of OS Windows, so that they
+are restored as they are now when the session is loaded. Note that positions are not
+saved on Wayland as it does not allow applications to position their windows.
 """
 
 

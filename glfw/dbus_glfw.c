@@ -168,9 +168,24 @@ glfw_dbus_connect_to(const char *path, const char *err_msg, const char *name, bo
     return ans;
 }
 
+static unsigned session_bus_dispatch_depth = 0;
+
 void
 glfw_dbus_dispatch(DBusConnection *conn) {
+    const bool is_session_bus = conn == session_bus;
+    if (is_session_bus) session_bus_dispatch_depth++;
     while (dbus_connection_dispatch(conn) == DBUS_DISPATCH_DATA_REMAINS);
+    if (is_session_bus) session_bus_dispatch_depth--;
+}
+
+bool
+glfw_dbus_session_bus_read_write_dispatch(int timeout_ms) {
+    // Dispatching is not re-entrant, so refuse to do it from inside a DBus callback
+    if (!session_bus || session_bus_dispatch_depth) return false;
+    session_bus_dispatch_depth++;
+    const bool ok = dbus_connection_read_write_dispatch(session_bus, timeout_ms);
+    session_bus_dispatch_depth--;
+    return ok;
 }
 
 void
@@ -221,8 +236,10 @@ method_reply_received(DBusPendingCall *pending, void *user_data) {
     if (msg) {
         DBusError err;
         dbus_error_init(&err);
-        if (dbus_set_error_from_message(&err, msg)) res->callback(NULL, &err, res->user_data);
-        else res->callback(msg, NULL, res->user_data);
+        if (dbus_set_error_from_message(&err, msg)) {
+            res->callback(NULL, &err, res->user_data);
+            dbus_error_free(&err);
+        } else res->callback(msg, NULL, res->user_data);
     }
 }
 
@@ -246,6 +263,7 @@ call_method_with_msg(DBusConnection *conn, DBusMessage *msg, int timeout, dbus_p
             RAII_MSG(reply, dbus_connection_send_with_reply_and_block(session_bus, msg, timeout, &error));
             if (dbus_error_is_set(&error)) {
                 callback(reply, &error, user_data);
+                dbus_error_free(&error);
                 return false;
             } else if (reply) {
                 callback(reply, NULL, user_data);

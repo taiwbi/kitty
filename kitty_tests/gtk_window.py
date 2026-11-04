@@ -30,7 +30,9 @@ class TestGtkWindow(BaseTest):
             self.skipTest('GTK and a display server are required')
         # MainContext.iteration() releases the GIL. Native GTK timer callbacks
         # must reacquire it before calling Python, even outside kitty's C loop.
-        code = '''
+        code = r'''
+import warnings
+warnings.filterwarnings('ignore', message=r"'asyncio\..*' is deprecated", category=DeprecationWarning)
 from kitty.constants import configure_gtk_runtime_paths
 configure_gtk_runtime_paths()
 from kitty.fast_data_types import gtk_backend_initialize, add_timer

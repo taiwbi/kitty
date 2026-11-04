@@ -537,6 +537,40 @@ class TestGraphics(BaseTest):
         self.ae(pl('abcd', s=1, v=1, a='q'), 'OK')
         self.ae(g.image_count, 0)
 
+        # Test feature queries
+        def q(e, payload='', **kw):
+            res = send_command(s, ','.join(f'{k}={v}' for k, v in dict(a='q', i=31, e=e, **kw).items()), payload)
+            return res.decode('ascii') if res else None
+
+        def r(keys=''):
+            return f'\033_Gi=31{keys};OK\033\\'
+
+        self.ae(q('T', s=1, v=1, f=24, U=1), r(',e=T,f=24,s=1,v=1,U=1'))
+        self.ae(q('T', s=1, v=1, f=24, t='d', C=1, z=-3, N=1), r(',e=T,t=d,f=24,s=1,v=1,N=1,C=1,z=-3'))
+        # no image data is needed or loaded
+        self.ae(q('t', 'abcd', s=1, v=1, f=8, c=2), r(',e=t,f=8,s=1,v=1'))
+        self.ae(g.image_count, 0)
+        # keys are interpreted according to the action being queried
+        self.ae(q('p', c=2, r=3, U=1, C=1, s=1), r(',e=p,c=2,r=3,C=1,U=1'))
+        self.ae(q('f', c=2, r=3, z=40, X=1, f=8, s=1), r(',e=f,s=1,c=2,r=3,z=40,X=1'))
+        self.ae(q('a', s=3, v=1, r=2, c=1, z=-1), r(',e=a,s=3,v=1,r=2,c=1,z=-1'))
+        self.ae(q('c', r=1, c=2, w=3, X=1, C=1, U=1), r(',e=c,r=1,c=2,w=3,X=1,C=1'))
+        self.ae(q('d', d='F', p=2, s=1), r(',e=d,d=F,p=2'))
+        # unsupported values are not reported
+        self.ae(q('T', s=1, v=1, f=24, C=7, N=6, U=2), r(',e=T,f=24,s=1,v=1'))
+        self.ae(q('t', f=42, s=100000), r(',e=t'))
+        self.ae(q('a', s=4), r(',e=a'))
+        # unknown actions are not reported
+        self.ae(q('x', s=1, v=1, f=24, U=1), r())
+        # a feature query does not disturb a chunked load in progress
+        self.assertIsNone(pl('ab', i=99, s=1, v=1, f=24, m=1))
+        self.ae(q('T', U=1), r(',e=T,U=1'))
+        self.ae(pl('c', i=99, m=0), 'OK')
+        self.ae(g.image_count, 1)
+        s.reset()
+        self.ae(g.image_count, 0)
+        self.assertIsNone(q('T', U=1, q=1))
+
         # Test simple load
         for f in 32, 24:
             p = 'abc' + ('d' if f == 32 else '')
@@ -669,7 +703,14 @@ class TestGraphics(BaseTest):
         # A shared memory object that could not be opened must also be
         # removed, and reported with the same generic error
         self.ae(pl('/kitty-test-shm-missing', s=1024, v=8, t='s'), generic_error)
-        self.ae(pl('kitty-test-shm-no-leading-slash', s=1024, v=8, t='s'), generic_error)
+        self.ae(pl('kitty-test-shm-missing-no-leading-slash', s=1024, v=8, t='s'), generic_error)
+
+        # Names without a leading slash must be accepted, as, for example,
+        # sandboxed applications on macOS cannot use a leading slash
+        name = 'kitty-test-shm-no-leading-slash'
+        shm_write(name, random_data)
+        sl(name, s=1024, v=8, t='s', expecting_data=random_data)
+        self.assertRaises(FileNotFoundError, shm_unlink, name)  # check that the object was deleted
 
         s.reset()
         self.assertEqual(g.disk_cache.total_size, 0)
@@ -936,6 +977,60 @@ class TestGraphics(BaseTest):
         self.ae(group_counts(), (4, 3, 2, 1))
         self.ae(put_image(s, 8, 16, id=2, z=-1)[1], 'OK')
         self.ae(group_counts(), (2, 1, 1, 2, 1))
+
+    def test_indexed_color_images(self):
+        s, g, pl, sl = load_helpers(self)
+        li = make_send_command(s)
+
+        # Loading
+        self.ae(pl('ab', s=1, v=1, f=8, a='q'), 'OK')
+        self.ae(g.image_count, 0)
+        img = sl(bytes(range(8)), s=4, v=2, f=8)
+        self.ae(img['indexed_px_sz'], 1)
+        img = sl(bytes(range(8)), s=2, v=2, f=16)
+        self.ae(img['indexed_px_sz'], 2)
+        data = bytes(range(256)) * 4
+        img = sl(zlib.compress(data), s=32, v=16, f=16, o='z', expecting_data=data)
+        self.ae(img['indexed_px_sz'], 2)
+        self.ae(pl(bytes(range(3)), s=3, v=1, f=8), 'OK')
+        img = g.image_for_client_id(1)
+        self.ae((img['indexed_px_sz'], img['is_4byte_aligned'], img['data']), (1, False, bytes(range(3))))
+        self.assertTrue(pl(bytes(range(5)), s=3, v=1, f=16).startswith('ENODATA'))
+        self.assertTrue(pl(b'', s=0, v=1, f=8).startswith('EINVAL'))
+
+        # Replacing an indexed image with a normal one
+        img = sl(b'abcd', s=1, v=1, f=32)
+        self.ae(img['indexed_px_sz'], 0)
+
+        # Animation is not supported
+        def unsupported(r, what='Animation'):
+            self.ae((r.code, r.msg), ('EINVAL', f'{what} is not supported for indexed color images'))
+
+        self.ae(li(b'abcd', s=2, v=2, f=8, a='t').code, 'OK')
+        unsupported(li(b'abcd', s=2, v=2, f=8, a='f'))
+        unsupported(li(b'abcd', s=1, v=1, f=32, a='f'))
+        unsupported(li(b'', a='c', r=1, c=1, w=1, h=1, x=1, s=0, v=0, f=0), 'Composition')
+        self.ae(g.image_for_client_id(1)['extra_frames'], ())
+        self.ae(li(b'abcd', s=1, v=1, f=32, a='t').code, 'OK')
+        unsupported(li(b'abcd', s=2, v=2, f=8, a='f'))
+
+        # Render data
+        cw, ch = 10, 20
+        s, dx, dy, put_image, put_ref, layers, rect_eq = put_helpers(self, cw, ch)
+        self.ae(put_image(s, 10, 20, id=1)[1], 'OK')
+        self.ae(parse_response(send_command(s, 'a=T,f=16,i=2,s=2,v=2,z=-1', b'\x01\xff' * 4)), 'OK')
+        self.ae(parse_response(send_command(s, 'a=T,f=8,i=3,s=2,v=2,z=1', b'\xf8' * 4)), 'OK')
+        self.ae(tuple((x['image_id'], x['indexed_px_sz']) for x in layers(s)), ((2, 2), (1, 0), (3, 1)))
+        self.ae(s.grman.image_count, 3)
+
+        # Refs drawn at natural size use a cheaper program, so must not share
+        # a group with scaled refs of the same image
+        s, dx, dy, put_image, put_ref, layers, rect_eq = put_helpers(self, cw, ch)
+        self.ae(parse_response(send_command(s, 'a=T,f=8,i=1,s=2,v=2', b'\x01' * 4)), 'OK')
+        self.ae(parse_response(send_command(s, 'a=p,i=1,c=1,r=1')), 'OK')
+        self.ae(parse_response(send_command(s, 'a=p,i=1')), 'OK')
+        self.ae(parse_response(send_command(s, 'a=T,f=32,i=2,s=2,v=2', b'abcd' * 4)), 'OK')
+        self.ae(tuple((x['is_unscaled'], x['group_count']) for x in layers(s)), ((True, 1), (False, 1), (True, 1), (False, 1)))
 
     def test_image_parents(self):
         cw, ch = 10, 20

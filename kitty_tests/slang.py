@@ -101,6 +101,161 @@ class TestSlang(BaseTest):
         # there are no shaders to draw.
         self.ae(simulate_custom_shader_render_ticks(8, 0xFF, True), [False] * 8)
 
+    def test_custom_shader_user_events(self):
+        from kitty.fast_data_types import MAX_SHADER_ANIM_USER_EVENTS, fire_custom_shader_event, simulate_custom_shader_animation
+        from kitty.options.utils import KeyAction, parse_key_action
+
+        def pipeline(*groups: str):
+            lines = []
+            for g in groups:
+                lines.append('startgroup')
+                lines.extend(g.splitlines())
+                lines.append('shaders sample')
+                lines.append('endgroup')
+            return parse_pipeline_definition(lines, 'test')
+
+        # Parsing
+        g = pipeline('animation_start user:find-cursor|tab-change\nanimation_stop user:x.y_z')['groups'][0]
+        self.ae(g['animation_start'], ('user:find-cursor', 'tab-change'))
+        self.ae(g['animation_end_events'], ('user:x.y_z',))
+        # Trailing comments, including empty ones
+        for comment in ('# ', '#', '# some comment', '\t#x'):
+            g = pipeline(f'animation_toggle user:toggle-notch {comment}\nanimation_duration 600 {comment}')['groups'][0]
+            self.ae(g['animation_toggle'], ('user:toggle-notch',))
+            self.ae(g['animation_duration'], 600_000_000)
+        for bad in ('user:', 'user:a/b', 'user:' + 'x' * 100, 'usr:a'):
+            self.assertRaises(ValueError, pipeline, f'animation_start {bad}')
+        # A toggled group stays on until toggled off unless told otherwise
+        self.ae(pipeline('animation_toggle user:t')['groups'][0]['animation_end_duration'], 0)
+        self.ae(pipeline('animation_toggle user:t\nanimation_stop 100')['groups'][0]['animation_end_duration'], 100_000_000)
+        self.ae(pipeline('animation_start user:s\nanimation_toggle user:t')['groups'][0]['animation_end_duration'], -1)
+        many = '|'.join(f'user:e{i}' for i in range(MAX_SHADER_ANIM_USER_EVENTS + 1))
+        self.assertRaises(ValueError, pipeline, f'animation_start {many}')
+        pipeline(f'animation_start {many.rpartition("|")[0]}')
+
+        # The action
+        self.ae(parse_key_action('shader_event find-cursor'), KeyAction('shader_event', ('find-cursor', 'active')))
+        self.ae(parse_key_action('shader_event user:notch ALL'), KeyAction('shader_event', ('notch', 'all')))
+        for bad in ('a b c', 'a sideways', 'a/b'):
+            self.assertRaises(ValueError, parse_key_action, f'shader_event {bad}')
+        # Events not used by the current pipeline, here no pipeline at all, are ignored
+        self.assertFalse(fire_custom_shader_event('find-cursor'))
+
+        # The animation state machine
+        p = pipeline(
+            'animation_toggle user:t',
+            'animation_start user:s\nanimation_stop 20',
+            'attach',
+            'animation_start user:on\nanimation_toggle user:t\nanimation_stop user:off|0',
+            '',
+        )
+        ticks = [(), ('user:t',), (), ('user:t',), ('user:s', 'user:unknown'), (), (), ('user:on',), ('user:t',), ('user:t', 'user:off'), ('user:on', 'user:t')]
+        expected = [
+            (False, False, False, False, True),
+            (True, False, False, True, True),  # toggled on
+            (True, False, False, True, True),  # toggles stay on
+            (False, False, False, False, True),  # toggled off
+            (False, True, True, False, True),  # started, with the attached group
+            (False, True, True, False, True),
+            (False, False, False, False, True),  # duration expired
+            (False, False, False, True, True),
+            (True, False, False, False, True),  # toggles flip each group's own state
+            (False, False, False, True, True),  # toggle wins over a simultaneous stop
+            (True, False, False, False, True),  # and over a simultaneous start
+        ]
+        self.ae(simulate_custom_shader_animation(p, ticks), expected)
+
+    def test_custom_shader_animation_progress(self):
+        from kitty.fast_data_types import simulate_custom_shader_animation
+
+        def pipeline(*groups: str):
+            lines = []
+            for g in groups:
+                lines.append('startgroup')
+                lines.extend(g.splitlines())
+                lines.append('shaders sample')
+                lines.append('endgroup')
+            return parse_pipeline_definition(lines, 'test')
+
+        def group(spec: str):
+            return pipeline(spec)['groups'][0]
+
+        def progress(spec: str, ticks: list[tuple[str, ...]]) -> list[float | None]:
+            # The ticks are 10ms apart
+            return [x[0] for x in simulate_custom_shader_animation(pipeline(spec, ''), ticks, True)]
+
+        # Parsing
+        self.ae(group('')['animation_duration'], -1)
+        self.ae(group('animation_duration 300')['animation_duration'], 300_000_000)
+        self.ae(group('')['animation_reverse'], 0)
+        self.ae(group('animation_reverse yes')['animation_reverse'], -1)
+        self.ae(group('animation_reverse no')['animation_reverse'], 0)
+        self.ae(group('animation_reverse 200')['animation_reverse'], 200_000_000)
+        self.ae(group('')['animation_loops'], 1)
+        self.ae(group('animation_reverse yes\nanimation_loops 3')['animation_loops'], 3)
+        for bad in (
+            'animation_duration -1',
+            'animation_duration x',
+            'animation_reverse -1',
+            'animation_reverse maybe',
+            'animation_reverse yes\nanimation_loops 0',
+            'animation_loops 2',
+        ):
+            self.assertRaises(ValueError, group, bad)
+
+        on, off, none = ('user:t',), ('user:off',), ()
+        # Without animation_duration progress follows the stop duration, and a
+        # group with no stop duration has no progress
+        self.ae(progress('animation_start user:t\nanimation_stop 40', [on, none, none, none, none]), [0, 0.25, 0.5, 0.75, None])
+        self.ae(progress('animation_toggle user:t', [on, none, none]), [0, 0, 0])
+        # animation_duration makes progress rise to one and stay there
+        self.ae(progress('animation_toggle user:t\nanimation_duration 40', [on] + [none] * 5 + [on, none]), [0, 0.25, 0.5, 0.75, 1, 1, None, None])
+        # Reversing on toggle off, over animation_duration with yes
+        self.ae(
+            progress('animation_toggle user:t\nanimation_duration 40\nanimation_reverse yes', [on] + [none] * 4 + [on] + [none] * 4),
+            [0, 0.25, 0.5, 0.75, 1, 1, 0.75, 0.5, 0.25, None],
+        )
+        # ...or over its own duration
+        self.ae(
+            progress('animation_toggle user:t\nanimation_duration 40\nanimation_reverse 20', [on] + [none] * 4 + [on, none, none]),
+            [0, 0.25, 0.5, 0.75, 1, 1, 0.5, None],
+        )
+        # Stopping part way reverses from the current progress, and restarting
+        # while reversing continues rising from there
+        self.ae(
+            progress('animation_toggle user:t\nanimation_duration 40\nanimation_reverse yes', [on, none, on, on, none, none, none]),
+            [0, 0.25, 0.5, 0.25, 0.5, 0.75, 1],
+        )
+        # Stop events are ignored while reversing, start events restart
+        self.ae(
+            progress('animation_start user:t\nanimation_stop user:off\nanimation_duration 40\nanimation_reverse yes', [on] + [none] * 4 + [off, off, on, none]),
+            [0, 0.25, 0.5, 0.75, 1, 1, 0.75, 0.5, 0.75],
+        )
+        # The stop duration ending also reverses, with progress having reached one
+        self.ae(progress('animation_start user:t\nanimation_stop 40\nanimation_reverse yes', [on] + [none] * 8), [0, 0.25, 0.5, 0.75, 1, 0.75, 0.5, 0.25, None])
+        # Loops play the animation forwards and in reverse again after the
+        # first reverse, without holding, for example, to blink three times
+        self.ae(
+            progress('animation_start user:t\nanimation_stop 20\nanimation_duration 20\nanimation_reverse yes\nanimation_loops 3', [on] + [none] * 12),
+            [0, 0.5, 1, 0.5, 0, 0.5, 1, 0.5, 0, 0.5, 1, 0.5, None],
+        )
+        # Starting again while looping goes back to holding at one
+        self.ae(
+            progress(
+                'animation_toggle user:t\nanimation_duration 20\nanimation_reverse yes\nanimation_loops 2', [on, none, none, on, none, none, on, none, none]
+            ),
+            [0, 0.5, 1, 1, 0.5, 0, 0.5, 1, 1],
+        )
+        # Attached groups without their own events share the progress, including
+        # the easing curve and reversal, of the group they are attached to
+        p = pipeline('animation_toggle user:t\nanimation_duration 40\nanimation_curve ease-in\nanimation_reverse yes', 'attach', '')
+        results = simulate_custom_shader_animation(p, [on] + [none] * 4 + [on] + [none] * 4, True)
+        self.ae([r[0] for r in results], [r[1] for r in results])
+        eased = results[2][0]
+        assert eased is not None
+        self.assertLess(eased, 0.5)
+        self.ae([r[1] is None for r in results], [False] * 9 + [True])
+
     def test_custom_shader_reenable(self):
         from kitty.fast_data_types import CUSTOM_END_PROGRAM
         from kitty.options.types import defaults
@@ -413,6 +568,12 @@ fsMain(VertexOutput vo) : SV_Target { return float4(0); }
         self.ae(pms('startgroup\nshaders crt sample crt\nendgroup\nstartgroup\nshaders crt\nendgroup'), ((1, 0), (0, 2), (0, 0)))
         # Transient effects and passes that do not draw to the screen do not move pointer events
         self.ae(pms('startgroup\nanimation_start tab-change\nshaders crt\nendgroup'), ())
+        self.ae(pms('startgroup\nanimation_start user:s\nanimation_stop 100\nshaders crt\nendgroup'), ())
+        self.ae(pms('startgroup\nanimation_toggle user:t\nanimation_stop 100\nshaders crt\nendgroup'), ())
+        # Effects that last until an event turns them off do
+        self.ae(pms('startgroup\nanimation_toggle user:t\nshaders crt\nendgroup'), ((0, 0),))
+        self.ae(pms('startgroup\nanimation_start user:s\nanimation_stop never\nshaders crt\nendgroup'), ((0, 0),))
+        self.ae(pms('startgroup\nanimation_start user:s\nanimation_stop user:e\nshaders crt\nendgroup'), ((0, 0),))
         self.ae(pms('startgroup\nshaders sample\nendgroup\nstartgroup\nattach\nshaders crt\nendgroup'), ())
         self.ae(pms('textures a\nstartgroup\nshaders crt\noutput_texture a\nendgroup\nstartgroup\nshaders sample\nendgroup'), ())
         # Groups that draw only part of the screen do not move pointer events everywhere
@@ -610,6 +771,32 @@ float f() { static const float SCAN = 2; return SCAN; }
         self.assertFalse(metadata['has_pointer_map'])
         self.assertFalse(invocation_tracker)
 
+        with tempfile.TemporaryDirectory() as cache_dir:
+            clear_caches()
+            # pointer_map() of a group turned on and off by events applies only while it is active
+            p = parse_pipeline_definition(
+                [
+                    'startgroup',
+                    'shaders crt',
+                    'endgroup',
+                    'startgroup',
+                    'shaders sample',
+                    'endgroup',
+                    'startgroup',
+                    'animation_toggle user:t',
+                    'shaders crt',
+                    'endgroup',
+                ],
+                'test',
+            )
+            try:
+                _, pm_frag_src, pm_metadata = build_custom_shader_pipeline_glsl(p, cache_dir=cache_dir)
+            finally:
+                clear_caches()
+        self.assertTrue(pm_metadata['has_pointer_map'])
+        self.ae(pm_metadata['pointer_map_groups'], [0, 2])
+        self.assertIn('active_groups', pm_frag_src)
+
         if not shutil.which('glslangValidator'):
             return
 
@@ -745,4 +932,50 @@ float f() { static const float SCAN = 2; return SCAN; }
                 self.assertEqual(src, slang_content)
                 self.assertEqual(import_dir, tmpdir)
             finally:
+                clear_caches()
+
+    def test_custom_shader_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdir = os.path.join(tmpdir, 'pipelines')
+            os.mkdir(pdir)
+
+            def w(path: str, data: str) -> str:
+                path = os.path.join(tmpdir, path)
+                with open(path, 'w') as f:
+                    f.write(data)
+                return path
+
+            effect = w('effect.slang', '// effect shader\n')
+            w('effect.pipeline', 'startgroup\n    shaders effect\nendgroup\n')
+            notch = w('notch.slang', '// notch shader\n')
+            w('pipelines/other.slang', '// other\n')
+            orig_home = os.environ.get('HOME')
+            os.environ['HOME'] = tmpdir
+            clear_caches()
+            try:
+                # absolute paths with the extension are not extended again
+                self.assertEqual(custom_shader(effect)[0], effect)
+                self.assertEqual(custom_shader(effect[: -len('.slang')])[0], effect)
+                # ~ is expanded both at top level and inside a pipeline, even
+                # when the pipeline is in the same directory as the shader
+                self.assertEqual(custom_shader('~/effect.slang')[0], effect)
+                self.assertEqual(custom_shader('~/notch', tmpdir)[0], notch)
+                self.assertEqual(custom_shader('~/notch', pdir)[0], notch)
+                self.assertEqual(custom_shader('other', pdir)[0], os.path.join(pdir, 'other.slang'))
+                lines, pipeline_dir = pipeline_definition('~/effect')
+                self.assertEqual(pipeline_dir, tmpdir)
+                self.assertIn('    shaders effect', lines)
+                # names ending with .slang never load pipelines
+                with self.assertRaises(FileNotFoundError):
+                    pipeline_definition('~/effect.slang')
+                # builtins work with or without the extension
+                self.assertEqual(custom_shader('crt.slang')[2], custom_shader('crt')[2])
+                with self.assertRaises(FileNotFoundError) as cm:
+                    custom_shader('~/does-not-exist')
+                self.assertIn(os.path.join(tmpdir, 'does-not-exist.slang'), str(cm.exception))
+            finally:
+                if orig_home is None:
+                    os.environ.pop('HOME', None)
+                else:
+                    os.environ['HOME'] = orig_home
                 clear_caches()

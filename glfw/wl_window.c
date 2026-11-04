@@ -31,6 +31,8 @@
 #include "internal.h"
 #include "backend_utils.h"
 #include "linux_notify.h"
+#include "linux_session_monitor.h"
+#include "linux_desktop_settings.h"
 #include "wl_client_side_decorations.h"
 #include "../kitty/monotonic.h"
 
@@ -1382,7 +1384,7 @@ abortOnFatalError(int last_error) {
     if (!abort_called) {
         abort_called = true;
         _glfwInputError(GLFW_PLATFORM_ERROR, "Wayland: fatal display error: %s", strerror(last_error));
-        if (_glfw.callbacks.application_close) _glfw.callbacks.application_close(1);
+        if (_glfw.callbacks.application_close) _glfw.callbacks.application_close(GLFW_APPLICATION_CLOSE_FATAL_ERROR);
         else {
             _GLFWwindow *window = _glfw.windowListHead;
             while (window) {
@@ -1551,9 +1553,14 @@ int
 _glfwPlatformCreateWindow(
     _GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _GLFWctxconfig *ctxconfig, const _GLFWfbconfig *fbconfig, const GLFWLayerShellConfig *lsc) {
     window->wl.layer_shell.config = lsc ? *lsc : (GLFWLayerShellConfig){0};
+    // Compositors without xdg-decoration such as mutter need client side
+    // decorations, whose titlebar height depends on desktop settings. Wait
+    // briefly for them, to avoid resizing the window right after it is mapped.
+    if (!_glfw.wl.decorationManager && wndconfig->decorated && !is_layer_shell(window)) glfw_wait_for_desktop_settings(ms_to_monotonic_t(200ll));
     csd_initialize_metrics(window);
     window->wl.transparent = fbconfig->transparent;
     strncpy(window->wl.appId, wndconfig->wl.appId, sizeof(window->wl.appId));
+    strncpy(window->wl.windowTag, wndconfig->wl.windowTag, sizeof(window->wl.windowTag));
     window->swaps_disallowed = true;
 
     if (!create_surface(window, wndconfig)) return false;
@@ -3109,6 +3116,11 @@ glfwDBusSetUserNotificationHandler(GLFWDBusnotificationactivatedfun handler) {
 }
 
 GLFWAPI bool
+glfwDBusMonitorSessionState(GLFWDBussessionstatefun callback) {
+    return glfw_dbus_monitor_session_state(callback);
+}
+
+GLFWAPI bool
 glfwWaylandSetTitlebarColor(GLFWwindow *handle, uint32_t color, bool use_system_color) {
     _GLFWwindow *window = (_GLFWwindow *)handle;
     if (!window->wl.decorations.serverSide) {
@@ -3122,6 +3134,38 @@ GLFWAPI void
 glfwWaylandRedrawCSDWindowTitle(GLFWwindow *handle) {
     _GLFWwindow *window = (_GLFWwindow *)handle;
     if (csd_change_title(window)) commit_window_surface_if_safe(window);
+}
+
+static void
+update_titlebar_height(_GLFWwindow *window) {
+    const unsigned old_height = window->wl.decorations.metrics.visible_titlebar_height;
+    csd_initialize_metrics(window);
+    if (old_height == window->wl.decorations.metrics.visible_titlebar_height) return;
+    if (!csd_should_window_be_decorated(window) || window->wl.decorations.titlebar_hidden) return;
+    // Floating windows keep their content size and grow/shrink, docked windows
+    // must keep the size the compositor gave them, so the content changes size.
+    int32_t width = window->wl.width;
+    int32_t height = window->wl.height + (int32_t)window->wl.decorations.metrics.visible_titlebar_height;
+    if (window->wl.current.toplevel_states & TOPLEVEL_STATE_DOCKED) height = window->wl.height + (int32_t)old_height;
+    csd_set_window_geometry(window, &width, &height);
+    height = MAX(1, height);
+    if (height != window->wl.height) {
+        _glfwInputWindowSize(window, width, height);
+        window->wl.height = height;
+        resizeFramebuffer(window);
+        _glfwInputWindowDamage(window);
+    }
+    inform_compositor_of_window_geometry(window, "TitlebarSettings");
+}
+
+void
+_glfwPlatformTitlebarSettingsChanged(void) {
+    for (_GLFWwindow *w = _glfw.windowListHead; w; w = w->next) {
+        w->wl.decorations.pressed_button = TITLEBAR_BUTTON_NONE;
+        w->wl.decorations.close.hovered = w->wl.decorations.maximize.hovered = w->wl.decorations.minimize.hovered = false;
+        update_titlebar_height(w);
+        if (csd_change_title(w)) commit_window_surface_if_safe(w);
+    }
 }
 
 GLFWAPI void

@@ -78,11 +78,11 @@
     },
 
     {
-        "name": "sqlite 3.53.2",
+        "name": "sqlite 3.54.0",
         "unix": {
             "file_extension": "tar.gz",
-            "hash": "sha256:588ad51949419a56ebe81fe56193d510c559eb94c9a57748387860b5d3069316",
-            "urls": ["https://www.sqlite.org/2026/{name}-autoconf-3530200.{file_extension}"]
+            "hash": "sha256:134ec0802dda5795816e25d25872d20b312cb3973438c49b30bc40b7705ea9ed",
+            "urls": ["https://www.sqlite.org/2026/{name}-autoconf-3540000.{file_extension}"]
         }
     },
 
@@ -145,10 +145,10 @@
     },
 
     {
-        "name": "python 3.14.8",
+        "name": "python 3.14.10",
         "unix": {
             "file_extension": "tar.xz",
-            "hash": "sha256:c2215904f02b175596dc49351585104f4bc20341e1c47378b26a2c274360ce73",
+            "hash": "sha256:de414a57119abef52784d8993e341d53aed635fc2b05c2607d9f98a2c5b72032",
             "urls": ["https://www.python.org/ftp/python/{version}/Python-{version}.{file_extension}"]
         }
     },
@@ -202,21 +202,21 @@
     },
 
     {
-        "name": "glib 2.88.1",
+        "name": "glib 2.89.0",
         "os": "linux",
         "unix": {
             "file_extension": "tar.xz",
-            "hash": "sha256:51ab804c56f6eab3e5045c774d1290ac5e4c923d4f9a3d8e33123bee45c1840e",
+            "hash": "sha256:205bf5dab175de68f11e33be7bb36d4ad4c5a5097d8c0c88a8682b257b6293dc",
             "urls": ["https://ftp.gnome.org/pub/GNOME/sources/glib/{version_except_last}/{filename}"]
         }
     },
 
     {
-        "name": "libbrotli 1.1.0",
+        "name": "libbrotli 1.1.1",
         "os": "linux",
         "unix": {
             "file_extension": "tar.gz",
-            "hash": "sha256:e720a6ca29428b803f4ad165371771f5398faba397edf6778837a18599ea13ff",
+            "hash": "sha256:1a84dfaa740994d19254bf78aa7d74a4a8040d1638f3d5f2cdecb188fd520da8",
             "urls": ["https://github.com/google/brotli/archive/v{version}/{filename}"]
         }
     },
@@ -232,11 +232,11 @@
     },
 
     {
-        "name": "freetype 2.13.2",
+        "name": "freetype 2.15.0",
         "os": "linux",
         "unix": {
             "file_extension": "tar.xz",
-            "hash": "sha256:12991c4e55c506dd7f9b765933e62fd2be2e06d421505d7950a132e4f1bb484d",
+            "hash": "sha256:93cd47eb719c325107f2d3cf087d06299e944c3b48a40b55537302304dea1dd5",
             "urls": ["https://download.savannah.gnu.org/releases/freetype/{filename}"]
         }
     },
@@ -262,10 +262,10 @@
     },
 
     {
-        "name": "harfbuzz 12.3.0",
+        "name": "harfbuzz 15.0.0",
         "unix": {
             "file_extension": "tar.xz",
-            "hash": "sha256:8660ebd3c27d9407fc8433b5d172bafba5f0317cb0bb4339f28e5370c93d42b7",
+            "hash": "sha256:968536e9abd782f07f7954044c0c4020199fcdd39b41d221ec42d2a3be4a44df",
             "urls": ["https://github.com/harfbuzz/harfbuzz/releases/download/{version}/{filename}"]
         }
     },

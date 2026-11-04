@@ -298,20 +298,63 @@ typedef struct TransparentDynamicColor {
 
 
 #define MARK_MASK (3u)
+// Number of special colors such as the default foreground and background
+// that indexed color images can use, they are the last colors in the
+// 256 color palette available to such images, see graphics-protocol.rst
+#define NUM_INDEXED_IMAGE_SPECIAL_COLORS (8u)
+
+// One bit per entry of the 256 color palette
+typedef uint64_t ColorTableMask[4];
+
+// The background and foreground colors of the marks, entry i is for mark i + 1
+typedef struct MarkColors {
+    DynamicColor bg[MARK_MASK], fg[MARK_MASK];
+} MarkColors;
+
+// A layer of colors. The configured colors of a window are the global layer
+// (kitty.conf and the automatic color theme) with the window layer (launch
+// --color, --copy-colors) on top and the session layer (color schemes from
+// the ssh kitten) on top of that. Colors set by the program running in the
+// window (escape codes or set-colors without --configured) are on top of all.
+typedef struct ColorLayer {
+    // Entries of type COLOR_NOT_SET mean use the value from the layer below
+    DynamicColors dynamic_colors;
+    color_type color_table[256];
+    // Which entries in color_table are set, unused for the global layer, where all entries are set
+    ColorTableMask color_table_mask;
+    TransparentDynamicColor transparent_colors[8];
+    // Whether transparent_colors is set, unused for the global layer
+    bool transparent_colors_set;
+    MarkColors mark_colors;
+} ColorLayer;
 
 typedef struct {
     PyObject_HEAD
 
         bool dirty;
+    // color_table is the current palette and orig_color_table the configured
+    // palette. Entries in color_table that are set by the program are marked
+    // in overridden_color_table_mask, all other entries are the same as in
+    // orig_color_table.
     color_type color_table[256], orig_color_table[256];
+    ColorTableMask overridden_color_table_mask;
     TransparentDynamicColor configured_transparent_colors[8], overriden_transparent_colors[8];
     struct {
         DynamicColors dynamic_colors;
         uint32_t color_table[256];
+        ColorTableMask color_table_mask;
         TransparentDynamicColor transparent_colors[8];
+        MarkColors mark_colors;
     } *color_stack;
     unsigned int color_stack_idx, color_stack_sz;
+    // configured is the global, window and session layers combined. overridden
+    // has entries of type COLOR_NOT_SET for colors not set by the program.
     DynamicColors configured, overridden;
+    ColorLayer global_layer, window_layer, session_layer;
+    // The mark colors set by the program, entries of type COLOR_NOT_SET for colors not set by the program
+    MarkColors overridden_mark_colors;
+    // The current mark colors resolved from the layers and overridden_mark_colors, in
+    // the layout used by the shaders, entry i is for mark i + 1 and the last entry is unused
     color_type mark_foregrounds[MARK_MASK + 1], mark_backgrounds[MARK_MASK + 1];
 } ColorProfile;
 

@@ -22,6 +22,7 @@ import (
 	"github.com/kovidgoyal/dbus/introspect"
 	"github.com/kovidgoyal/dbus/prop"
 	"github.com/kovidgoyal/kitty/tools/utils"
+	"github.com/kovidgoyal/kitty/tools/utils/shlex"
 	"github.com/kovidgoyal/kitty/tools/utils/style"
 	"golang.org/x/sys/unix"
 )
@@ -71,9 +72,14 @@ type Portal struct {
 	file_chooser_first_instance_exited chan struct{}
 }
 
+func color_variant(col style.RGBA) dbus.Variant {
+	return dbus.MakeVariant([]float64{float64(col.Red) / 255., float64(col.Green) / 255., float64(col.Blue) / 255.})
+}
+
 func to_color(spec string) (v dbus.Variant, err error) {
-	if col, err := style.ParseColor(spec); err == nil {
-		return dbus.MakeVariant([]float64{float64(col.Red) / 255., float64(col.Green) / 255., float64(col.Blue) / 255.}), nil
+	col, err := style.ParseColor(spec)
+	if err == nil {
+		v = color_variant(col)
 	}
 	return
 }
@@ -94,7 +100,7 @@ func NewPortal(opts *Config, server_options *ServerOptions) (p *Portal, err erro
 	default:
 		ans.settings[PORTAL_APPEARANCE_NAMESPACE][PORTAL_COLOR_SCHEME_KEY] = dbus.MakeVariant(uint32(NO_PREFERENCE))
 	}
-	ans.settings[PORTAL_APPEARANCE_NAMESPACE][PORTAL_ACCENT_COLOR_KEY], err = to_color(opts.Accent_color)
+	ans.settings[PORTAL_APPEARANCE_NAMESPACE][PORTAL_ACCENT_COLOR_KEY] = color_variant(opts.Accent_color)
 	var contrast uint32
 	if opts.Contrast == Contrast_high {
 		contrast = 1
@@ -390,6 +396,23 @@ func patch_portals_conf(text []byte) []byte {
 	return utils.UnsafeStringToBytes(strings.Join(lines, "\n"))
 }
 
+// dbus_service_exec_line returns the value for the Exec key of a D-Bus
+// .service file. D-Bus first unescapes the value (\\, \n, \t) and then
+// parses it as a shell-style command line.
+func dbus_service_exec_line(argv ...string) (string, error) {
+	quoted := make([]string, len(argv))
+	for i, arg := range argv {
+		// D-Bus decodes \r as a newline and rejects files with a raw CR
+		if strings.ContainsRune(arg, '\r') {
+			return "", fmt.Errorf("cannot use %#v in a D-Bus service file as it contains a carriage return", arg)
+		}
+		quoted[i] = dbus_service_value_escaper.Replace(shlex.Quote(arg))
+	}
+	return strings.Join(quoted, " "), nil
+}
+
+var dbus_service_value_escaper = strings.NewReplacer(`\`, `\\`, "\n", `\n`, "\t", `\t`)
+
 func enable_portal() (err error) {
 	if len(WritableDataDirs()) == 0 {
 		return fmt.Errorf("Could not find any writable data directories. Make sure XDG_DATA_DIRS is set and contains at least one directory for which you have write permission")
@@ -429,16 +452,22 @@ Interfaces=%s;
 	dbus_service_defn := filepath.Join(dbus_service_dir, PORTAL_BUS_NAME+".service")
 	exe_path, eerr := os.Executable()
 	if eerr != nil {
-		exe_path = utils.Which("kitten")
+		if exe_path = utils.Which("kitten"); exe_path == "" {
+			return fmt.Errorf("failed to get path to kitten executable with error: %w", eerr)
+		}
 	}
-	if exe_path, err = filepath.Abs(exe_path); eerr != nil {
+	if exe_path, err = filepath.Abs(exe_path); err != nil {
 		return fmt.Errorf("failed to get path to kitten executable with error: %w", err)
+	}
+	exec_line, err := dbus_service_exec_line(exe_path, "desktop-ui", "run-server")
+	if err != nil {
+		return err
 	}
 	if err = os.WriteFile(dbus_service_defn, utils.UnsafeStringToBytes(fmt.Sprintf(
 		`[D-BUS Service]
 Name=%s
-Exec=%s desktop-ui run-server
-`, PORTAL_BUS_NAME, exe_path)), 0o644); err != nil {
+Exec=%s
+`, PORTAL_BUS_NAME, exec_line)), 0o644); err != nil {
 		return err
 	}
 	fmt.Println("Wrote kitty DBUS activation service file to:", dbus_service_defn)

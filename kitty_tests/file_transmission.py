@@ -340,6 +340,56 @@ class TestFileTransmission(BaseTest):
         self.assertPathEqual(os.path.dirname(tf.name), base)
         os.remove(tf.name)
 
+    def test_file_put_existing_directory(self):
+        def start_receiving():
+            ft = FileTransmission()
+            ft.handle_serialized_command(serialized_cmd(action='send'))
+            ft.test_responses = []
+            return ft
+
+        def statuses(ft):
+            return [r['status'] for r in ft.test_responses if r.get('action') == 'status']
+
+        base = os.path.join(self.tdir, 'existing')
+        dest_dir = os.path.join(base, 'dir')
+        os.makedirs(os.path.join(dest_dir, 'child'))
+        dir_link = os.path.join(base, 'dir_link')
+        os.symlink(dest_dir, dir_link)
+
+        # a regular file must not replace an existing directory or a symlink
+        # to one, and data sent for it must be silently discarded
+        for dest in (dest_dir, dir_link):
+            ft = start_receiving()
+            ft.handle_serialized_command(serialized_cmd(action='file', file_id='f', name=dest, ftype='regular'))
+            ft.handle_serialized_command(serialized_cmd(action='end_data', file_id='f', data='xyz'))
+            self.ae(statuses(ft), [f'EISDIR:Cannot replace the existing directory {dest} with a file'])
+            self.assertTrue(os.path.isdir(dest))
+        self.assertTrue(os.path.islink(dir_link))
+        self.ae(set(names_in(dest_dir)), {'child'})
+
+        # a symlink must not replace an existing directory
+        ft = start_receiving()
+        ft.handle_serialized_command(serialized_cmd(action='file', file_id='s', name=dest_dir, ftype='symlink'))
+        self.ae(statuses(ft), [f'EISDIR:Cannot replace the existing directory {dest_dir} with a file'])
+        self.assertTrue(os.path.isdir(dest_dir))
+
+        # but it may replace a symlink to a directory
+        ft = start_receiving()
+        ft.handle_serialized_command(serialized_cmd(action='file', file_id='s', name=dir_link, ftype='symlink'))
+        ft.handle_serialized_command(serialized_cmd(action='end_data', file_id='s', data='path:elsewhere'))
+        self.ae(statuses(ft)[-1], 'OK')
+        self.ae(os.readlink(dir_link), 'elsewhere')
+
+        # failure to create parent directories gives a clear error
+        blocker = os.path.join(base, 'blocker')
+        with open(blocker, 'w'):
+            pass
+        dest = os.path.join(blocker, 'sub', 'f')
+        ft = start_receiving()
+        ft.handle_serialized_command(serialized_cmd(action='file', file_id='f', name=dest, ftype='regular'))
+        ft.handle_serialized_command(serialized_cmd(action='end_data', file_id='f', data='xyz'))
+        self.ae(statuses(ft), ['STARTED', f'ENOTDIR:Failed to create the directory {os.path.dirname(dest)}: Not a directory'])
+
     def test_file_get(self):
         # send refusal
         for quiet in (0, 1, 2):
@@ -517,6 +567,28 @@ class TestFileTransmission(BaseTest):
         single_file('--compress=always')
         single_file('--transmit-deltas', '--compress=never')
 
+        def empty_file(*cmd, existing_dest_data=None):
+            esrc = os.path.join(self.tdir, 'esrc')
+            edest = os.path.join(self.tdir, 'edest')
+            open(esrc, 'wb').close()
+            if existing_dest_data is None:
+                if os.path.exists(edest):
+                    os.remove(edest)
+            else:
+                with open(edest, 'wb') as d:
+                    d.write(existing_dest_data)
+            with self.run_kitten(list(cmd) + [esrc, edest]) as pty:
+                pty.wait_till_child_exits(require_exit_code=0)
+            self.assertTrue(os.path.isfile(edest), f'{edest} was not created by: {cmd}')
+            self.ae(os.path.getsize(edest), 0, f'{edest} is not empty after: {cmd}')
+
+        empty_file()
+        # an existing destination must be truncated
+        empty_file(existing_dest_data=b'stale')
+        # an existing destination larger than the signature threshold causes an rsync transfer
+        empty_file('--transmit-deltas', existing_dest_data=os.urandom(8192))
+        empty_file('--transmit-deltas')
+
         def multiple_files(*cmd):
             src = os.path.join(self.tdir, 'msrc')
             dest = os.path.join(self.tdir, 'mdest')
@@ -549,6 +621,10 @@ class TestFileTransmission(BaseTest):
             se(str(b / 'hardlink'))
             os.mkdir(b / 'empty')
             se(str(b / 'empty'))
+            with open(b / 'emptyfile', 'wb') as f:
+                os.fchmod(f.fileno(), 0o640)
+            os.utime(f.name, (2345.6, 2345.6))
+            se(f.name)
             s = b / 'sub'
             os.mkdir(s)
             with open(s / 'reg', 'wb') as f:
@@ -620,6 +696,36 @@ class TestFileTransmission(BaseTest):
         os.remove(os.path.join(dest, 'src'))
         os.remove(os.path.join(dest, 'sym'))
         shutil.rmtree(os.path.join(dest, 'sub'))
+
+    def test_transfer_receive_existing_links(self):
+        self.direction_receive = True
+        for link in (os.symlink, os.link):
+            for args in ([], ['--compress=always'], ['--transmit-deltas']):
+                for data in (b'', b'incoming contents' * 1024):
+                    with self.subTest(link=link.__name__, args=args, size=len(data)):
+                        self.clean_tdir()
+                        base = Path(self.tdir)
+                        src = base / 'source'
+                        src.write_bytes(data)
+                        src.chmod(0o644)
+                        target = base / 'unrelated'
+                        original = b'keep these contents' * 1024
+                        target.write_bytes(original)
+                        target.chmod(0o600)
+                        before = target.stat()
+                        dest = base / 'downloads' / 'received'
+                        dest.parent.mkdir()
+                        link(target, dest)
+                        with self.run_kitten([*args, str(src), str(dest)]) as pty:
+                            pty.wait_till_child_exits(require_exit_code=0)
+                        self.assertFalse(dest.is_symlink())
+                        self.assertFalse(os.path.samefile(target, dest))
+                        self.ae(dest.read_bytes(), data)
+                        self.ae(stat.S_IMODE(dest.stat().st_mode), 0o644)
+                        self.ae(target.read_bytes(), original)
+                        self.ae(target.stat().st_mtime_ns, before.st_mtime_ns)
+                        self.ae(stat.S_IMODE(target.stat().st_mode), 0o600)
+                        self.ae(os.listdir(dest.parent), ['received'])
 
     def test_transfer_receive(self):
         self.direction_receive = True

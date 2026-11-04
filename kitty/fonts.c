@@ -644,6 +644,9 @@ init_font(Font *f, PyObject *face, bool bold, bool italic, bool emoji_presentati
 static void
 free_font_groups(void) {
     if (font_groups) {
+        // Clear dangling pointers into font_groups, otherwise the next call to
+        // save_window_font_groups() would read freed memory
+        for (size_t o = 0; o < global_state.num_os_windows; o++) global_state.os_windows[o].fonts_data = NULL;
         for (size_t i = 0; i < num_font_groups; i++) del_font_group(font_groups + i);
         free(font_groups);
         font_groups = NULL;
@@ -1287,6 +1290,8 @@ render_box_cell(FontGroup *fg, RunFont rf, CPUCell *cpu_cell, GPUCell *gpu_cell,
         return;
     }
     FontCellMetrics unscaled_metrics = fg->fcm;
+    // must be calculated before apply_scale_to_font_group() as it changes fg->font_sz_in_pts
+    const double line_scale = line_thickness_scale_for_font_size((FONTS_DATA_HANDLE)fg);
     float scale = apply_scale_to_font_group(fg, &rf);
     ensure_canvas_can_fit(fg, num_glyphs + 1, rf.scale);
     FontCellMetrics scaled_metrics = fg->fcm;
@@ -1305,7 +1310,7 @@ render_box_cell(FontGroup *fg, RunFont rf, CPUCell *cpu_cell, GPUCell *gpu_cell,
     for (unsigned i = 0, cnum = 0; i < num_glyphs; i++) {
         unsigned int ch = global_glyph_render_scratch.lc->chars[cnum++];
         while (!ch) ch = global_glyph_render_scratch.lc->chars[cnum++];
-        render_box_char(ch, fg->canvas.alpha_mask, src.right, src.bottom, fg->logical_dpi_x, fg->logical_dpi_y, scale);
+        render_box_char(ch, fg->canvas.alpha_mask, src.right, src.bottom, fg->logical_dpi_x, fg->logical_dpi_y, scale * line_scale);
         dest.left = i * scaled_metrics.cell_width + right_shift;
         dest.right = dest.left + scaled_metrics.cell_width;
         render_alpha_mask(fg->canvas.alpha_mask, fg->canvas.buf, &src, &dest, src.right, mask_stride, 0xffffff);
@@ -2523,9 +2528,10 @@ send_prerendered_sprites(FontGroup *fg) {
     // BEAM_IDX in shader.c and STRIKE_SPRITE_INDEX in
     // shaders.py and MISSING_GLYPH in font.c and dec_idx above
     do_one(add_missing_glyph(alpha_mask, fg->fcm));
-    do_one(add_beam_cursor(alpha_mask, fg->fcm, fg->logical_dpi_x));
-    do_one(add_underline_cursor(alpha_mask, fg->fcm, fg->logical_dpi_y));
-    do_one(add_hollow_cursor(alpha_mask, fg->fcm, fg->logical_dpi_x, fg->logical_dpi_y));
+    const double line_scale = line_thickness_scale_for_font_size((FONTS_DATA_HANDLE)fg);
+    do_one(add_beam_cursor(alpha_mask, fg->fcm, fg->logical_dpi_x, line_scale));
+    do_one(add_underline_cursor(alpha_mask, fg->fcm, fg->logical_dpi_y, line_scale));
+    do_one(add_hollow_cursor(alpha_mask, fg->fcm, fg->logical_dpi_x, fg->logical_dpi_y, line_scale));
     RunFont rf = {.scale = 1};
     Region rg = {.bottom = fg->fcm.cell_height, .right = fg->fcm.cell_width};
     sprite_index actual_dec_idx = index_for_decorations(fg, rf, rg, rg, fg->fcm).start_idx;
@@ -2829,9 +2835,9 @@ render_decoration(PyObject *self UNUSED, PyObject *args) {
     u(straight);
     else if (strcmp(which, "strikethrough") == 0) add_strikethrough((uint8_t *)PyBytes_AS_STRING(ans), fcm);
     else if (strcmp(which, "missing") == 0) add_missing_glyph((uint8_t *)PyBytes_AS_STRING(ans), fcm);
-    else if (strcmp(which, "beam_cursor") == 0) add_beam_cursor((uint8_t *)PyBytes_AS_STRING(ans), fcm, dpi);
-    else if (strcmp(which, "underline_cursor") == 0) add_underline_cursor((uint8_t *)PyBytes_AS_STRING(ans), fcm, dpi);
-    else if (strcmp(which, "hollow_cursor") == 0) add_hollow_cursor((uint8_t *)PyBytes_AS_STRING(ans), fcm, dpi, dpi); else {
+    else if (strcmp(which, "beam_cursor") == 0) add_beam_cursor((uint8_t *)PyBytes_AS_STRING(ans), fcm, dpi, 1.0);
+    else if (strcmp(which, "underline_cursor") == 0) add_underline_cursor((uint8_t *)PyBytes_AS_STRING(ans), fcm, dpi, 1.0);
+    else if (strcmp(which, "hollow_cursor") == 0) add_hollow_cursor((uint8_t *)PyBytes_AS_STRING(ans), fcm, dpi, dpi, 1.0); else {
         Py_CLEAR(ans);
         PyErr_Format(PyExc_KeyError, "Unknown decoration type: %s", which);
     }

@@ -211,8 +211,8 @@ typedef struct {
         monotonic_t expires_at;
         Cursor cursor;
         ColorProfile color_profile;
-        bool inverted, cell_data_updated, cursor_visible;
-        unsigned int scrolled_by;
+        bool inverted, cell_data_updated, cursor_visible, pixel_scroll;
+        unsigned int scrolled_by, pixel_scroll_offset_y;
         LineBuf *linebuf;
         GraphicsManager *grman;
         Selections selections, url_ranges;
@@ -237,7 +237,11 @@ typedef struct {
     } dnd_chunking;
 } Screen;
 
-#define pixel_scroll_enabled(screen) (OPT(pixel_scroll) && !screen->paused_rendering.expires_at && screen->linebuf == screen->main_linebuf)
+#define live_pixel_scroll_enabled(screen) (OPT(pixel_scroll) && (screen)->linebuf == (screen)->main_linebuf)
+// While rendering is paused the pixel scroll state captured at pause time is used so that pausing does not change what is rendered
+#define pixel_scroll_enabled(screen) ((screen)->paused_rendering.expires_at ? (screen)->paused_rendering.pixel_scroll : live_pixel_scroll_enabled(screen))
+#define rendered_pixel_scroll_offset_y(screen) \
+    ((screen)->paused_rendering.expires_at ? (screen)->paused_rendering.pixel_scroll_offset_y : (screen)->pixel_scroll_offset_y)
 #define render_lines_for_screen(screen) (screen->lines + pixel_scroll_enabled(screen))
 
 void screen_align(Screen *);
@@ -360,7 +364,7 @@ void screen_pop_key_encoding_flags(Screen *self, uint32_t num);
 uint8_t screen_current_key_encoding_flags(Screen *self);
 void screen_modify_other_keys(Screen *self, unsigned, unsigned);
 void screen_report_key_encoding_flags(Screen *self);
-int screen_detect_url(Screen *screen, unsigned int x, unsigned int y);
+int screen_detect_url(Screen *screen, unsigned int x, unsigned int y, bool mark);
 int screen_cursor_at_a_shell_prompt(const Screen *);
 bool screen_prompt_supports_click_events(const Screen *, bool *is_relative);
 bool screen_fake_move_cursor_to_position(Screen *, index_type x, index_type y);

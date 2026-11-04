@@ -71,6 +71,8 @@ func TestHintMarking(t *testing.T) {
 	r("http://example.com.", "http://example.com")
 	r("http://example.com!", "http://example.com")
 	r("http://example.com?", "http://example.com")
+	r("“"+u+"”", u)
+	r("‘"+u+"’", u)
 
 	opts.Type = "linenum"
 	m := func(text, path string, line int) {
@@ -98,6 +100,16 @@ func TestHintMarking(t *testing.T) {
 	r("file.epub.", "file.epub")
 	r("(file.epub)", "file.epub")
 	r("some/path", "some/path")
+	r("“some/path”", "some/path")
+	r("Saving to: ‘index.html’", "index.html")
+	// a match consisting of only a quote must not result in start > end
+	for _, text := range []string{`"`, `'`, `""`, "“”", "“"} {
+		for _, name := range []string{"quotes", "brackets"} {
+			if s, e := PostProcessorMap()[name](text, 0, len(text)); s > e {
+				t.Fatalf("%s post processor returned start (%d) > end (%d) for %#v", name, s, e, text)
+			}
+		}
+	}
 	// long lines without spaces must not cause quadratic backtracking
 	long_line := strings.Repeat("1,", 20000)
 	r(long_line)

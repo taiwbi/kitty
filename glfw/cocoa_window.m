@@ -621,6 +621,8 @@ static const NSRange kEmptyRange = {NSNotFound, 0};
 static void update_titlebar_button_visibility_after_fullscreen_transition(_GLFWwindow *, bool, bool);
 static void _glfwUpdateNotchCover(_GLFWwindow *);
 
+static void flush_focus_loss_text(_GLFWwindow *window);
+
 @implementation GLFWWindowDelegate
 
 - (instancetype)initWithGlfwWindow:(_GLFWwindow *)initWindow {
@@ -739,6 +741,8 @@ static void _glfwUpdateNotchCover(_GLFWwindow *);
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
     (void)notification;
+    // Commit any pre-edit text still pending from the last focus loss before new input arrives
+    flush_focus_loss_text(window);
     if (_glfw.ns.disabledCursorWindow == window) _glfwCenterCursorInContentArea(window);
 
     _glfwInputWindowFocus(window, true);
@@ -908,6 +912,9 @@ static void _glfwUpdateNotchCover(_GLFWwindow *);
     NSRange markedTextSelectedRange;
     NSRect markedRect;
     bool marked_text_cleared_by_insert;
+    bool committing_marked_text, marked_text_committed_by_ime;
+    NSString *focus_loss_text;
+    bool focus_loss_text_sent;
     int in_key_handler;
     NSString *input_source_at_last_key_event;
     GLFWDraggingSource *dragging_source;
@@ -966,6 +973,7 @@ static void _glfwUpdateNotchCover(_GLFWwindow *);
 - (void)dealloc {
     [trackingArea release];
     [markedText release];
+    [focus_loss_text release];
     [dragging_source release];
     if (input_source_at_last_key_event) [input_source_at_last_key_event release];
     [input_context release];
@@ -973,6 +981,7 @@ static void _glfwUpdateNotchCover(_GLFWwindow *);
 }
 
 - (void)removeGLFWWindow {
+    [self clearFocusLossText];
     window = NULL;
 }
 
@@ -2052,6 +2061,7 @@ glfwCocoaPreserveDroppedFilePromises(GLFWwindow *w) {
 }
 
 - (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange {
+    if (committing_marked_text) return;
     const char *s = polymorphic_string_as_utf8(string);
     debug_input(
         "\n\tsetMarkedText: %s selectedRange: (%lu, %lu) replacementRange: (%lu, %lu)\n",
@@ -2101,18 +2111,78 @@ glfwCocoaPreserveDroppedFilePromises(GLFWwindow *w) {
     markedTextSelectedRange = kEmptyRange;
 }
 
+static void
+flush_focus_loss_text(_GLFWwindow *window) {
+    [(GLFWContentView *)window->ns.view flushFocusLossText];
+}
+
 void
 _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     [w->ns.view updateIMEStateFor:ev->type focused:(bool)ev->focused];
 }
 
-- (void)updateIMEStateFor:(GLFWIMEUpdateType)which focused:(bool)focused {
-    if (which == GLFW_IME_UPDATE_FOCUS && !focused && [self hasMarkedText] && window) {
-        [input_context discardMarkedText];
-        [self unmarkText];
-        GLFWkeyevent glfw_keyevent = {.ime_state = GLFW_IME_PREEDIT_CHANGED};
+- (void)commitMarkedText {
+    NSString *text = [[[markedText string] copy] autorelease];
+    [self unmarkText];
+    // Reset the input method. Some input methods, such as dictation, respond
+    // by calling insertText with their final result, use it if they do.
+    committing_marked_text = true;
+    marked_text_committed_by_ime = false;
+    [self clearFocusLossText];
+    [input_context discardMarkedText];
+    committing_marked_text = false;
+    if (!window || marked_text_committed_by_ime) return;
+    // Other input methods may deliver their final result asynchronously, so
+    // wait briefly for it before committing the pre-edit text.
+    debug_input("Waiting for IME result before committing pre-edit text on focus loss: %s\n", [text UTF8String]);
+    focus_loss_text = [text retain];
+    focus_loss_text_sent = false;
+    [self performSelector:@selector(sendFocusLossText) withObject:nil afterDelay:0.2];
+}
+
+- (void)sendFocusLossText {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sendFocusLossText) object:nil];
+    if (!focus_loss_text || focus_loss_text_sent) return;
+    focus_loss_text_sent = true;
+    if (window) {
+        debug_input("Committing pre-edit text on focus loss: %s\n", [focus_loss_text UTF8String]);
+        GLFWkeyevent glfw_keyevent = {.text = [focus_loss_text UTF8String], .ime_state = GLFW_IME_COMMIT_TEXT};
         _glfwInputKeyboard(window, &glfw_keyevent);
         _glfw.ns.text[0] = 0;
+    }
+    // Remember the committed text for a while, to de-duplicate a result the
+    // input method delivers even later
+    [self performSelector:@selector(clearFocusLossText) withObject:nil afterDelay:2.0];
+}
+
+- (void)clearFocusLossText {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sendFocusLossText) object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(clearFocusLossText) object:nil];
+    [focus_loss_text release];
+    focus_loss_text = nil;
+}
+
+- (void)flushFocusLossText {
+    if (!focus_loss_text) return;
+    [self sendFocusLossText];
+    [self clearFocusLossText];
+}
+
+- (void)updateIMEStateFor:(GLFWIMEUpdateType)which focused:(bool)focused {
+    if (which == GLFW_IME_UPDATE_FOCUS && !focused && [self hasMarkedText] && window) {
+        if (!_glfwPlatformWindowFocused(window)) {
+            // The OS window lost focus, commit the pre-edit text as native
+            // macOS applications do, so that it is not lost
+            [self commitMarkedText];
+        } else {
+            // Focus moved to another kitty window or the window is being
+            // closed, cancel the composition
+            [input_context discardMarkedText];
+            [self unmarkText];
+            GLFWkeyevent glfw_keyevent = {.ime_state = GLFW_IME_PREEDIT_CHANGED};
+            _glfwInputKeyboard(window, &glfw_keyevent);
+            _glfw.ns.text[0] = 0;
+        }
     }
     if (which != GLFW_IME_UPDATE_CURSOR_POSITION) return;
 
@@ -2179,6 +2249,22 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     }
     const char *utf8 = polymorphic_string_as_utf8(string);
     debug_input("\n\tinsertText: %s replacementRange: (%lu, %lu)\n", utf8, replacementRange.location, replacementRange.length);
+    if (focus_loss_text && !in_key_handler && !committing_marked_text) {
+        // The input method delivered its result after the OS window lost focus
+        NSString *text = [string isKindOfClass:[NSAttributedString class]] ? [(NSAttributedString *)string string] : (NSString *)string;
+        if (focus_loss_text_sent) {
+            if ([text isEqualToString:focus_loss_text]) {
+                debug_input("Ignoring IME result identical to pre-edit text already committed on focus loss\n");
+                [self clearFocusLossText];
+                return;
+            }
+            if ([text hasPrefix:focus_loss_text]) {
+                utf8 = [[text substringFromIndex:[focus_loss_text length]] UTF8String];
+                debug_input("Sending only the part of the IME result not already committed on focus loss: %s\n", utf8);
+            }
+        } else debug_input("Using IME result instead of pre-edit text on focus loss\n");
+        [self clearFocusLossText];
+    }
     if ([self hasMarkedText] && !is_ascii_control_char(utf8[0])) {
         [self unmarkText];
         marked_text_cleared_by_insert = true;
@@ -2192,11 +2278,12 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     // Outside key handling there is no key event to accumulate text for. This
     // path already commits immediately, so do not constrain a full IME result
     // to the fixed-size buffer used by the key handlers.
-    if (!in_key_handler) {
+    if (!in_key_handler || committing_marked_text) {
         if (!is_ascii_control_char(utf8[0])) {
             debug_input("Sending text to kitty from insertText called from event loop: %s\n", utf8);
             GLFWkeyevent glfw_keyevent = {.text = utf8, .ime_state = GLFW_IME_COMMIT_TEXT};
             _glfwInputKeyboard(window, &glfw_keyevent);
+            if (committing_marked_text) marked_text_committed_by_ime = true;
         }
         _glfw.ns.text[0] = 0;
         return;
@@ -2417,7 +2504,10 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
 
 - (void)removeGLFWWindow {
     glfw_window = NULL;
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    // Remove only our own observation, a blanket removeObserver: would also
+    // remove any observations Cocoa has registered with this window as the
+    // observer.
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:NSApplicationDidChangeScreenParametersNotification object:nil];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
@@ -2451,6 +2541,10 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
 }
 
 - (BOOL)canBecomeMainWindow {
+    // Cocoa can send this to a window that has already been destroyed, for
+    // instance while the exit full screen transition started by -close is
+    // still running.
+    if (!glfw_window) return NO;
     return !glfw_window->ns.layer_shell.is_active || glfw_window->ns.layer_shell.config.type != GLFW_LAYER_SHELL_BACKGROUND;
 }
 
@@ -2495,7 +2589,7 @@ update_titlebar_button_visibility_after_fullscreen_transition(_GLFWwindow *w, bo
     // When the window decoration is hidden, toggling fullscreen causes the style mask to be changed,
     // and causes the first responder to be cleared.
     if (glfw_window && !glfw_window->decorated && glfw_window->ns.view) [self makeFirstResponder:glfw_window->ns.view];
-    update_titlebar_button_visibility_after_fullscreen_transition(glfw_window, false, !is_fullscreen_already);
+    if (glfw_window) update_titlebar_button_visibility_after_fullscreen_transition(glfw_window, false, !is_fullscreen_already);
 }
 
 - (void)zoom:(id)sender {
@@ -2672,12 +2766,17 @@ _glfwPlatformDestroyWindow(_GLFWwindow *window) {
     // Workaround for macOS Tahoe where if the frame is not set to zero size
     // even after NSWindow::close the window remains on screen as an invisible
     // rectangle that intercepts mouse events and takes up space in mission
-    // control. Sigh.
-    NSRect frame = w.frame;
-    frame.size.width = 0;
-    frame.size.height = 0;
-    [w setFrame:frame display:NO];
-    [w setHasShadow:NO];
+    // control. Sigh. Not done for full screen windows as there -close starts
+    // the exit full screen transition which restores the pre-full screen frame
+    // anyway, and feeding a degenerate frame to that transition is asking for
+    // trouble.
+    if (!([w styleMask] & NSWindowStyleMaskFullScreen)) {
+        NSRect frame = w.frame;
+        frame.size.width = 0;
+        frame.size.height = 0;
+        [w setFrame:frame display:NO];
+        [w setHasShadow:NO];
+    }
     [w close]; // sends a release to NSWindow so we dont release it
     window->ns.object = nil;
 }

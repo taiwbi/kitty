@@ -6,8 +6,9 @@ import os
 import re
 import tempfile
 from base64 import standard_b64encode
+from unittest.mock import patch
 
-from kitty.notifications import Channel, DesktopIntegration, IconDataCache, NotificationManager, UIState, Urgency
+from kitty.notifications import Channel, DesktopIntegration, FreeDesktopIntegration, IconDataCache, NotificationManager, UIState, Urgency
 
 from .base import BaseTest
 
@@ -362,3 +363,126 @@ class TestNotifications(BaseTest):
     def test_desktop_notify(self):
         with tempfile.TemporaryDirectory() as tdir:
             do_test(self, tdir)
+
+    def test_freedesktop_close_before_created(self):
+        import kitty.fast_data_types as fdt
+
+        sent: list[int] = []
+        closed: list[int] = []
+        replaces: list[object] = []
+
+        def send_notification(**kw: object) -> int:
+            replaces.append(kw['replaces'])
+            sent.append(len(sent) + 1)
+            return sent[-1]
+
+        def close_notification(dbus_id: int) -> bool:
+            closed.append(dbus_id)
+            return True
+
+        with (
+            tempfile.TemporaryDirectory() as tdir,
+            patch.multiple(
+                fdt,
+                create=True,
+                dbus_set_notification_callback=lambda *a: None,
+                dbus_send_notification=send_notification,
+                dbus_close_notification=close_notification,
+            ),
+        ):
+            di = FreeDesktopIntegration(None)
+            ch = Channel()
+            nm = NotificationManager(di, ch, lambda *a, **kw: None, base_cache_dir=tdir)
+            di.notification_manager = nm
+
+            # close requested before the notification daemon replies to Notify
+            nm.handle_notification_cmd(1, 99, 'i=x:c=1;title')
+            nm.handle_notification_cmd(1, 99, 'i=x:p=close;')
+            self.ae(closed, [])
+            self.assertIn('x', nm.in_progress_notification_commands_by_client_id)
+            self.ae(ch.responses, [])
+            di.dispatch_event_from_desktop('created', sent[-1], 101)
+            self.ae(closed, [101])
+            di.dispatch_event_from_desktop('closed', 101, 0)
+            self.assertNotIn('x', nm.in_progress_notification_commands_by_client_id)
+            self.ae(ch.responses, ['99;i=x:p=close;'])
+            self.ae(di.pending_closes, set())
+
+            # replacement sent before the notification being replaced is created
+            closed.clear(), ch.reset()
+            nm.handle_notification_cmd(1, 99, 'i=r;first')
+            first = sent[-1]
+            nm.handle_notification_cmd(1, 99, 'i=r;second')
+            second = sent[-1]
+            self.ae(nm.in_progress_notification_commands_by_client_id['r'].title, 'second')
+            di.dispatch_event_from_desktop('created', first, 201)
+            self.ae(closed, [201])
+            di.dispatch_event_from_desktop('closed', 201, 0)
+            di.dispatch_event_from_desktop('created', second, 202)
+            self.ae(closed, [201])
+            self.ae(nm.in_progress_notification_commands_by_client_id['r'].title, 'second')
+            self.ae(ch.responses, [])
+            nm.handle_notification_cmd(1, 99, 'i=r;third')
+            self.ae(closed, [201])  # replaced via the replaces argument to Notify, not closed
+            self.ae(replaces[-3:], [0, 0, 202])
+
+            # normal close after creation
+            closed.clear(), ch.reset()
+            nm.handle_notification_cmd(1, 99, 'i=y;title')
+            di.dispatch_event_from_desktop('created', sent[-1], 102)
+            self.ae(closed, [])
+            nm.handle_notification_cmd(1, 99, 'i=y:p=close;')
+            self.ae(closed, [102])
+
+    def test_freedesktop_desktop_entry(self):
+        import kitty.fast_data_types as fdt
+        from kitty.xdg import desktop_file_id_for_appname, kitty_desktop_entry, xdg_data_dirs, xdg_data_home
+
+        desktop_entries: list[object] = []
+
+        def send_notification(**kw: object) -> int:
+            desktop_entries.append(kw['desktop_entry'])
+            return len(desktop_entries)
+
+        kitty_desktop_entry.set_override('net.kovidgoyal.kitty')
+        try:
+            with (
+                tempfile.TemporaryDirectory() as tdir,
+                patch.multiple(
+                    fdt,
+                    create=True,
+                    dbus_set_notification_callback=lambda *a: None,
+                    dbus_send_notification=send_notification,
+                    dbus_close_notification=lambda *a: True,
+                ),
+            ):
+                di = FreeDesktopIntegration(None)
+                nm = NotificationManager(di, Channel(), lambda *a, **kw: None, base_cache_dir=tdir)
+                di.notification_manager = nm
+                nm.handle_notification_cmd(1, 99, 'i=a;title')
+                nm.handle_notification_cmd(1, 99, f'i=b:f={standard_b64encode(b"kitty").decode()};title')
+                nm.handle_notification_cmd(1, 99, f'i=c:f={standard_b64encode(b"nvim").decode()};title')
+                self.ae(desktop_entries, ['net.kovidgoyal.kitty', 'net.kovidgoyal.kitty', ''])
+        finally:
+            kitty_desktop_entry.clear_override()
+
+        with tempfile.TemporaryDirectory() as tdir:
+            home, sysdir = os.path.join(tdir, 'home'), os.path.join(tdir, 'sys')
+            for x in (os.path.join(home, 'applications', 'sub'), os.path.join(sysdir, 'applications')):
+                os.makedirs(x)
+
+            def touch(*parts: str) -> None:
+                open(os.path.join(*parts), 'w').close()
+
+            xdg_data_home.set_override(home)
+            xdg_data_dirs.set_override((sysdir,))
+            try:
+                self.ae(desktop_file_id_for_appname('kitty'), '')
+                touch(sysdir, 'applications', 'other.desktop')
+                touch(home, 'applications', 'sub', 'net.kovidgoyal.kitty.desktop')
+                self.ae(desktop_file_id_for_appname('kitty'), 'sub-net.kovidgoyal.kitty')
+                touch(sysdir, 'applications', 'kitty.desktop')
+                self.ae(desktop_file_id_for_appname('kitty'), 'kitty')
+            finally:
+                xdg_data_home.clear_override()
+                xdg_data_dirs.clear_override()

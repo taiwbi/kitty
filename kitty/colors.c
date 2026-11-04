@@ -17,6 +17,26 @@
 static const color_type NULL_COLOR_VALUE = 0xffffffff;
 static const color_type GENERATED_COLOR_MASK = 0xff000000;
 
+// The layer of colors to change in patch_color_profiles()
+typedef enum ColorLayerType { COLOR_LAYER_OVERRIDE = 0, COLOR_LAYER_GLOBAL = 1, COLOR_LAYER_WINDOW = 2, COLOR_LAYER_SESSION = 3 } ColorLayerType;
+
+static inline bool
+mask_test(const ColorTableMask m, unsigned i) {
+    return (m[i >> 6] >> (i & 63)) & 1;
+}
+static inline void
+mask_set(ColorTableMask m, unsigned i) {
+    m[i >> 6] |= (uint64_t)1 << (i & 63);
+}
+static inline void
+mask_clear(ColorTableMask m, unsigned i) {
+    m[i >> 6] &= ~((uint64_t)1 << (i & 63));
+}
+static inline bool
+mask_is_empty(const ColorTableMask m) {
+    return !(m[0] | m[1] | m[2] | m[3]);
+}
+
 static uint32_t FG_BG_256[256] = {
     0x000000, // 0
     0xcd0000, // 1
@@ -88,16 +108,16 @@ set_configured_colors(ColorProfile *self, PyObject *opts) {
         RAII_PyObject(t, PyObject_GetAttrString(opts, #attr));                            \
         if (t == NULL) return false;                                                      \
         if (t == Py_None) {                                                               \
-            self->configured.which.rgb = 0;                                               \
-            self->configured.which.type = COLOR_IS_SPECIAL;                               \
+            self->global_layer.dynamic_colors.which.rgb = 0;                              \
+            self->global_layer.dynamic_colors.which.type = COLOR_IS_SPECIAL;              \
         } else if (PyLong_Check(t)) {                                                     \
             unsigned int x = PyLong_AsUnsignedLong(t);                                    \
-            self->configured.which.rgb = x & 0xffffff;                                    \
-            self->configured.which.type = COLOR_IS_RGB;                                   \
+            self->global_layer.dynamic_colors.which.rgb = x & 0xffffff;                   \
+            self->global_layer.dynamic_colors.which.type = COLOR_IS_RGB;                  \
         } else if (PyObject_TypeCheck(t, &Color_Type)) {                                  \
             Color *c = (Color *)t;                                                        \
-            self->configured.which.rgb = c->color.rgb;                                    \
-            self->configured.which.type = COLOR_IS_RGB;                                   \
+            self->global_layer.dynamic_colors.which.rgb = c->color.rgb;                   \
+            self->global_layer.dynamic_colors.which.type = COLOR_IS_RGB;                  \
         } else {                                                                          \
             PyErr_SetString(PyExc_TypeError, "colors must be integers or Color objects"); \
             return false;                                                                 \
@@ -117,14 +137,14 @@ set_configured_colors(ColorProfile *self, PyObject *opts) {
         PyErr_SetString(PyExc_TypeError, "No transparent_background_colors on opts object");
         return false;
     }
-    set_transparent_background_colors(self->configured_transparent_colors, src);
+    set_transparent_background_colors(self->global_layer.transparent_colors, src);
     return PyErr_Occurred() ? false : true;
 }
 
 static bool
 set_mark_colors(ColorProfile *self, PyObject *opts) {
     char fgattr[] = "mark?_foreground", bgattr[] = "mark?_background";
-#define n(i, attr, which)                                                       \
+#define n(attr, which)                                                          \
     {                                                                           \
         attr[4] = '1' + i;                                                      \
         RAII_PyObject(t, PyObject_GetAttrString(opts, attr));                   \
@@ -133,16 +153,13 @@ set_mark_colors(ColorProfile *self, PyObject *opts) {
             PyErr_SetString(PyExc_TypeError, "mark color is not Color object"); \
             return false;                                                       \
         }                                                                       \
-        Color *c = (Color *)t;                                                  \
-        self->which[i] = c->color.rgb;                                          \
+        self->global_layer.mark_colors.which[i].rgb = ((Color *)t)->color.rgb;  \
+        self->global_layer.mark_colors.which[i].type = COLOR_IS_RGB;            \
     }
-#define m(i)                        \
-    n(i, fgattr, mark_foregrounds); \
-    n(i, bgattr, mark_backgrounds);
-    m(0);
-    m(1);
-    m(2);
-#undef m
+    for (unsigned i = 0; i < MARK_MASK; i++) {
+        n(fgattr, fg);
+        n(bgattr, bg);
+    }
 #undef n
     return true;
 }
@@ -208,9 +225,7 @@ lerp_lab(float t, float *a, float *b, float *out) {
 }
 
 static void
-setup_256_palette_lab(ColorProfile *self, color_type *color_table, bool semantic, float base8_lab[8][3]) {
-    const color_type bg = colorprofile_to_color(self, self->overridden.default_bg, self->configured.default_bg).rgb;
-    const color_type fg = colorprofile_to_color(self, self->overridden.default_fg, self->configured.default_fg).rgb;
+setup_256_palette_lab(color_type fg, color_type bg, const color_type *color_table, bool semantic, float base8_lab[8][3]) {
     color_type_to_lab(bg, base8_lab[0]);
     color_type_to_lab(fg, base8_lab[7]);
     for (int i = 1; i < 7; i++) color_type_to_lab(color_table[i], base8_lab[i]);
@@ -230,10 +245,12 @@ is_generated_color(const color_type c) {
     return (c & GENERATED_COLOR_MASK) == GENERATED_COLOR_MASK;
 }
 
+// Generate the colors in color_table that are marked as generated. If only is
+// not NULL, only generate the colors marked in it.
 static void
-generate_256_palette(ColorProfile *self, color_type *color_table, bool semantic) {
+generate_256_palette(color_type fg, color_type bg, color_type *color_table, bool semantic, const ColorTableMask only) {
     float base8_lab[8][3];
-    setup_256_palette_lab(self, color_table, semantic, base8_lab);
+    setup_256_palette_lab(fg, bg, color_table, semantic, base8_lab);
 
     int idx = 16;
     for (int r = 0; r < 6; r++) {
@@ -249,7 +266,7 @@ generate_256_palette(ColorProfile *self, color_type *color_table, bool semantic)
             lerp_lab(tg, c0, c1, c4);
             lerp_lab(tg, c2, c3, c5);
             for (int b = 0; b < 6; b++) {
-                if (is_generated_color(color_table[idx])) {
+                if (is_generated_color(color_table[idx]) && (!only || mask_test(only, idx))) {
                     float c6[3];
                     lerp_lab(b / 5.0f, c4, c5, c6);
                     color_table[idx] = lab_to_color_type(c6);
@@ -263,15 +280,15 @@ generate_256_palette(ColorProfile *self, color_type *color_table, bool semantic)
         float t = (i + 1) / 25.0f;
         float lab[3];
         lerp_lab(t, base8_lab[0], base8_lab[7], lab);
-        if (is_generated_color(color_table[idx])) color_table[idx] = lab_to_color_type(lab);
+        if (is_generated_color(color_table[idx]) && (!only || mask_test(only, idx))) color_table[idx] = lab_to_color_type(lab);
         idx++;
     }
 }
 
 static color_type
-generate_256_palette_color(ColorProfile *self, color_type *color_table, unsigned int idx, bool semantic) {
+generate_256_palette_color(color_type fg, color_type bg, const color_type *color_table, unsigned int idx, bool semantic) {
     float base8_lab[8][3];
-    setup_256_palette_lab(self, color_table, semantic, base8_lab);
+    setup_256_palette_lab(fg, bg, color_table, semantic, base8_lab);
 
     if (idx < 232) {
         unsigned int i = idx - 16;
@@ -318,13 +335,101 @@ palette_generation_is_dynamic(PyObject *opts, bool *semantic) {
 }
 // }}}
 
+// The current mark colors are the colors set by the program, if any, otherwise
+// the colors from the topmost color layer that has them
+static void
+resolve_mark_colors(ColorProfile *self) {
+    const MarkColors *layers[] = {
+        &self->overridden_mark_colors, &self->session_layer.mark_colors, &self->window_layer.mark_colors, &self->global_layer.mark_colors};
+#define S(which, dest)                                   \
+    self->dest[i] = 0;                                   \
+    for (unsigned l = 0; l < arraysz(layers); l++) {     \
+        if (layers[l]->which[i].type != COLOR_NOT_SET) { \
+            self->dest[i] = layers[l]->which[i].rgb;     \
+            break;                                       \
+        }                                                \
+    }
+    for (unsigned i = 0; i < MARK_MASK; i++) {
+        S(bg, mark_backgrounds);
+        S(fg, mark_foregrounds);
+    }
+#undef S
+    self->dirty = true;
+}
+
+static void
+fill_generated_colors(color_type fg, color_type bg, color_type *color_table, bool dynamic, bool semantic, const ColorTableMask only) {
+    if (dynamic) generate_256_palette(fg, bg, color_table, semantic, only);
+    else fixed_color_palette(color_table);
+}
+
+// Re-calculate the configured colors from the global, window and session layers, if
+// configured_changed, and the current colors from the configured colors and
+// the colors set by the program. opts is used for the palette generation
+// policy, if NULL the global options are used.
+static void
+colorprofile_resolve(ColorProfile *self, PyObject *opts, bool configured_changed) {
+    bool semantic, dynamic = palette_generation_is_dynamic(opts ? opts : global_state.options_object, &semantic);
+    if (configured_changed) {
+        const ColorLayer *layers[] = {&self->session_layer, &self->window_layer};
+#define S(name)                                                     \
+    self->configured.name = self->global_layer.dynamic_colors.name; \
+    for (unsigned l = 0; l < arraysz(layers); l++) {                \
+        if (layers[l]->dynamic_colors.name.type != COLOR_NOT_SET) { \
+            self->configured.name = layers[l]->dynamic_colors.name; \
+            break;                                                  \
+        }                                                           \
+    }
+        S(default_fg) S(default_bg) S(cursor_color) S(cursor_text_color) S(highlight_fg) S(highlight_bg) S(visual_bell_color);
+#undef S
+        const TransparentDynamicColor *transparent_colors = self->global_layer.transparent_colors;
+        for (unsigned l = 0; l < arraysz(layers); l++) {
+            if (layers[l]->transparent_colors_set) {
+                transparent_colors = layers[l]->transparent_colors;
+                break;
+            }
+        }
+        memcpy(self->configured_transparent_colors, transparent_colors, sizeof(self->configured_transparent_colors));
+        for (unsigned i = 0; i < arraysz(self->orig_color_table); i++) {
+            self->orig_color_table[i] = self->global_layer.color_table[i];
+            for (unsigned l = 0; l < arraysz(layers); l++) {
+                if (mask_test(layers[l]->color_table_mask, i)) {
+                    self->orig_color_table[i] = layers[l]->color_table[i];
+                    break;
+                }
+            }
+        }
+        fill_generated_colors(
+            colorprofile_to_color(self, self->configured.default_fg, self->configured.default_fg).rgb,
+            colorprofile_to_color(self, self->configured.default_bg, self->configured.default_bg).rgb,
+            self->orig_color_table,
+            dynamic,
+            semantic,
+            NULL);
+    }
+    const bool has_overrides = !mask_is_empty(self->overridden_color_table_mask);
+    for (unsigned i = 0; i < arraysz(self->color_table); i++) {
+        if (!has_overrides || !mask_test(self->overridden_color_table_mask, i)) self->color_table[i] = self->orig_color_table[i];
+    }
+    // Colors set by the program to the generated value are generated from the current colors
+    if (has_overrides) {
+        fill_generated_colors(
+            colorprofile_to_color(self, self->overridden.default_fg, self->configured.default_fg).rgb,
+            colorprofile_to_color(self, self->overridden.default_bg, self->configured.default_bg).rgb,
+            self->color_table,
+            dynamic,
+            semantic,
+            self->overridden_color_table_mask);
+    }
+    resolve_mark_colors(self);
+}
+
 static bool
 set_colortable(ColorProfile *self, PyObject *opts) {
     RAII_PyObject(ct, PyObject_GetAttrString(opts, "color_table"));
     if (!ct) return false;
     RAII_PyObject(ret, PyObject_CallMethod(ct, "buffer_info", NULL));
     if (!ret) return false;
-    bool semantic_generation, dynamic_palette = palette_generation_is_dynamic(opts, &semantic_generation);
     unsigned long *color_table = PyLong_AsVoidPtr(PyTuple_GET_ITEM(ret, 0));
     size_t count = PyLong_AsSize_t(PyTuple_GET_ITEM(ret, 1));
     if (!color_table || count != arraysz(FG_BG_256)) {
@@ -338,10 +443,8 @@ set_colortable(ColorProfile *self, PyObject *opts) {
         PyErr_Format(PyExc_TypeError, "color_table has incorrect itemsize: %zu", itemsize);
         return false;
     }
-    for (size_t i = 0; i < arraysz(FG_BG_256); i++) self->color_table[i] = color_table[i];
-    if (dynamic_palette) generate_256_palette(self, self->color_table, semantic_generation);
-    else fixed_color_palette(self->color_table);
-    memcpy(self->orig_color_table, self->color_table, sizeof(self->color_table));
+    for (size_t i = 0; i < arraysz(FG_BG_256); i++) self->global_layer.color_table[i] = color_table[i];
+    colorprofile_resolve(self, opts, true);
     return true;
 }
 
@@ -361,6 +464,7 @@ new_cp(PyTypeObject *type, PyObject *args, PyObject *kwds) {
             if (!set_mark_colors(self, opts)) return NULL;
             if (!set_colortable(self, opts)) return NULL;
         } else {
+            memcpy(self->global_layer.color_table, FG_BG_256, sizeof(FG_BG_256));
             memcpy(self->color_table, FG_BG_256, sizeof(FG_BG_256));
             memcpy(self->orig_color_table, self->color_table, sizeof(FG_BG_256));
         }
@@ -386,75 +490,144 @@ void
 copy_color_profile(ColorProfile *dest, ColorProfile *src) {
     memcpy(dest->color_table, src->color_table, sizeof(dest->color_table));
     memcpy(dest->orig_color_table, src->orig_color_table, sizeof(dest->color_table));
+    memcpy(dest->overridden_color_table_mask, src->overridden_color_table_mask, sizeof(dest->overridden_color_table_mask));
+    dest->global_layer = src->global_layer;
+    dest->window_layer = src->window_layer;
+    dest->session_layer = src->session_layer;
     memcpy(&dest->configured, &src->configured, sizeof(dest->configured));
     memcpy(&dest->overridden, &src->overridden, sizeof(dest->overridden));
     memcpy(dest->overriden_transparent_colors, src->overriden_transparent_colors, sizeof(dest->overriden_transparent_colors));
     memcpy(dest->configured_transparent_colors, src->configured_transparent_colors, sizeof(dest->configured_transparent_colors));
-    dest->dirty = true;
+    dest->overridden_mark_colors = src->overridden_mark_colors;
+    resolve_mark_colors(dest);
+}
+
+static ColorLayer *
+color_layer(ColorProfile *self, ColorLayerType layer) {
+    switch (layer) {
+        case COLOR_LAYER_GLOBAL: return &self->global_layer;
+        case COLOR_LAYER_WINDOW: return &self->window_layer;
+        case COLOR_LAYER_SESSION: return &self->session_layer;
+        case COLOR_LAYER_OVERRIDE: break;
+    }
+    return NULL;
+}
+
+// The configured color layers above the specified layer, in order, terminated by NULL
+static void
+color_layers_above(ColorProfile *self, ColorLayerType layer, ColorLayer *ans[3]) {
+    unsigned n = 0;
+    switch (layer) {
+        case COLOR_LAYER_GLOBAL: ans[n++] = &self->window_layer;  /* fallthrough */
+        case COLOR_LAYER_WINDOW: ans[n++] = &self->session_layer; /* fallthrough */
+        case COLOR_LAYER_SESSION:
+        case COLOR_LAYER_OVERRIDE: break;
+    }
+    ans[n] = NULL;
 }
 
 static void
-patch_color_table(const char *key, PyObject *profiles, PyObject *spec, size_t which, int change_configured, bool *has_null_values) {
+patch_color_table(const char *key, PyObject *profiles, PyObject *spec, size_t which, ColorLayerType layer, bool clear_upper_layers) {
     PyObject *v = PyDict_GetItemString(spec, key);
     if (v) {
         color_type color = NULL_COLOR_VALUE;
         if (PyLong_Check(v)) color = PyLong_AsUnsignedLong(v);
-        else *has_null_values = true;
         for (Py_ssize_t j = 0; j < PyTuple_GET_SIZE(profiles); j++) {
             ColorProfile *self = (ColorProfile *)PyTuple_GET_ITEM(profiles, j);
-            self->color_table[which] = color;
-            if (change_configured) self->orig_color_table[which] = color;
-            self->dirty = true;
+            ColorLayer *l = color_layer(self, layer);
+            if (l) {
+                l->color_table[which] = color;
+                mask_set(l->color_table_mask, which);
+                if (clear_upper_layers) {
+                    ColorLayer *upper[3];
+                    color_layers_above(self, layer, upper);
+                    for (ColorLayer **u = upper; *u; u++) mask_clear((*u)->color_table_mask, which);
+                    mask_clear(self->overridden_color_table_mask, which);
+                }
+            } else {
+                self->color_table[which] = color;
+                mask_set(self->overridden_color_table_mask, which);
+            }
         }
     }
 }
 
-#define patch_mark_color(key, profiles, spec, array, i)                             \
-    {                                                                               \
-        PyObject *v = PyDict_GetItemString(spec, key);                              \
-        if (v && PyLong_Check(v)) {                                                 \
-            color_type color = PyLong_AsUnsignedLong(v);                            \
-            for (Py_ssize_t j = 0; j < PyTuple_GET_SIZE(profiles); j++) {           \
-                ColorProfile *self = (ColorProfile *)PyTuple_GET_ITEM(profiles, j); \
-                self->array[i] = color;                                             \
-                self->dirty = true;                                                 \
-            }                                                                       \
-        }                                                                           \
+static void
+patch_mark_color(const char *key, PyObject *profiles, PyObject *spec, size_t which, bool foreground, ColorLayerType layer, bool clear_upper_layers) {
+#define mc(m) (foreground ? (m).fg : (m).bg)[which]
+    PyObject *v = PyDict_GetItemString(spec, key);
+    if (v && PyLong_Check(v)) {
+        const DynamicColor color = {.rgb = PyLong_AsUnsignedLong(v), .type = COLOR_IS_RGB};
+        for (Py_ssize_t j = 0; j < PyTuple_GET_SIZE(profiles); j++) {
+            ColorProfile *self = (ColorProfile *)PyTuple_GET_ITEM(profiles, j);
+            ColorLayer *l = color_layer(self, layer);
+            if (l) {
+                mc(l->mark_colors) = color;
+                if (clear_upper_layers) {
+                    ColorLayer *upper[3];
+                    color_layers_above(self, layer, upper);
+                    for (ColorLayer **u = upper; *u; u++) mc((*u)->mark_colors).val = 0;
+                    mc(self->overridden_mark_colors).val = 0;
+                }
+            } else mc(self->overridden_mark_colors) = color;
+        }
     }
+#undef mc
+}
 
 
 static PyObject *
 patch_color_profiles(PyObject *module UNUSED, PyObject *args) {
     PyObject *spec, *transparent_background_colors, *profiles, *v;
     ColorProfile *self;
-    int change_configured;
-    if (!PyArg_ParseTuple(args, "O!O!O!p", &PyDict_Type, &spec, &PyTuple_Type, &transparent_background_colors, &PyTuple_Type, &profiles, &change_configured))
+    int layer_, clear_upper_layers = 0;
+    if (!PyArg_ParseTuple(args, "O!OO!i|p", &PyDict_Type, &spec, &transparent_background_colors, &PyTuple_Type, &profiles, &layer_, &clear_upper_layers))
         return NULL;
+    if (transparent_background_colors != Py_None && !PyTuple_Check(transparent_background_colors)) {
+        PyErr_SetString(PyExc_TypeError, "transparent_background_colors must be a tuple or None");
+        return NULL;
+    }
+    if (layer_ < COLOR_LAYER_OVERRIDE || layer_ > COLOR_LAYER_SESSION) {
+        PyErr_Format(PyExc_ValueError, "Unknown color layer: %d", layer_);
+        return NULL;
+    }
+    const ColorLayerType layer = layer_;
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(profiles); i++) {
+        if (!PyObject_TypeCheck(PyTuple_GET_ITEM(profiles, i), &ColorProfile_Type)) {
+            PyErr_SetString(PyExc_TypeError, "profiles must be a tuple of ColorProfile objects");
+            return NULL;
+        }
+    }
     char key[32] = {0};
-    bool has_null_values = false;
     for (size_t i = 0; i < arraysz(FG_BG_256); i++) {
         snprintf(key, sizeof(key) - 1, "color%zu", i);
-        patch_color_table(key, profiles, spec, i, change_configured, &has_null_values);
+        patch_color_table(key, profiles, spec, i, layer, clear_upper_layers);
     }
-    for (size_t i = 1; i <= MARK_MASK; i++) {
-#define S(which, i)                                       \
-    snprintf(key, sizeof(key) - 1, "mark%zu_" #which, i); \
-    patch_mark_color(key, profiles, spec, mark_##which##s, i)
-        S(background, i);
-        S(foreground, i);
-#undef S
+    for (size_t i = 0; i < MARK_MASK; i++) {
+        snprintf(key, sizeof(key) - 1, "mark%zu_background", i + 1);
+        patch_mark_color(key, profiles, spec, i, false, layer, clear_upper_layers);
+        snprintf(key, sizeof(key) - 1, "mark%zu_foreground", i + 1);
+        patch_mark_color(key, profiles, spec, i, true, layer, clear_upper_layers);
     }
-#define SI(profile_name)                                          \
-    DynamicColor color;                                           \
-    if (PyLong_Check(v)) {                                        \
-        color.rgb = PyLong_AsUnsignedLong(v);                     \
-        color.type = COLOR_IS_RGB;                                \
-    } else {                                                      \
-        color.rgb = 0;                                            \
-        color.type = COLOR_IS_SPECIAL;                            \
-    }                                                             \
-    self->overridden.profile_name = color;                        \
-    if (change_configured) self->configured.profile_name = color; \
+#define SI(profile_name)                                                                     \
+    DynamicColor color;                                                                      \
+    if (PyLong_Check(v)) {                                                                   \
+        color.rgb = PyLong_AsUnsignedLong(v);                                                \
+        color.type = COLOR_IS_RGB;                                                           \
+    } else {                                                                                 \
+        color.rgb = 0;                                                                       \
+        color.type = COLOR_IS_SPECIAL;                                                       \
+    }                                                                                        \
+    ColorLayer *l = color_layer(self, layer);                                                \
+    if (l) {                                                                                 \
+        l->dynamic_colors.profile_name = color;                                              \
+        if (clear_upper_layers) {                                                            \
+            ColorLayer *upper[3];                                                            \
+            color_layers_above(self, layer, upper);                                          \
+            for (ColorLayer **u = upper; *u; u++) (*u)->dynamic_colors.profile_name.val = 0; \
+            self->overridden.profile_name.val = 0;                                           \
+        }                                                                                    \
+    } else self->overridden.profile_name = color;                                            \
     self->dirty = true;
 
 #define S(config_name, profile_name)                                      \
@@ -476,26 +649,27 @@ patch_color_profiles(PyObject *module UNUSED, PyObject *args) {
     S(visual_bell_color, visual_bell_color);
 #undef SI
 #undef S
-    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(profiles); i++) {
-        self = (ColorProfile *)PyTuple_GET_ITEM(profiles, i);
-        set_transparent_background_colors(self->overriden_transparent_colors, transparent_background_colors);
-        if (change_configured) set_transparent_background_colors(self->configured_transparent_colors, transparent_background_colors);
-    }
-
-    if (has_null_values) {
-        bool semantic, dynamic = palette_generation_is_dynamic(global_state.options_object, &semantic);
-        for (Py_ssize_t j = 0; j < PyTuple_GET_SIZE(profiles); j++) {
-            ColorProfile *self = (ColorProfile *)PyTuple_GET_ITEM(profiles, j);
-            if (dynamic) {
-                generate_256_palette(self, self->color_table, semantic);
-                if (change_configured) generate_256_palette(self, self->orig_color_table, semantic);
-            } else {
-                fixed_color_palette(self->color_table);
-                if (change_configured) fixed_color_palette(self->orig_color_table);
-            }
+    // None means the transparent colors were not specified, so leave them unchanged
+    if (transparent_background_colors != Py_None) {
+        for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(profiles); i++) {
+            self = (ColorProfile *)PyTuple_GET_ITEM(profiles, i);
+            ColorLayer *l = color_layer(self, layer);
+            if (l) {
+                set_transparent_background_colors(l->transparent_colors, transparent_background_colors);
+                l->transparent_colors_set = true;
+                if (clear_upper_layers) {
+                    ColorLayer *upper[3];
+                    color_layers_above(self, layer, upper);
+                    for (ColorLayer **u = upper; *u; u++) (*u)->transparent_colors_set = false;
+                    zero_at_ptr_count(self->overriden_transparent_colors, arraysz(self->overriden_transparent_colors));
+                }
+            } else set_transparent_background_colors(self->overriden_transparent_colors, transparent_background_colors);
         }
     }
     if (PyErr_Occurred()) return NULL;
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(profiles); i++) {
+        colorprofile_resolve((ColorProfile *)PyTuple_GET_ITEM(profiles, i), NULL, layer != COLOR_LAYER_OVERRIDE);
+    }
     Py_RETURN_NONE;
 }
 
@@ -534,6 +708,15 @@ colorprofile_to_color(const ColorProfile *self, DynamicColor entry, DynamicColor
         case COLOR_IS_SPECIAL: return entry;
     }
     return entry;
+}
+
+// Resolve to an actual RGB color, using fallback for special colors, that
+// is colors that depend on the cell they are used in.
+static color_type
+resolved_dynamic_color(const ColorProfile *self, DynamicColor overridden, DynamicColor configured, color_type fallback) {
+    DynamicColor ans = colorprofile_to_color(self, overridden, configured);
+    if (ans.type == COLOR_IS_INDEX) ans = colorprofile_to_color(self, ans, ans);
+    return ans.type == COLOR_IS_RGB ? (color_type)ans.rgb : fallback;
 }
 
 color_type
@@ -593,22 +776,23 @@ as_dict(ColorProfile *self, PyObject *args UNUSED) {
     RAII_PyObject(ans, PyDict_New());
     if (ans == NULL) return NULL;
     if (!colortable_colors_into_dict(self, 0, arraysz(self->color_table), ans)) return NULL;
-#define D(attr, name)                                                                                            \
-    {                                                                                                            \
-        if (self->overridden.attr.type != COLOR_NOT_SET) {                                                       \
-            int ret;                                                                                             \
-            PyObject *val;                                                                                       \
-            if (self->overridden.attr.type == COLOR_IS_SPECIAL) {                                                \
-                val = Py_NewRef(Py_None);                                                                        \
-            } else {                                                                                             \
-                unsigned long c = colorprofile_to_color(self, self->overridden.attr, self->configured.attr).rgb; \
-                val = PyLong_FromUnsignedLong(c);                                                                \
-            }                                                                                                    \
-            if (!val) { return NULL; }                                                                           \
-            ret = PyDict_SetItemString(ans, #name, val);                                                         \
-            Py_DECREF(val);                                                                                      \
-            if (ret != 0) { return NULL; }                                                                       \
-        }                                                                                                        \
+#define D(attr, name)                                                                                                      \
+    {                                                                                                                      \
+        if (self->overridden.attr.type != COLOR_NOT_SET || self->window_layer.dynamic_colors.attr.type != COLOR_NOT_SET || \
+            self->session_layer.dynamic_colors.attr.type != COLOR_NOT_SET) {                                               \
+            int ret;                                                                                                       \
+            PyObject *val;                                                                                                 \
+            DynamicColor c = colorprofile_to_color(self, self->overridden.attr, self->configured.attr);                    \
+            if (c.type == COLOR_IS_SPECIAL) {                                                                              \
+                val = Py_NewRef(Py_None);                                                                                  \
+            } else {                                                                                                       \
+                val = PyLong_FromUnsignedLong(c.rgb);                                                                      \
+            }                                                                                                              \
+            if (!val) { return NULL; }                                                                                     \
+            ret = PyDict_SetItemString(ans, #name, val);                                                                   \
+            Py_DECREF(val);                                                                                                \
+            if (ret != 0) { return NULL; }                                                                                 \
+        }                                                                                                                  \
     }
     D(default_fg, foreground);
     D(default_bg, background);
@@ -617,6 +801,19 @@ as_dict(ColorProfile *self, PyObject *args UNUSED) {
     D(highlight_fg, selection_foreground);
     D(highlight_bg, selection_background);
     D(visual_bell_color, visual_bell_color);
+#undef D
+    char key[32];
+#define D(which, dest, name)                                                                                                            \
+    if (self->overridden_mark_colors.which[i].type != COLOR_NOT_SET || self->window_layer.mark_colors.which[i].type != COLOR_NOT_SET || \
+        self->session_layer.mark_colors.which[i].type != COLOR_NOT_SET) {                                                               \
+        snprintf(key, sizeof(key), "mark%u_" name, i + 1);                                                                              \
+        RAII_PyObject(val, PyLong_FromUnsignedLong(self->dest[i]));                                                                     \
+        if (!val || PyDict_SetItemString(ans, key, val) != 0) return NULL;                                                              \
+    }
+    for (unsigned i = 0; i < MARK_MASK; i++) {
+        D(bg, mark_backgrounds, "background");
+        D(fg, mark_foregrounds, "foreground");
+    }
     RAII_PyObject(transparent_background_colors, PyList_New(0));
     if (!transparent_background_colors) return NULL;
     for (size_t i = 0; i < arraysz(self->overriden_transparent_colors); i++) {
@@ -669,6 +866,7 @@ static PyObject *
 reset_color_table(ColorProfile *self, PyObject *a UNUSED) {
 #define reset_color_table_doc "Reset all customized colors back to defaults"
     memcpy(self->color_table, self->orig_color_table, sizeof(FG_BG_256));
+    zero_at_ptr(&self->overridden_color_table_mask);
     self->dirty = true;
     Py_RETURN_NONE;
 }
@@ -678,6 +876,7 @@ reset_color(ColorProfile *self, PyObject *val) {
 #define reset_color_doc "Reset the specified color"
     uint8_t i = PyLong_AsUnsignedLong(val) & 0xff;
     self->color_table[i] = self->orig_color_table[i];
+    mask_clear(self->overridden_color_table_mask, i);
     self->dirty = true;
     Py_RETURN_NONE;
 }
@@ -689,9 +888,16 @@ set_color(ColorProfile *self, PyObject *args) {
     unsigned long val;
     if (!PyArg_ParseTuple(args, "Bk", &i, &val)) return NULL;
     self->dirty = true;
+    mask_set(self->overridden_color_table_mask, i);
     if (val == NULL_COLOR_VALUE && i >= 16) {
         bool semantic, dynamic = palette_generation_is_dynamic(global_state.options_object, &semantic);
-        self->color_table[i] = dynamic ? generate_256_palette_color(self, self->color_table, i, semantic) : GENERATED_COLOR_MASK | FG_BG_256[i];
+        self->color_table[i] = dynamic ? generate_256_palette_color(
+                                             colorprofile_to_color(self, self->overridden.default_fg, self->configured.default_fg).rgb,
+                                             colorprofile_to_color(self, self->overridden.default_bg, self->configured.default_bg).rgb,
+                                             self->color_table,
+                                             i,
+                                             semantic)
+                                       : GENERATED_COLOR_MASK | FG_BG_256[i];
     } else self->color_table[i] = val;
     Py_RETURN_NONE;
 }
@@ -710,22 +916,46 @@ copy_color_table_to_buffer(ColorProfile *self, color_type *buf, int offset, size
         *buf = self->mark_foregrounds[i];
         buf += stride;
     }
+    // Copy the special colors used by indexed color images, these must be in
+    // the order defined in the graphics protocol documentation.
+    const color_type fg = resolved_dynamic_color(self, self->overridden.default_fg, self->configured.default_fg, OPT(foreground));
+    const color_type bg = resolved_dynamic_color(self, self->overridden.default_bg, self->configured.default_bg, OPT(background));
+    const color_type specials[NUM_INDEXED_IMAGE_SPECIAL_COLORS] = {
+        bg,
+        fg,
+        resolved_dynamic_color(self, self->overridden.highlight_bg, self->configured.highlight_bg, fg),
+        resolved_dynamic_color(self, self->overridden.highlight_fg, self->configured.highlight_fg, bg),
+        resolved_dynamic_color(self, self->overridden.cursor_color, self->configured.cursor_color, fg),
+        resolved_dynamic_color(self, self->overridden.cursor_text_color, self->configured.cursor_text_color, bg),
+        OPT(url_color),
+        fg, // reserved
+    };
+    for (i = 0; i < arraysz(specials); i++) {
+        *buf = specials[i];
+        buf += stride;
+    }
     self->dirty = false;
 }
 
+// Only the colors set by the program are saved on the stack, so that popping
+// restores the current configured colors for all other colors.
 static void
 push_onto_color_stack_at(ColorProfile *self, unsigned int i) {
     self->color_stack[i].dynamic_colors = self->overridden;
     memcpy(self->color_stack[i].transparent_colors, self->overriden_transparent_colors, sizeof(self->overriden_transparent_colors));
-    self->color_stack[i].dynamic_colors = self->overridden;
     memcpy(self->color_stack[i].color_table, self->color_table, sizeof(self->color_stack->color_table));
+    memcpy(self->color_stack[i].color_table_mask, self->overridden_color_table_mask, sizeof(self->color_stack->color_table_mask));
+    self->color_stack[i].mark_colors = self->overridden_mark_colors;
 }
 
 static void
 copy_from_color_stack_at(ColorProfile *self, unsigned int i) {
     self->overridden = self->color_stack[i].dynamic_colors;
     memcpy(self->color_table, self->color_stack[i].color_table, sizeof(self->color_table));
+    memcpy(self->overridden_color_table_mask, self->color_stack[i].color_table_mask, sizeof(self->overridden_color_table_mask));
     memcpy(self->overriden_transparent_colors, self->color_stack[i].transparent_colors, sizeof(self->overriden_transparent_colors));
+    self->overridden_mark_colors = self->color_stack[i].mark_colors;
+    colorprofile_resolve(self, NULL, false);
 }
 
 bool
@@ -758,11 +988,14 @@ colorprofile_push_colors(ColorProfile *self, unsigned int idx) {
 void
 colorprofile_reset(ColorProfile *self) {
     memcpy(self->color_table, self->orig_color_table, sizeof(FG_BG_256));
+    zero_at_ptr(&self->overridden_color_table_mask);
     self->dirty = true;
     self->color_stack_idx = 0;
     zero_at_ptr(&self->overridden);
     for (unsigned i = 0; i < arraysz(self->overriden_transparent_colors); i++) { zero_at_ptr(self->overriden_transparent_colors + i); }
     for (unsigned i = 0; i < self->color_stack_sz; i++) { zero_at_ptr(self->color_stack + i); }
+    zero_at_ptr(&self->overridden_mark_colors);
+    resolve_mark_colors(self);
 }
 
 bool
@@ -874,13 +1107,37 @@ reload_from_opts(ColorProfile *self, PyObject *args, PyObject *kw) {
     if (opts == NULL) opts = global_state.options_object;
     self->dirty = true;
     if (!set_configured_colors(self, opts)) return NULL;
+    // The window layer is kept, only the global layer is reloaded
     if (reset_overriden_colors) {
         zero_at_ptr(&self->overridden);
         memset(self->overriden_transparent_colors, 0, sizeof(self->overriden_transparent_colors));
+        zero_at_ptr(&self->overridden_color_table_mask);
+        zero_at_ptr(&self->overridden_mark_colors);
     }
     if (!set_mark_colors(self, opts)) return NULL;
     if (!set_colortable(self, opts)) return NULL;
     Py_RETURN_NONE;
+}
+
+static PyObject *
+reset_layer(ColorProfile *self, PyObject *which) {
+    if (!PyLong_Check(which)) {
+        PyErr_SetString(PyExc_TypeError, "layer must be an int");
+        return NULL;
+    }
+    long layer = PyLong_AsLong(which);
+    if (layer != COLOR_LAYER_WINDOW && layer != COLOR_LAYER_SESSION) {
+        PyErr_Format(PyExc_ValueError, "Only the window and session color layers can be reset, not: %ld", layer);
+        return NULL;
+    }
+    zero_at_ptr(color_layer(self, layer));
+    colorprofile_resolve(self, NULL, true);
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+color_stack_depth(ColorProfile *self, PyObject *a UNUSED) {
+    return PyLong_FromUnsignedLong(self->color_stack_idx);
 }
 
 static PyObject *
@@ -929,10 +1186,33 @@ set_transparent_background_color(ColorProfile *self, PyObject *const *args, Py_s
     Py_RETURN_NONE;
 }
 
+// Return the (fg, bg) pair for each mark, as uploaded to the GPU, without
+// clearing pending uploads. The buffer layout must match copy_color_table_to_buffer().
+static PyObject *
+test_mark_colors(ColorProfile *self, PyObject *unused UNUSED) {
+    color_type buf[arraysz(self->color_table) + arraysz(self->mark_backgrounds) + arraysz(self->mark_foregrounds) + NUM_INDEXED_IMAGE_SPECIAL_COLORS];
+    const bool dirty = self->dirty;
+    copy_color_table_to_buffer(self, buf, 0, 1);
+    self->dirty = dirty;
+    const color_type *bg = buf + arraysz(self->color_table);
+    const color_type *fg = bg + arraysz(self->mark_backgrounds);
+    RAII_PyObject(ans, PyTuple_New(MARK_MASK));
+    if (!ans) return NULL;
+    for (size_t i = 0; i < MARK_MASK; i++) {
+        PyObject *pair = Py_BuildValue("II", fg[i], bg[i]);
+        if (!pair) return NULL;
+        PyTuple_SET_ITEM(ans, i, pair);
+    }
+    return Py_NewRef(ans);
+}
+
 static PyMethodDef cp_methods[] = {
     METHOD(reset_color_table, METH_NOARGS) METHOD(as_dict, METH_NOARGS) METHOD(basic_colors, METH_NOARGS) METHOD(color_table_address, METH_NOARGS)
         METHOD(as_color, METH_O) METHOD(reset_color, METH_O) METHOD(set_color, METH_VARARGS) METHODB(palette_color_is_generated, METH_O),
     METHODB(get_transparent_background_color, METH_O),
+    METHODB(reset_layer, METH_O),
+    METHODB(color_stack_depth, METH_NOARGS),
+    METHODB(test_mark_colors, METH_NOARGS),
     {"reload_from_opts", (PyCFunction)(void (*)(void))(reload_from_opts), METH_VARARGS | METH_KEYWORDS, NULL},
     {"set_transparent_background_color", (PyCFunction)(void (*)(void))set_transparent_background_color, METH_FASTCALL, ""},
     {NULL} /* Sentinel */
@@ -1611,6 +1891,10 @@ init_ColorProfile(PyObject *module) {
 
     if (PyModule_AddFunctions(module, module_methods) != 0) return false;
     PyModule_AddIntMacro(module, NULL_COLOR_VALUE);
+    PyModule_AddIntMacro(module, COLOR_LAYER_OVERRIDE);
+    PyModule_AddIntMacro(module, COLOR_LAYER_GLOBAL);
+    PyModule_AddIntMacro(module, COLOR_LAYER_WINDOW);
+    PyModule_AddIntMacro(module, COLOR_LAYER_SESSION);
     return 1;
 }
 

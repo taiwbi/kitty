@@ -63,7 +63,7 @@ func main(_ *cli.Command, opts *Options, args []string) (rc int, err error) {
 	if err != nil {
 		return 1, err
 	}
-	cv := utils.NewCachedValues("unicode-input", &CachedData{Category: "All"})
+	cv := utils.NewCachedValues("themes", &CachedData{Category: "All"})
 	h := &handler{lp: lp, opts: opts, cached_data: cv.Load()}
 	defer cv.Save()
 	lp.OnInitialize = func() (string, error) {

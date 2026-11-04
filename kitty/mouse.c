@@ -20,6 +20,8 @@ extern PyTypeObject Screen_Type;
 static MouseShape mouse_cursor_shape = TEXT_POINTER;
 typedef enum MouseActions { PRESS, RELEASE, DRAG, MOVE, LEAVE } MouseAction;
 #define debug debug_input
+#define MOUSE_MAPPING_MODS_MASK (GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_CONTROL | GLFW_MOD_SUPER | GLFW_MOD_HYPER | GLFW_MOD_META)
+static_assert(MOUSE_MAPPING_MODS_MASK < 64, "mouse mapping modifiers must fit in a uint64_t bitmap");
 
 static void
 finish_scroll_animation(Screen *screen) {
@@ -441,19 +443,33 @@ handle_mouse_movement_in_kitty(Window *w, int button, bool mouse_cell_changed) {
     }
 }
 
+static bool
+url_is_clickable_with(Screen *screen, int modifiers) {
+    return OPT(url_mappings)[screen->modes.mouse_tracking_mode != NO_TRACKING] & (1ull << (modifiers & MOUSE_MAPPING_MODS_MASK));
+}
+
 static void
-detect_url(Screen *screen, unsigned int x, unsigned int y) {
-    int hid = screen_detect_url(screen, x, y);
+detect_url(Screen *screen, unsigned int x, unsigned int y, int modifiers) {
+    const bool clickable = url_is_clickable_with(screen, modifiers);
+    int hid = screen_detect_url(screen, x, y, clickable);
+    const __typeof__(screen->current_hyperlink_under_mouse) previous = screen->current_hyperlink_under_mouse;
     zero_at_ptr(&screen->current_hyperlink_under_mouse);
+    set_mouse_cursor_for_screen(screen);
     if (hid != 0) {
-        mouse_cursor_shape = POINTER_POINTER;
+        if (clickable) mouse_cursor_shape = POINTER_POINTER;
         screen->current_hyperlink_under_mouse.has_detected_url = hid < 0;
         if (hid > 0) {
             screen->current_hyperlink_under_mouse.id = (hyperlink_id_type)hid;
             screen->current_hyperlink_under_mouse.x = x;
             screen->current_hyperlink_under_mouse.y = y;
         }
-    } else set_mouse_cursor_for_screen(screen);
+    }
+    // The position of the displayed hyperlink target depends on the hovered cell
+    if (OPT(show_hyperlink_targets) != SHOW_HYPERLINK_TARGETS_NEVER && global_state.callback_os_window &&
+        (previous.id || screen->current_hyperlink_under_mouse.id) &&
+        (previous.id != screen->current_hyperlink_under_mouse.id || previous.x != screen->current_hyperlink_under_mouse.x ||
+         previous.y != screen->current_hyperlink_under_mouse.y))
+        global_state.callback_os_window->needs_render = true;
 }
 
 static bool
@@ -713,7 +729,7 @@ handle_potential_drag(Window *w, int button) {
         debug("Sent drag start event to child\n");
     } else if (w->drag_source.potential_drag.type == POTENTIAL_DRAG_URL) {
         w->drag_source.potential_drag.type = POTENTIAL_DRAG_NONE;
-        screen_detect_url(screen, w->drag_source.potential_drag.x, w->drag_source.potential_drag.y);
+        screen_detect_url(screen, w->drag_source.potential_drag.x, w->drag_source.potential_drag.y, true);
         if (screen->current_hyperlink_under_mouse.id || screen->current_hyperlink_under_mouse.has_detected_url) {
             screen_open_url(screen, "drag_url");
             debug("Started URL drag\n");
@@ -733,7 +749,7 @@ HANDLER(handle_move_event) {
         return;
     }
     Screen *screen = w->render_data.screen;
-    if (OPT(detect_urls)) detect_url(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y);
+    if (OPT(detect_urls)) detect_url(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y, modifiers);
     if (should_handle_in_kitty(w, screen, button)) {
         handle_mouse_movement_in_kitty(w, button, mouse_cell_changed | cell_half_changed);
     } else {
@@ -810,8 +826,13 @@ add_press(Window *w, int button, int modifiers) {
 bool
 mouse_open_url(Window *w) {
     Screen *screen = w->render_data.screen;
-    detect_url(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y);
-    return screen_open_url(screen, "open_url");
+    // Opening a URL must work even when hover highlighting is disabled, so
+    // mark it, then remove the mark if there was no hover highlight before.
+    const bool was_highlighted = screen->url_ranges.count > 0;
+    screen_detect_url(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y, true);
+    const bool opened = screen_open_url(screen, "open_url");
+    if (!was_highlighted) screen_mark_url(screen, 0, 0, 0, 0);
+    return opened;
 }
 
 bool
@@ -1190,8 +1211,9 @@ update_mouse_pointer_shape(void) {
         if (handle_scrollbar_mouse(r.window, -1, MOVE, 0)) {
             mouse_cursor_shape = scrollbar_drag_mouse_cursor;
         } else if (r.window->render_data.screen) {
-            screen_mark_url(r.window->render_data.screen, 0, 0, 0, 0);
             set_mouse_cursor_for_screen(r.window->render_data.screen);
+            // Keep the pointer consistent with a link hover highlight
+            if (r.window->render_data.screen->url_ranges.count && r.window->id == global_state.mouse_hover_in_window) mouse_cursor_shape = POINTER_POINTER;
         }
     }
     set_mouse_cursor(mouse_cursor_shape);
@@ -1201,6 +1223,86 @@ void
 leave_event(int modifiers) {
     if (global_state.redirect_mouse_handling || global_state.active_drag_in_window || global_state.tracked_drag_in_window) return;
     set_currently_hovered_window(0, modifiers, false);
+}
+
+static Window *
+window_in_active_tab(OSWindow *osw, id_type window_id) {
+    if (!osw || !osw->num_tabs) return NULL;
+    Tab *t = osw->tabs + osw->active_tab;
+    for (unsigned i = 0; i < t->num_windows; i++) {
+        if (t->windows[i].id == window_id) return t->windows + i;
+    }
+    return NULL;
+}
+
+static bool
+mouse_is_busy(void) {
+    return global_state.redirect_mouse_handling || global_state.active_drag_in_window || global_state.tracked_drag_in_window ||
+           global_state.tab_being_dragged.id || global_state.window_being_dragged.id || global_state.active_drag_resize;
+}
+
+static Window *
+hovered_window(OSWindow **osw) {
+    const id_type wid = global_state.mouse_hover_in_window;
+    if (!wid) return NULL;
+    // The mouse can be over an OS window other than the one receiving events
+    *osw = global_state.callback_os_window;
+    Window *w = window_in_active_tab(*osw, wid);
+    for (size_t i = 0; !w && i < global_state.num_os_windows; i++) {
+        *osw = global_state.os_windows + i;
+        w = window_in_active_tab(*osw, wid);
+    }
+    return w;
+}
+
+// Output can clear the link hover highlight, so keep the pointer and the
+// hovered link consistent with it when the screen is under the mouse.
+void
+link_hover_cleared_by_output(Screen *screen) {
+    OSWindow *osw;
+    Window *w = hovered_window(&osw);
+    if (!w || w->render_data.screen != screen) return;
+    zero_at_ptr(&screen->current_hyperlink_under_mouse);
+    if (mouse_cursor_shape != POINTER_POINTER || mouse_is_busy()) return;
+    OSWindow *callback_os_window = global_state.callback_os_window;
+    global_state.callback_os_window = osw;
+    update_mouse_pointer_shape();
+    global_state.callback_os_window = callback_os_window;
+}
+
+// Show or remove the link hover highlight in the window under the mouse when
+// modifiers change without the mouse moving. Returns true if the highlight changed.
+bool
+update_link_hover_for_modifiers(int old_mods, int new_mods) {
+    old_mods &= MOUSE_MAPPING_MODS_MASK;
+    new_mods &= MOUSE_MAPPING_MODS_MASK;
+    if (old_mods == new_mods || !OPT(detect_urls) || mouse_is_busy()) return false;
+    OSWindow *osw;
+    Window *w = hovered_window(&osw);
+    if (!w) return false;
+    Screen *screen = w->render_data.screen;
+    if (!w->visible || !screen || w->scrollbar.is_hovering || w->scrollbar.is_dragging) return false;
+    const bool was_highlighted = screen->url_ranges.count > 0;
+    OSWindow *callback_os_window = global_state.callback_os_window;
+    global_state.callback_os_window = osw;
+    // The stored cell is stale when the mouse is in the window padding
+    unsigned x, y;
+    bool in_left_half_of_cell, over_cell = cell_for_pos(w, &x, &y, &in_left_half_of_cell, osw);
+    bool changed = false;
+    // Compare against what is displayed rather than old_mods as the mouse
+    // tracking mode, and thus the applicable mappings, may have changed since
+    if (over_cell ? was_highlighted != url_is_clickable_with(screen, new_mods) : was_highlighted) {
+        if (over_cell) detect_url(screen, x, y, new_mods);
+        else {
+            screen_mark_url(screen, 0, 0, 0, 0);
+            zero_at_ptr(&screen->current_hyperlink_under_mouse);
+            set_mouse_cursor_for_screen(screen);
+        }
+        changed = was_highlighted != (screen->url_ranges.count > 0);
+        set_mouse_cursor(mouse_cursor_shape);
+    }
+    global_state.callback_os_window = callback_os_window;
+    return changed;
 }
 
 void
@@ -1607,9 +1709,6 @@ mapped_scroll_steps(GLFWOffsetType offset_type, double offset, double *pending, 
 
 // Bit i of wheel_mappings[button - MOUSE_WHEEL_UP][grabbed] is set when the wheel is mapped
 // with the modifiers i, so that unmapped scrolling never calls into Python.
-#define WHEEL_MAPPING_MODS_MASK (GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_CONTROL | GLFW_MOD_SUPER | GLFW_MOD_HYPER | GLFW_MOD_META)
-static_assert(WHEEL_MAPPING_MODS_MASK < 64, "wheel mapping modifiers must fit in a uint64_t bitmap");
-
 bool
 set_wheel_mappings(PyObject *py_opts, Options *opts) {
     memset(opts->wheel_mappings, 0, sizeof(opts->wheel_mappings));
@@ -1630,10 +1729,37 @@ set_wheel_mappings(PyObject *py_opts, Options *opts) {
         const long button = PyLong_AsLong(PyTuple_GET_ITEM(key, 0)), mods = PyLong_AsLong(PyTuple_GET_ITEM(key, 1));
         if (PyErr_Occurred()) return false;
         // modifiers outside the mask are stripped from events, so such a mapping can never match
-        if (button < MOUSE_WHEEL_UP || button > MOUSE_WHEEL_RIGHT || (mods & ~WHEEL_MAPPING_MODS_MASK)) continue;
+        if (button < MOUSE_WHEEL_UP || button > MOUSE_WHEEL_RIGHT || (mods & ~MOUSE_MAPPING_MODS_MASK)) continue;
         const int grabbed = PyObject_IsTrue(PyTuple_GET_ITEM(key, 3));
         if (grabbed < 0) return false;
         opts->wheel_mappings[button - MOUSE_WHEEL_UP][grabbed] |= 1ull << mods;
+    }
+    return true;
+}
+
+// Bit i of url_mappings[grabbed] is set when a mouse button opens the hovered URL
+// with the modifiers i, computed by finalize_mouse_mappings() in config.py
+bool
+set_url_mappings(PyObject *py_opts, Options *opts) {
+    memset(opts->url_mappings, 0, sizeof(opts->url_mappings));
+    RAII_PyObject(url_mappings, PyObject_GetAttrString(py_opts, "url_mappings"));
+    if (!url_mappings) return false;
+    if (!PyDict_Check(url_mappings)) {
+        PyErr_SetString(PyExc_TypeError, "url_mappings must be a dict");
+        return false;
+    }
+    for (size_t grabbed = 0; grabbed < arraysz(opts->url_mappings); grabbed++) {
+        PyObject *mask = PyDict_GetItemWithError(url_mappings, grabbed ? Py_True : Py_False);
+        if (!mask) {
+            if (PyErr_Occurred()) return false;
+            continue; // an empty dict, as in the unfinalized defaults, means no mappings
+        }
+        if (!PyLong_Check(mask)) {
+            PyErr_SetString(PyExc_TypeError, "url_mappings values must be ints");
+            return false;
+        }
+        opts->url_mappings[grabbed] = PyLong_AsUnsignedLongLong(mask);
+        if (PyErr_Occurred()) return false;
     }
     return true;
 }
@@ -1758,7 +1884,7 @@ scroll_event_in_window(OSWindow *osw, Window *w, const GLFWScrollEvent *ev, unsi
     }
     if (ev->momentum_type == GLFW_NO_MOMENTUM_DATA) {
         const bool grabbed = screen->modes.mouse_tracking_mode != NO_TRACKING;
-        const int mods = ev->keyboard_modifiers & WHEEL_MAPPING_MODS_MASK;
+        const int mods = ev->keyboard_modifiers & MOUSE_MAPPING_MODS_MASK;
         if (dispatch_mapped_scroll(osw, w, ev, mods, grabbed)) osw->scroll.mapped_gesture = true;
         else if (osw->scroll.mapped_gesture) {
             osw->scroll.mapped_gesture = continues_mapped_gesture(osw, w, ev, mods, grabbed);
@@ -1949,7 +2075,7 @@ send_mock_mouse_event_to_window(PyObject *self UNUSED, PyObject *args) {
         if (button == -2) do_drag_scroll(w, true);
         else if (button == -3) do_drag_scroll(w, false);
         else {
-            if (OPT(detect_urls)) detect_url(w->render_data.screen, x, y);
+            if (OPT(detect_urls)) detect_url(w->render_data.screen, x, y, modifiers);
             handle_mouse_movement_in_kitty(w, last_button_pressed, mouse_cell_changed);
             handle_potential_drag(w, last_button_pressed);
         }
@@ -1966,7 +2092,107 @@ send_mock_mouse_event_to_window(PyObject *self UNUSED, PyObject *args) {
             }
         }
     }
-    Py_RETURN_NONE;
+    return PyLong_FromLong(mouse_cursor_shape);
+}
+
+static PyObject *
+update_mock_pointer(PyObject *self UNUSED, PyObject *args) {
+    PyObject *capsule;
+    int old_mods, new_mods, inside = 1, in_padding = 0;
+    unsigned drag = 0, border = 0;
+    const char *pointer_shape = NULL;
+    PyObject *before_update = Py_None;
+    if (!PyArg_ParseTuple(
+            args, "O!ii|pIIzpO", &PyCapsule_Type, &capsule, &old_mods, &new_mods, &inside, &drag, &border, &pointer_shape, &in_padding, &before_update))
+        return NULL;
+    Window *w = PyCapsule_GetPointer(capsule, "Window");
+    if (!w) return NULL;
+    Screen *screen = w->render_data.screen;
+    // Only the global state used by mouse handling is overridden, so that is all that is restored
+    struct {
+        OSWindow *callback_os_window;
+        id_type mouse_hover_in_window, active_drag_in_window, tracked_drag_in_window, active_drag_resize, tab_being_dragged, window_being_dragged;
+        bool redirect_mouse_handling;
+        int mods_at_last_key_or_button_event;
+    } saved = {
+        global_state.callback_os_window,
+        global_state.mouse_hover_in_window,
+        global_state.active_drag_in_window,
+        global_state.tracked_drag_in_window,
+        global_state.active_drag_resize,
+        global_state.tab_being_dragged.id,
+        global_state.window_being_dragged.id,
+        global_state.redirect_mouse_handling,
+        global_state.mods_at_last_key_or_button_event};
+    MouseShape saved_shape = mouse_cursor_shape;
+    // The mock window is placed in a tab by value and copied back afterwards, so
+    // that any heap state the handlers change stays owned by it. The second
+    // window exists only to give the tab a border and owns nothing.
+    const WindowGeometry saved_geometry = w->render_data.geometry;
+    const WindowGeometry geometry = {.right = screen->columns * 10, .bottom = screen->lines * 20};
+    Window windows[2] = {*w, {.id = w->id + 1, .visible = true, .render_data = {.screen = screen, .geometry = geometry}}};
+    windows[0].render_data.geometry = geometry;
+    const unsigned saved_padding_right = w->padding.right;
+    windows[0].padding.right = 10;
+    BorderRect rect = {.border_type = (int)w->id, .horizontal = border == 2};
+    rect.px.left = (unsigned)w->mouse_pos.global_x;
+    rect.px.right = rect.px.left + 1;
+    rect.px.top = (unsigned)w->mouse_pos.global_y;
+    rect.px.bottom = rect.px.top + 1;
+    Tab tab = {.windows = windows, .num_windows = border ? 2 : 1};
+    tab.border_rects.rect_buf = &rect;
+    tab.border_rects.num_border_rects = border ? 1 : 0;
+    struct {
+        FONTS_DATA_HEAD
+    } fonts = {.logical_dpi_x = 72, .logical_dpi_y = 72, .fcm = {.cell_width = 10, .cell_height = 20}};
+    OSWindow osw = {
+        .tabs = &tab,
+        .num_tabs = 1,
+        .has_too_few_tabs = true,
+        .fonts_data = (FONTS_DATA_HANDLE)&fonts,
+        .viewport_width = screen->columns * 10 + 10,
+        .viewport_height = screen->lines * 20,
+        .mouse_x = w->mouse_pos.global_x,
+        .mouse_y = w->mouse_pos.global_y};
+    global_state.callback_os_window = &osw;
+    global_state.mouse_hover_in_window = global_state.active_drag_in_window = global_state.tracked_drag_in_window = global_state.active_drag_resize = 0;
+    global_state.tab_being_dragged.id = global_state.window_being_dragged.id = 0;
+    global_state.redirect_mouse_handling = false;
+    global_state.mods_at_last_key_or_button_event = old_mods;
+    mouse_event(-1, old_mods, -1);
+    if (in_padding) {
+        osw.mouse_x = geometry.right + 5;
+        mouse_event(-1, old_mods, -1);
+    }
+    if (!inside) leave_event(old_mods);
+    if (drag == 1) global_state.active_drag_in_window = w->id;
+    else if (drag == 2) global_state.tracked_drag_in_window = w->id;
+    global_state.mods_at_last_key_or_button_event = new_mods;
+    bool updated = false, ok = true;
+    if (before_update != Py_None) {
+        RAII_PyObject(ret, PyObject_CallNoArgs(before_update));
+        ok = ret != NULL;
+    }
+    if (ok && pointer_shape) {
+        RAII_PyObject(ret, PyObject_CallMethod((PyObject *)screen, "change_pointer_shape", "ss", "=", pointer_shape));
+        if (ret) update_mouse_pointer_shape();
+    } else if (ok) updated = update_link_hover_for_modifiers(old_mods, new_mods);
+    MouseShape result = mouse_cursor_shape;
+    *w = windows[0];
+    w->render_data.geometry = saved_geometry;
+    w->padding.right = saved_padding_right;
+    global_state.callback_os_window = saved.callback_os_window;
+    global_state.mouse_hover_in_window = saved.mouse_hover_in_window;
+    global_state.active_drag_in_window = saved.active_drag_in_window;
+    global_state.tracked_drag_in_window = saved.tracked_drag_in_window;
+    global_state.active_drag_resize = saved.active_drag_resize;
+    global_state.tab_being_dragged.id = saved.tab_being_dragged;
+    global_state.window_being_dragged.id = saved.window_being_dragged;
+    global_state.redirect_mouse_handling = saved.redirect_mouse_handling;
+    global_state.mods_at_last_key_or_button_event = saved.mods_at_last_key_or_button_event;
+    mouse_cursor_shape = saved_shape;
+    if (PyErr_Occurred()) return NULL;
+    return Py_BuildValue("(iO)", result, updated ? Py_True : Py_False);
 }
 
 static PyObject *
@@ -2043,6 +2269,7 @@ static PyMethodDef module_methods[] = {
     METHODB(test_scale_scroll, METH_VARARGS),
     METHODB(test_mapped_scroll_steps, METH_VARARGS),
     METHODB(send_mock_mouse_event_to_window, METH_VARARGS),
+    METHODB(update_mock_pointer, METH_VARARGS),
     METHODB(send_mock_scroll_event_to_window, METH_VARARGS),
     METHODB(mock_mouse_selection, METH_VARARGS),
     {NULL, NULL, 0, NULL} /* Sentinel */

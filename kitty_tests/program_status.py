@@ -149,6 +149,11 @@ class TestProgramStatus(BaseTest):
         self.ae(len(ps.records), MAX_RECORDS)
         self.assertNotIn('r1', ps.records)
         self.assertIn('r0', ps.records)
+        # an identical report still counts as recent for eviction
+        self.assertFalse(apply('state=idle:id=r2'))
+        apply('state=idle:id=newer')
+        self.assertIn('r2', ps.records)
+        self.assertNotIn('r3', ps.records)
 
     def test_program_status_symbol(self):
         self.ae(status_symbol(None), '')
@@ -183,3 +188,13 @@ class TestProgramStatus(BaseTest):
         # an identical report does not change which record is shown
         b.apply(parse_report('state=working:progress=20'))
         self.ae(combined_status_symbol([a, b]), '\uf110  2 30% ')
+        # the same rule applies to several records within one window
+        w = window('state=working:id=x:progress=10', 'state=working:id=y:progress=20')
+        self.ae(combined_status_symbol([w]), '\uf110  20% ')
+        self.ae(w.handle_escape_code(b'state=working:id=x:progress=10'), ('', False))
+        self.ae(combined_status_symbol([w]), '\uf110  20% ')
+        # an identical report does not reorder the records either
+        self.ae([d['id'] for d in w.as_list()], ['x', 'y'])
+        w.apply(parse_report('state=working:id=x:progress=30'))
+        self.ae(combined_status_symbol([w]), '\uf110  30% ')
+        self.ae([d['id'] for d in w.as_list()], ['y', 'x'])

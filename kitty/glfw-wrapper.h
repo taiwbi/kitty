@@ -1160,8 +1160,14 @@ typedef struct GLFWLayerShellConfig {
     } related;
 } GLFWLayerShellConfig;
 
+typedef struct GLFWTitlebarFont {
+    const char *family;  // NULL means use the default font
+    double point_size, text_scale;
+    bool bold, italic;
+} GLFWTitlebarFont;
+
 typedef struct GLFWDBUSNotificationData {
-    const char *app_name, *icon, *summary, *body, *category, **actions;
+    const char *app_name, *icon, *summary, *body, *category, *desktop_entry, **actions;
     size_t num_actions;
     int32_t timeout;
     uint8_t urgency;
@@ -1303,13 +1309,19 @@ typedef void (*GLFWwindowclosefun)(GLFWwindow *);
  *  void function_name(int flags)
  *  @endcode
  *
- *  @param[in] flags 0 for a user requested application quit, 1 if a fatal error occurred and application should quit ASAP
+ *  @param[in] flags 0 for a user requested application quit, otherwise a
+ *  combination of the GLFW_APPLICATION_CLOSE_* flags
  *
  *  @sa @ref glfwSetApplicationCloseCallback
  *
  *  @ingroup window
  */
 typedef void (*GLFWapplicationclosefun)(int);
+
+/*! A fatal error occurred and the application should quit ASAP */
+#define GLFW_APPLICATION_CLOSE_FATAL_ERROR 1
+/*! The OS asked the application to quit because the user is logging out, restarting or shutting down */
+#define GLFW_APPLICATION_CLOSE_LOGOUT 2
 
 
 /*! @brief The function pointer type for system color theme change callbacks.
@@ -1934,6 +1946,7 @@ typedef void (* GLFWcocoarenderframefun)(GLFWwindow*);
 typedef void (*GLFWwaylandframecallbackfunc)(unsigned long long id);
 typedef void (*GLFWDBusnotificationcreatedfun)(unsigned long long, uint32_t, void*);
 typedef void (*GLFWDBusnotificationactivatedfun)(uint32_t, int, const char*);
+typedef void (*GLFWDBussessionstatefun)(uint32_t);
 typedef int (*glfwInit_func)(monotonic_t, bool*);
 GFW_EXTERN glfwInit_func glfwInit_impl;
 #define glfwInit glfwInit_impl
@@ -2269,6 +2282,10 @@ GFW_EXTERN glfwSetClipboardLostCallback_func glfwSetClipboardLostCallback_impl;
 typedef GLFWColorScheme (*glfwGetCurrentSystemColorTheme_func)(bool);
 GFW_EXTERN glfwGetCurrentSystemColorTheme_func glfwGetCurrentSystemColorTheme_impl;
 #define glfwGetCurrentSystemColorTheme glfwGetCurrentSystemColorTheme_impl
+
+typedef GLFWTitlebarFont (*glfwGetTitlebarFont_func)(void);
+GFW_EXTERN glfwGetTitlebarFont_func glfwGetTitlebarFont_impl;
+#define glfwGetTitlebarFont glfwGetTitlebarFont_impl
 
 typedef GLFWwindowrefreshfun (*glfwSetWindowRefreshCallback_func)(GLFWwindow*, GLFWwindowrefreshfun);
 GFW_EXTERN glfwSetWindowRefreshCallback_func glfwSetWindowRefreshCallback_impl;
@@ -2681,6 +2698,10 @@ GFW_EXTERN glfwDBusUserNotify_func glfwDBusUserNotify_impl;
 typedef void (*glfwDBusSetUserNotificationHandler_func)(GLFWDBusnotificationactivatedfun);
 GFW_EXTERN glfwDBusSetUserNotificationHandler_func glfwDBusSetUserNotificationHandler_impl;
 #define glfwDBusSetUserNotificationHandler glfwDBusSetUserNotificationHandler_impl
+
+typedef bool (*glfwDBusMonitorSessionState_func)(GLFWDBussessionstatefun);
+GFW_EXTERN glfwDBusMonitorSessionState_func glfwDBusMonitorSessionState_impl;
+#define glfwDBusMonitorSessionState glfwDBusMonitorSessionState_impl
 
 typedef int (*glfwSetX11LaunchCommand_func)(GLFWwindow*, char**, int);
 GFW_EXTERN glfwSetX11LaunchCommand_func glfwSetX11LaunchCommand_impl;

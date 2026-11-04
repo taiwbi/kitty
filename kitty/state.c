@@ -382,7 +382,11 @@ initialize_window(Window *w, PyObject *title, bool init_gpu_resources) {
         if (PyErr_Occurred()) PyErr_Print();
     }
     if (init_gpu_resources) create_gpu_resources_for_window(w);
-    else { w->render_data.vao_idx = -1; }
+    else {
+        // Mock windows have no graphics context. Neither VAO may be deleted when
+        // the mock window is destroyed by the mouse regression tests.
+        w->render_data.vao_idx = w->window_title_render_data.vao_idx = -1;
+    }
 }
 
 static id_type
@@ -769,8 +773,11 @@ vertical_tab_bar_cols(const OSWindow *os_window, long margin_outer, long margin_
     long available_width = (long)os_window->viewport_width - margin_outer - margin_inner;
     if (available_width <= 0) return 0;
     unsigned available_cols = MAX(1u, (unsigned)available_width / cell_width);
-    unsigned title_cols = OPT(tab_title_max_length) > 0 ? (unsigned)OPT(tab_title_max_length) : 20u;
-    unsigned desired_cols = title_cols + 8u;
+    // Without an explicit title length use a default sidebar wide enough for
+    // about twenty title cells, otherwise fit the title and whatever
+    // decorations the tab bar style draws around it.
+    unsigned desired_cols = 28u;
+    if (OPT(tab_title_max_length) > 0) desired_cols = MAX((unsigned)OPT(tab_title_max_length) + OPT(vertical_tab_bar.padding), OPT(vertical_tab_bar.min_cols));
     unsigned soft_max = available_cols / 3u;
     if (soft_max < 6u) soft_max = available_cols;
     return MAX(1u, MIN(available_cols, MIN(desired_cols, MAX(1u, soft_max))));
@@ -1094,6 +1101,45 @@ PYWRAP0(get_options) {
     return global_state.options_object;
 }
 
+static bool
+set_vertical_tab_bar_padding(PyObject *py_opts, Options *opts) {
+    // The number of cells each tab bar style draws around the title in a
+    // vertical tab bar, see the draw_tab_with_* functions in tab_bar.py.
+    // Custom styles can draw anything, so give them generous room.
+    opts->vertical_tab_bar.padding = 8;
+    opts->vertical_tab_bar.min_cols = 1;
+    RAII_PyObject(style, PyObject_GetAttrString(py_opts, "tab_bar_style"));
+    if (!style) return false;
+    if (PyUnicode_CompareWithASCIIString(style, "fade") == 0) {
+        RAII_PyObject(fade, PyObject_GetAttrString(py_opts, "tab_fade"));
+        if (!fade) return false;
+        Py_ssize_t n = PyObject_Length(fade);
+        if (n < 0) return false;
+        // Fade cells on both sides of the title, the trailing ones are only
+        // drawn when they end before the last column
+        opts->vertical_tab_bar.padding = 2 * (unsigned)n + (n < 2 ? 1 : 0);
+    } else if (PyUnicode_CompareWithASCIIString(style, "powerline") == 0) {
+        // Leading space, trailing space and the separator
+        opts->vertical_tab_bar.padding = 3;
+    } else if (PyUnicode_CompareWithASCIIString(style, "slant") == 0) {
+        // Separators and spaces on both sides of the title, tabs narrower
+        // than six cells show only an ellipsis
+        opts->vertical_tab_bar.padding = 4;
+        opts->vertical_tab_bar.min_cols = 6;
+    } else if (PyUnicode_CompareWithASCIIString(style, "separator") == 0) {
+        // The spaces in tab_separator, plus the column reserved at the end
+        RAII_PyObject(sep, PyObject_GetAttrString(py_opts, "tab_separator"));
+        if (!sep) return false;
+        Py_ssize_t len = PyUnicode_GetLength(sep);
+        if (len < 0) return false;
+        unsigned spaces = 0;
+        for (Py_ssize_t i = 0; i < len && PyUnicode_READ_CHAR(sep, i) == ' '; i++) spaces++;
+        for (Py_ssize_t i = len - 1; i >= (Py_ssize_t)spaces && PyUnicode_READ_CHAR(sep, i) == ' '; i--) spaces++;
+        opts->vertical_tab_bar.padding = spaces + 1;
+    }
+    return true;
+}
+
 PYWRAP1(set_options) {
     PyObject *opts;
     int is_wayland = 0, debug_rendering = 0, debug_font_fallback = 0;
@@ -1112,6 +1158,8 @@ PYWRAP1(set_options) {
     global_state.debug_font_fallback = debug_font_fallback ? true : false;
     if (!convert_opts_from_python_opts(opts, &global_state.opts)) return NULL;
     if (!set_wheel_mappings(opts, &global_state.opts)) return NULL;
+    if (!set_url_mappings(opts, &global_state.opts)) return NULL;
+    if (!set_vertical_tab_bar_padding(opts, &global_state.opts)) return NULL;
     push_modifier_remap_to_glfw();
     Py_XDECREF(global_state.options_object);
     global_state.options_object = Py_NewRef(opts);
@@ -1246,12 +1294,19 @@ PYWRAP1(set_application_quit_request) {
     CloseRequest cr = IMPERATIVE_CLOSE_REQUESTED;
     PA("|i", &cr);
     global_state.quit_request = cr;
+    if (cr == NO_CLOSE_REQUESTED) global_state.logout_quit.requested = false;
     global_state.has_pending_closes = true;
     request_tick_callback();
     Py_RETURN_NONE;
 }
 
 PYWRAP0(current_application_quit_request) { return Py_BuildValue("i", global_state.quit_request); }
+
+PYWRAP0(application_logout_requested_at) {
+    // The monotonic time at which the OS asked kitty to quit for a logout, restart or shutdown, or -1 if it has not done so since
+    // the last time a quit was cancelled
+    return PyFloat_FromDouble(global_state.logout_quit.requested ? monotonic_t_to_s_double(global_state.logout_quit.at) : -1);
+}
 
 PYWRAP1(focus_os_window) {
     id_type os_window_id;
@@ -1441,8 +1496,10 @@ PYWRAP1(set_os_window_title) {
 
 PYWRAP1(get_os_window_title) {
     id_type os_window_id;
-    PA("K", &os_window_id);
+    int only_if_overridden = 0;
+    PA("K|p", &os_window_id, &only_if_overridden);
     WITH_OS_WINDOW(os_window_id)
+    if (only_if_overridden && !os_window->disallow_title_changes && !os_window->title_is_overriden) break;
     if (os_window->window_title) return Py_BuildValue("O", os_window->window_title);
     END_WITH_OS_WINDOW
     Py_RETURN_NONE;
@@ -1606,6 +1663,26 @@ PYWRAP0(apply_options_update) {
     Py_RETURN_NONE;
 }
 
+// Indexed color images use the url color, so the color tables on the GPU must
+// be refreshed when it changes
+static void
+mark_all_color_profiles_dirty(void) {
+    for (size_t o = 0; o < global_state.num_os_windows; o++) {
+        OSWindow *osw = global_state.os_windows + o;
+        for (size_t t = 0; t < osw->num_tabs; t++) {
+            Tab *tab = osw->tabs + t;
+            for (size_t w = 0; w < tab->num_windows; w++) {
+                Screen *screen = tab->windows[w].render_data.screen;
+                if (screen) {
+                    screen->color_profile->dirty = true;
+                    screen->paused_rendering.color_profile.dirty = true;
+                    screen->is_dirty = true;
+                }
+            }
+        }
+    }
+}
+
 PYWRAP1(patch_global_colors) {
     PyObject *spec;
     int configured;
@@ -1629,7 +1706,9 @@ PYWRAP1(patch_global_colors) {
     P(scrollbar_track_color);
     if (configured) {
         P(background);
+        const color_type prev_url_color = OPT(url_color);
         P(url_color);
+        if (OPT(url_color) != prev_url_color) mark_all_color_profiles_dirty();
     }
     if (PyErr_Occurred()) return NULL;
     Py_RETURN_NONE;
@@ -2097,6 +2176,7 @@ static PyMethodDef module_methods[] = {
     MW(mark_os_window_for_close, METH_VARARGS),
     MW(set_application_quit_request, METH_VARARGS),
     MW(current_application_quit_request, METH_NOARGS),
+    MW(application_logout_requested_at, METH_NOARGS),
     MW(set_os_window_chrome, METH_VARARGS),
     MW(focus_os_window, METH_VARARGS),
     MW(mark_tab_bar_dirty, METH_VARARGS),

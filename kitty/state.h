@@ -44,6 +44,12 @@ typedef enum ShowHyperlinkTargets {
     SHOW_HYPERLINK_TARGETS_SUPER = 8,
     SHOW_HYPERLINK_TARGETS_ALT = 16
 } ShowHyperlinkTargets;
+typedef enum HyperlinkTargetPosition {
+    HYPERLINK_TARGET_TOP = 0,
+    HYPERLINK_TARGET_BOTTOM = 1,
+    HYPERLINK_TARGET_BELOW = 2,
+    HYPERLINK_TARGET_TOOLTIP = 3
+} HyperlinkTargetPosition;
 
 struct MenuItem {
     const char **location;
@@ -136,6 +142,8 @@ typedef struct Options {
     // wheel with the modifiers i, button is 0 for wheel_up, 1 for wheel_down,
     // 2 for wheel_left and 3 for wheel_right
     uint64_t wheel_mappings[4][2];
+    // Bit i is set when a mouse button opens the hovered URL with modifiers i.
+    uint64_t url_mappings[2]; // ungrabbed, grabbed
     bool window_alert_on_bell;
     bool macos_dock_badge_on_bell;
     bool debug_keyboard;
@@ -157,6 +165,9 @@ typedef struct Options {
         size_t count;
     } detect_url_regex;
     bool tab_bar_hidden;
+    struct {
+        unsigned padding, min_cols;
+    } vertical_tab_bar;
     double font_size;
     struct {
         double outer, inner;
@@ -168,6 +179,7 @@ typedef struct Options {
         AdjustmentUnit unit;
     } underline_position, underline_thickness, strikethrough_position, strikethrough_thickness, cell_width, cell_height, baseline;
     ShowHyperlinkTargets show_hyperlink_targets;
+    HyperlinkTargetPosition hyperlink_target_position;
     UnderlineHyperlinks underline_hyperlinks;
     int background_blur;
     long macos_titlebar_color;
@@ -253,7 +265,8 @@ typedef struct PendingClick {
 
 
 typedef struct WindowBarData {
-    unsigned width, height;
+    unsigned width, height, requested_width;
+    bool fit_to_text;
     uint8_t *buf;
     PyObject *last_drawn_title_object_id;
     hyperlink_id_type hyperlink_id_for_title_object;
@@ -521,6 +534,22 @@ typedef struct ShaderAnimState {
     monotonic_t next_end_at; // earliest expiry of a duration bounded active animation, MONOTONIC_T_MAX if none
 } ShaderAnimState;
 
+typedef struct ShaderGroupAnimState {
+    bool active;
+    monotonic_t started_at;
+    // When animation_progress would have been zero, before applying the
+    // easing curve, had it been rising since then without interruption
+    monotonic_t ramp_started_at;
+    // Non-zero while the group is active only to play its animation in
+    // reverse after being stopped, the time at which that finishes
+    monotonic_t reverse_ends_at;
+    // How many more times to play the animation forwards and in reverse
+    // after the current reverse finishes
+    unsigned loops_left;
+    // true while playing the animation forwards in one of those loops
+    bool looping;
+} ShaderGroupAnimState;
+
 typedef enum {
     SHADER_ANIM_EVENT_POINTER_LEFT_BUTTON_PRESS,
     SHADER_ANIM_EVENT_OS_WINDOW_FOCUS_IN,
@@ -535,6 +564,13 @@ typedef enum {
     SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP,
     NUM_SHADER_ANIM_EVENTS
 } ShaderAnimationEvent;
+// Events named by the pipeline itself, with the user: prefix, and fired by the
+// shader_event action occupy the bits above the builtin events
+#define SHADER_ANIM_FIRST_USER_EVENT 16
+#define MAX_SHADER_ANIM_USER_EVENTS (64 - SHADER_ANIM_FIRST_USER_EVENT)
+#define MAX_SHADER_ANIM_USER_EVENT_NAME_LEN 63
+// Bitmask of ShaderAnimationEvent values and user events
+typedef uint64_t ShaderAnimEventMask;
 
 typedef struct OSWindow {
     void *handle;
@@ -620,18 +656,18 @@ typedef struct OSWindow {
         monotonic_t mapped_last_event_at;
         bool mapped_gesture, mapped_grabbed;
     } scroll;
-    unsigned shader_anim_event_registry;
+    ShaderAnimEventMask shader_anim_event_registry;
     id_type last_bell_window_id; // ID of the most recent window that received a bell event
-    struct {
-        bool active;
-        monotonic_t started_at;
-    } shader_group_anim[MAX_CUSTOM_SHADER_GROUPS];
+    ShaderGroupAnimState shader_group_anim[MAX_CUSTOM_SHADER_GROUPS];
     ShaderAnimState shader_anim;
     struct {
         // POINTER_MAP_SIZE x POINTER_MAP_SIZE (x, y) pairs, rows from the bottom up, in viewport UV
         float *data;
         int viewport_width, viewport_height;
         unsigned pipeline_generation;
+        // Bitmask of the groups whose pointer_map() functions data was computed
+        // from, zero when there are none and so pointer events are not moved
+        uint32_t groups;
     } pointer_map;
 } OSWindow;
 
@@ -665,6 +701,10 @@ typedef struct GlobalState {
     int active_drag_button, tracked_drag_button;
     int mods_at_last_key_or_button_event;
     CloseRequest quit_request;
+    struct {
+        bool requested;
+        monotonic_t at;
+    } logout_quit;
     bool redirect_mouse_handling;
     // Set once an IME composition has been seen, see sync_ime_position_with_cursor()
     bool ime_used;
@@ -798,6 +838,7 @@ void set_gpu_viewport(unsigned w, unsigned h);
 void free_texture(uint32_t *);
 void free_framebuffer(uint32_t *);
 void send_image_to_gpu(uint32_t *, const void *, int32_t, int32_t, bool, bool, bool, RepeatStrategy);
+void send_indexed_image_to_gpu(uint32_t *, const void *, int32_t, int32_t, unsigned, bool);
 void send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index, pixel *, sprite_index);
 void send_padded_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index, pixel *, sprite_index);
 void blank_canvas(float, color_type, bool);
@@ -850,18 +891,21 @@ void update_ime_state_in_os_window(OSWindow *osw, Window *window, int update_foc
 void set_ignore_os_keyboard_processing(bool enabled);
 void push_modifier_remap_to_glfw(void);
 bool set_wheel_mappings(PyObject *py_opts, Options *opts);
+bool set_url_mappings(PyObject *py_opts, Options *opts);
 void update_menu_bar_title(PyObject *title UNUSED);
 void change_live_resize_state(OSWindow *, bool);
 bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images);
 void update_mouse_pointer_shape(void);
+bool update_link_hover_for_modifiers(int old_mods, int new_mods);
+void link_hover_cleared_by_output(Screen *screen);
 void adjust_window_size_for_csd(OSWindow *w, int width, int height, int *adjusted_width, int *adjusted_height);
 void dispatch_buffered_keys(Window *w);
 void free_buffered_keys(Window *w);
 bool screen_needs_rendering_in_layers(OSWindow *os_window, Window *w, Screen *screen);
 void setup_os_window_for_rendering(OSWindow *, Tab *, Window *, bool, monotonic_t);
-monotonic_t update_custom_shader_animations(unsigned event_mask, monotonic_t now, OSWindow *os_window);
+monotonic_t update_custom_shader_animations(ShaderAnimEventMask event_mask, monotonic_t now, OSWindow *os_window);
 void init_shader_animation_state(OSWindow *os_window);
-bool custom_shader_needs_render(const ShaderAnimState *before, const ShaderAnimState *after, unsigned event_mask, monotonic_t now);
+bool custom_shader_needs_render(const ShaderAnimState *before, const ShaderAnimState *after, ShaderAnimEventMask event_mask, monotonic_t now);
 void map_pointer_position(const OSWindow *os_window, double *x, double *y);
 void set_os_window_mouse_position(OSWindow *window, double x, double y);
 void swap_window_buffers(OSWindow *w);
