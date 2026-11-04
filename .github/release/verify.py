@@ -40,9 +40,16 @@ def check_bundle(path: Path, arch: str) -> None:
     with tarfile.open(path) as tf:
         members = {m.name.removeprefix('./'): m for m in tf}
         for name in (
-            'bin/kitty', 'bin/kitten', 'lib/cacert.pem', 'share/man/man1/kitty.1', 'share/doc/kitty/html/index.html',
-            'lib/libgtk-4.so.1', 'lib/libadwaita-1.so.0', 'lib/libgirepository-2.0.so.0',
-            'lib/girepository-1.0/Gtk-4.0.typelib', 'lib/girepository-1.0/Adw-1.typelib',
+            'bin/kitty',
+            'bin/kitten',
+            'lib/cacert.pem',
+            'share/man/man1/kitty.1',
+            'share/doc/kitty/html/index.html',
+            'lib/libgtk-4.so.1',
+            'lib/libadwaita-1.so.0',
+            'lib/libgirepository-2.0.so.0',
+            'lib/girepository-1.0/Gtk-4.0.typelib',
+            'lib/girepository-1.0/Adw-1.typelib',
             'share/glib-2.0/schemas/gschemas.compiled',
         ):
             assert name in members, f'{path}: missing {name}'
@@ -62,8 +69,10 @@ def main() -> None:
     dest = Path('dist')
     kittens = {f'kitten-{goos}-{arch}': (goos, arch) for goos, arches in PLATFORMS.items() for arch in arches}
     expected = set(kittens) | {
-        f'kitty-{version}-x86_64.txz', f'kitty-{version}-arm64.txz',
-        f'kitty-{version}.tar.xz', f'kitty-{version}.tar.xz.spdx.json',
+        f'kitty-{version}-x86_64.txz',
+        f'kitty-{version}-arm64.txz',
+        f'kitty-{version}.tar.xz',
+        f'kitty-{version}.tar.xz.spdx.json',
     }
     actual = {p.name for p in dest.iterdir()} - {'SHA256SUMS'}
     assert actual == expected, f'Asset matrix mismatch: missing={expected - actual}, unexpected={actual - expected}'

@@ -23,9 +23,11 @@ class TestSystemd(BaseTest):
             library = Path(tdir) / 'libsystemd.so'
             subprocess.run(
                 [compiler, '-shared', '-fPIC', '-x', 'c', '-', '-o', str(library)],
-                input=b'int sd_bus_default_user(void **bus) { return -38; }', check=True, capture_output=True,
+                input=b'int sd_bus_default_user(void **bus) { return -38; }',
+                check=True,
+                capture_output=True,
             )
-            code = '''
+            code = """
 import ctypes, os, sys
 try:
     runtime = ctypes.CDLL('libsystemd.so.0')
@@ -39,7 +41,7 @@ except (NotImplementedError, OSError):
 with open('/proc/self/maps') as f:
     if os.environ['KITTY_TEST_SYSTEMD_LIBRARY'] in f.read():
         raise RuntimeError('loaded a second libsystemd through the host development symlink')
-'''
+"""
             env = dict(os.environ, KITTY_TEST_SYSTEMD_LIBRARY=str(library))
             env['LD_LIBRARY_PATH'] = tdir + os.pathsep + env.get('LD_LIBRARY_PATH', '')
             result = subprocess.run([kitty_exe(), '+runpy', code], env=env, capture_output=True, timeout=10)

@@ -16,9 +16,7 @@ from kitty.fast_data_types import gtk_backend_available
 
 assert sys.frozen, 'Expected the frozen Python runtime'
 assert ssl.create_default_context().get_ca_certs(), 'The shipped CA bundle did not load'
-assert gtk_backend_available(), (
-    'The frozen Linux release was built without GTK 4/libadwaita support'
-)
+assert gtk_backend_available(), 'The frozen Linux release was built without GTK 4/libadwaita support'
 for module in ('bz2', 'lzma', 'ctypes', 'sqlite3', 'cairo', 'kittens.transfer.rsync', 'kitty.fast_data_types'):
     importlib.import_module(module)
 # Importing the real window module also checks PyGObject, typelibs, libadwaita
@@ -29,8 +27,10 @@ gtk_window = importlib.import_module('kitty.gtk_window')
 # or system GTK/icon installation is available in the minimal runtime image.
 gtk_window.initialize_gtk()
 chrome = gtk_window.GtkTabHeaderBar(
-    on_new_tab=lambda: None, on_select_tab=lambda _: None,
-    on_close_tab=lambda _: None, on_reorder_tabs=lambda _: None,
+    on_new_tab=lambda: None,
+    on_select_tab=lambda _: None,
+    on_close_tab=lambda _: None,
+    on_reorder_tabs=lambda _: None,
 )
 assert chrome.new_tab_button.has_css_class('flat')
 icon = chrome.new_tab_button.get_child()
@@ -43,9 +43,13 @@ assert pixels[8 * surface.get_stride() + 8 * 4 + 3], 'New-tab glyph is invisible
 assert not pixels[3], 'New-tab glyph has an opaque background'
 assert gtk_window.GLib.get_prgname() == 'com.taiwbi.kitty'
 window = gtk_window.GtkKittyWindow(
-    'kitty release smoke', (640, 480), events=gtk_window.GtkKittyEvents(),
-    on_new_tab=lambda: None, on_select_tab=lambda _: None,
-    on_close_tab=lambda _: None, on_reorder_tabs=lambda _: None,
+    'kitty release smoke',
+    (640, 480),
+    events=gtk_window.GtkKittyEvents(),
+    on_new_tab=lambda: None,
+    on_select_tab=lambda _: None,
+    on_close_tab=lambda _: None,
+    on_reorder_tabs=lambda _: None,
 )
 window.realize_gl_area()
 assert window.gl_area.get_realized(), 'GTK OpenGL window did not realize'
@@ -61,7 +65,11 @@ if host_systemd is not None:
         (Path(tdir) / 'libsystemd.so').symlink_to(host_systemd)
         env = dict(os.environ)
         env['LD_LIBRARY_PATH'] = tdir + os.pathsep + env.get('LD_LIBRARY_PATH', '')
-        subprocess.run([str(kitty), '+runpy', '''
+        subprocess.run(
+            [
+                str(kitty),
+                '+runpy',
+                """
 import ctypes, os
 from kitty.constants import kitty_exe
 ctypes.CDLL(os.path.join(os.path.dirname(os.path.dirname(kitty_exe())), 'lib', 'libsystemd.so.0'), mode=ctypes.RTLD_GLOBAL)
@@ -74,7 +82,12 @@ with open('/proc/self/maps') as f:
     libraries = {line.split()[-1] for line in f if '/libsystemd.so' in line}
 if len(libraries) != 1:
     raise RuntimeError(f'Loaded incompatible systemd libraries: {libraries}')
-'''], env=env, check=True, timeout=10)
+""",
+            ],
+            env=env,
+            check=True,
+            timeout=10,
+        )
 kitten = Path(sys.argv[1]) if len(sys.argv) > 1 else kitty.parent / 'kitten'
 for executable, option in ((kitty, '--version'), (kitten, '--version'), (kitty.parent / 'slangc', '-version')):
     subprocess.run([str(executable), option], check=True)

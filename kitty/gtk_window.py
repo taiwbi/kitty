@@ -152,7 +152,7 @@ def initialize_gtk() -> None:
     if not _gtk_initialized:
         if not gtk_backend_available():
             raise RuntimeError('kitty was built without GTK 4 and libadwaita support')
-        GLib.set_prgname("com.taiwbi.kitty")
+        GLib.set_prgname('com.taiwbi.kitty')
         gtk_backend_initialize()
         _gtk_initialized = True
 
@@ -277,7 +277,7 @@ class GtkTabHeaderBar:
         global _gtk_chrome_css
         if _gtk_chrome_css is None:
             _gtk_chrome_css = Gtk.CssProvider()
-            _gtk_chrome_css.load_from_data(b'''
+            _gtk_chrome_css.load_from_data(b"""
                 headerbar.kitty-headerbar {
                     min-height: 42px;
                     padding: 0;
@@ -305,10 +305,8 @@ class GtkTabHeaderBar:
                 tabbar.kitty-tabbar tab:selected .tab-title {
                     font-weight: bold;
                 }
-            ''')
-            Gtk.StyleContext.add_provider_for_display(
-                self.header_bar.get_display(), _gtk_chrome_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
+            """)
+            Gtk.StyleContext.add_provider_for_display(self.header_bar.get_display(), _gtk_chrome_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.tab_view.connect('notify::selected-page', self._selected_page_changed)
         self.tab_view.connect('close-page', self._close_page_requested)
         self.tab_view.connect('page-reordered', self._page_reordered)
@@ -446,7 +444,7 @@ class GtkKittyWindow:
     ) -> None:
         initialize_gtk()
 
-        self.application_id = "com.taiwbi.kitty" if application_id == appname else application_id
+        self.application_id = 'com.taiwbi.kitty' if application_id == appname else application_id
         self.window = Gtk.Window.new()
         self.window.set_title(title)
         self.window.set_default_size(*initial_size)
@@ -912,15 +910,46 @@ class GtkKittyWindow:
             Gdk.KEY_Meta_L: GLFW_FKEY_LEFT_META,
             Gdk.KEY_Meta_R: GLFW_FKEY_RIGHT_META,
         }
-        for i, name in enumerate((
-            GLFW_FKEY_F1, GLFW_FKEY_F2, GLFW_FKEY_F3, GLFW_FKEY_F4, GLFW_FKEY_F5,
-            GLFW_FKEY_F6, GLFW_FKEY_F7, GLFW_FKEY_F8, GLFW_FKEY_F9, GLFW_FKEY_F10,
-            GLFW_FKEY_F11, GLFW_FKEY_F12, GLFW_FKEY_F13, GLFW_FKEY_F14, GLFW_FKEY_F15,
-            GLFW_FKEY_F16, GLFW_FKEY_F17, GLFW_FKEY_F18, GLFW_FKEY_F19, GLFW_FKEY_F20,
-            GLFW_FKEY_F21, GLFW_FKEY_F22, GLFW_FKEY_F23, GLFW_FKEY_F24, GLFW_FKEY_F25,
-            GLFW_FKEY_F26, GLFW_FKEY_F27, GLFW_FKEY_F28, GLFW_FKEY_F29, GLFW_FKEY_F30,
-            GLFW_FKEY_F31, GLFW_FKEY_F32, GLFW_FKEY_F33, GLFW_FKEY_F34, GLFW_FKEY_F35,
-        ), start=1):
+        for i, name in enumerate(
+            (
+                GLFW_FKEY_F1,
+                GLFW_FKEY_F2,
+                GLFW_FKEY_F3,
+                GLFW_FKEY_F4,
+                GLFW_FKEY_F5,
+                GLFW_FKEY_F6,
+                GLFW_FKEY_F7,
+                GLFW_FKEY_F8,
+                GLFW_FKEY_F9,
+                GLFW_FKEY_F10,
+                GLFW_FKEY_F11,
+                GLFW_FKEY_F12,
+                GLFW_FKEY_F13,
+                GLFW_FKEY_F14,
+                GLFW_FKEY_F15,
+                GLFW_FKEY_F16,
+                GLFW_FKEY_F17,
+                GLFW_FKEY_F18,
+                GLFW_FKEY_F19,
+                GLFW_FKEY_F20,
+                GLFW_FKEY_F21,
+                GLFW_FKEY_F22,
+                GLFW_FKEY_F23,
+                GLFW_FKEY_F24,
+                GLFW_FKEY_F25,
+                GLFW_FKEY_F26,
+                GLFW_FKEY_F27,
+                GLFW_FKEY_F28,
+                GLFW_FKEY_F29,
+                GLFW_FKEY_F30,
+                GLFW_FKEY_F31,
+                GLFW_FKEY_F32,
+                GLFW_FKEY_F33,
+                GLFW_FKEY_F34,
+                GLFW_FKEY_F35,
+            ),
+            start=1,
+        ):
             special[getattr(Gdk, f'KEY_F{i}')] = name
         actual = Gdk.keyval_to_unicode(keyval)
         shifted = actual if state & Gdk.ModifierType.SHIFT_MASK else 0
@@ -928,8 +957,27 @@ class GtkKittyWindow:
         base = Gdk.keyval_to_unicode(base_keyval)
         actual_char = chr(actual) if actual else ''
         base_chars = {
-            '!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
-            '_': '-', '+': '=', '{': '[', '}': ']', '|': '\\', ':': ';', '"': "'", '<': ',', '>': '.', '?': '/', '~': '`',
+            '!': '1',
+            '@': '2',
+            '#': '3',
+            '$': '4',
+            '%': '5',
+            '^': '6',
+            '&': '7',
+            '*': '8',
+            '(': '9',
+            ')': '0',
+            '_': '-',
+            '+': '=',
+            '{': '[',
+            '}': ']',
+            '|': '\\',
+            ':': ';',
+            '"': "'",
+            '<': ',',
+            '>': '.',
+            '?': '/',
+            '~': '`',
         }
         if actual_char in base_chars:
             base = ord(base_chars[actual_char])
@@ -968,14 +1016,14 @@ class GtkKittyWindow:
         if getattr(self, '_chrome_style_key', None) == style_key:
             return
         self._chrome_style_key = style_key
-        r = (background_color >> 16) & 0xff
-        g = (background_color >> 8) & 0xff
-        b = background_color & 0xff
+        r = (background_color >> 16) & 0xFF
+        g = (background_color >> 8) & 0xFF
+        b = background_color & 0xFF
         alpha = max(0.0, min(float(background_opacity), 1.0))
         blur_css = ''
         if _use_gtk_css_wayland_blur and is_wayland():
             blur_css = f'backdrop-filter: {"blur(20px)" if self._background_blur > 0 else "none"};'
-        css = f'''
+        css = f"""
             window.kitty-window,
             glarea {{
                 background-color: transparent;
@@ -990,7 +1038,7 @@ class GtkKittyWindow:
                 box-shadow: none;
                 border-bottom: none;
             }}
-        '''
+        """
         old_provider = getattr(self, '_background_css', None)
         if old_provider is not None:
             self.window.get_style_context().remove_provider(old_provider)
@@ -999,9 +1047,7 @@ class GtkKittyWindow:
         self._background_css = Gtk.CssProvider()
         self._background_css.load_from_data(css.encode())
         for widget in (self.window, self.gl_area, self.tab_chrome.header_bar):
-            widget.get_style_context().add_provider(
-                self._background_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
+            widget.get_style_context().add_provider(self._background_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
     def bind(self, os_window_id: int) -> None:
         self.os_window_id = os_window_id

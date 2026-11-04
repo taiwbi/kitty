@@ -87,6 +87,7 @@ def get_clipboard_mime(ctype: int, mime: str | None, output: Callable[[bytes], N
         return True
 
     if mime == 'text/plain':
+
         def opened_text(source: Any, result: Any, _data: Any) -> None:
             nonlocal finished
             try:
@@ -99,6 +100,7 @@ def get_clipboard_mime(ctype: int, mime: str | None, output: Callable[[bytes], N
 
         clipboard.read_text_async(cancellable, opened_text, None)
     else:
+
         def read_chunk(stream: Any, result: Any, _data: Any) -> None:
             nonlocal finished, last_progress
             try:

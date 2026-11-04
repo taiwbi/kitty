@@ -36,7 +36,7 @@ def check_gtk_fallback() -> None:
     # stubs. Reuse setup.py's compiler/headers and keep warnings fatal, as on
     # systems without the optional GTK development packages.
     commands = json.loads((SOURCE / 'build/compile_commands.json').read_text())
-    entry, = (c for c in commands if c['file'] == 'kitty/gtk_backend.c')
+    (entry,) = (c for c in commands if c['file'] == 'kitty/gtk_backend.c')
     args = [a for a in entry['arguments'] if a != '-MMD']
     args.insert(args.index('-c'), '-UKITTY_WITH_GTK')
     with tempfile.TemporaryDirectory() as tmp:
@@ -67,8 +67,18 @@ def build_fribidi() -> None:
 def smoke_test(kitty: Path, kitten: Path) -> None:
     # Run from outside the source tree without the build-time library paths.
     build_vars = {
-        'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'SW', 'SLANGC', 'FONTCONFIG_PATH', 'FONTCONFIG_FILE', 'SSL_CERT_FILE',
-        'GI_TYPELIB_PATH', 'GSETTINGS_SCHEMA_DIR', 'GTK_PATH', 'XDG_DATA_DIRS', 'KITTY_DEVELOP_FROM',
+        'LD_LIBRARY_PATH',
+        'DYLD_LIBRARY_PATH',
+        'SW',
+        'SLANGC',
+        'FONTCONFIG_PATH',
+        'FONTCONFIG_FILE',
+        'SSL_CERT_FILE',
+        'GI_TYPELIB_PATH',
+        'GSETTINGS_SCHEMA_DIR',
+        'GTK_PATH',
+        'XDG_DATA_DIRS',
+        'KITTY_DEVELOP_FROM',
     }
     env = {k: v for k, v in os.environ.items() if not k.startswith('PYTHON') and k not in build_vars}
     with tempfile.TemporaryDirectory() as tmp:
@@ -79,10 +89,7 @@ def preserve_library_aliases(destination: Path) -> None:
     # The freezer copies one filename per library. Some exported libraries have
     # no SONAME, so extension modules need the unversioned name as well (SQLite
     # currently needs libsqlite3.so). Preserve all names for the copied libraries.
-    copied = {
-        (PREFIX / 'lib' / p.name).resolve(): p.name
-        for p in destination.iterdir() if p.is_file() and not p.is_symlink()
-    }
+    copied = {(PREFIX / 'lib' / p.name).resolve(): p.name for p in destination.iterdir() if p.is_file() and not p.is_symlink()}
     for source in (PREFIX / 'lib').iterdir():
         if (target := copied.get(source.resolve())) and not (destination / source.name).exists():
             (destination / source.name).symlink_to(target)
@@ -92,16 +99,25 @@ def copy_gtk_runtime(destination: Path) -> None:
     # GTK is supplied by the builder image, while its Python bindings and GLib
     # are built for the exported prefix. Resolve dependencies with the same
     # library path as the build so we ship a consistent set of libraries.
-    libdirs = [Path(subprocess.check_output(
-        [os.environ['PKGCONFIG_EXE'], '--variable=libdir', package], text=True,
-    ).strip()) for package in ('gtk4', 'libadwaita-1')]
+    libdirs = [
+        Path(
+            subprocess.check_output(
+                [os.environ['PKGCONFIG_EXE'], '--variable=libdir', package],
+                text=True,
+            ).strip()
+        )
+        for package in ('gtk4', 'libadwaita-1')
+    ]
     roots = [
-        libdirs[0] / 'libgtk-4.so.1', libdirs[1] / 'libadwaita-1.so.0',
-        libdirs[0] / 'libcairo.so.2', libdirs[0] / 'libcairo-gobject.so.2',
+        libdirs[0] / 'libgtk-4.so.1',
+        libdirs[1] / 'libadwaita-1.so.0',
+        libdirs[0] / 'libcairo.so.2',
+        libdirs[0] / 'libcairo-gobject.so.2',
         libdirs[0] / 'libharfbuzz.so.0',
         # Pango's typelib references this even though GTK's ELF dependencies
         # only reference the core HarfBuzz library.
-        libdirs[0] / 'libharfbuzz-gobject.so.0', PREFIX / 'lib/libgirepository-2.0.so.0',
+        libdirs[0] / 'libharfbuzz-gobject.so.0',
+        PREFIX / 'lib/libgirepository-2.0.so.0',
     ]
     # Keep glibc, the graphics driver dispatch libraries and fontconfig on the
     # host, as in the upstream bundle. In particular, fontconfig has distro-
@@ -243,27 +259,44 @@ def sbom(version: str) -> None:
     # exported-prefix entries and describe the actual binary packages below.
     replaced = {p['SPDXID'] for p in document['packages'] if p['name'].split()[0] in ('cairo', 'harfbuzz')}
     document['packages'] = [p for p in document['packages'] if p['SPDXID'] not in replaced]
-    document['relationships'] = [
-        r for r in document['relationships'] if r['spdxElementId'] not in replaced and r['relatedSpdxElement'] not in replaced
-    ]
-    document['packages'].append({
-        'name': 'fribidi', 'SPDXID': 'SPDXRef-fribidi', 'versionInfo': FRIBIDI_VERSION,
-        'downloadLocation': f'https://github.com/fribidi/fribidi/releases/download/v{FRIBIDI_VERSION}/fribidi-{FRIBIDI_VERSION}.tar.xz',
-        'licenseConcluded': 'LGPL-2.1-or-later', 'filesAnalyzed': False,
-        'checksums': [{'algorithm': 'SHA256', 'checksumValue': FRIBIDI_SHA256}],
-    })
-    document['relationships'].append({
-        'spdxElementId': 'SPDXRef-fribidi', 'relatedSpdxElement': document['packages'][0]['SPDXID'], 'relationshipType': 'DEPENDENCY_OF',
-    })
+    document['relationships'] = [r for r in document['relationships'] if r['spdxElementId'] not in replaced and r['relatedSpdxElement'] not in replaced]
+    document['packages'].append(
+        {
+            'name': 'fribidi',
+            'SPDXID': 'SPDXRef-fribidi',
+            'versionInfo': FRIBIDI_VERSION,
+            'downloadLocation': f'https://github.com/fribidi/fribidi/releases/download/v{FRIBIDI_VERSION}/fribidi-{FRIBIDI_VERSION}.tar.xz',
+            'licenseConcluded': 'LGPL-2.1-or-later',
+            'filesAnalyzed': False,
+            'checksums': [{'algorithm': 'SHA256', 'checksumValue': FRIBIDI_SHA256}],
+        }
+    )
+    document['relationships'].append(
+        {
+            'spdxElementId': 'SPDXRef-fribidi',
+            'relatedSpdxElement': document['packages'][0]['SPDXID'],
+            'relationshipType': 'DEPENDENCY_OF',
+        }
+    )
     for name, version in {'PyGObject': '3.54.5', 'pycairo': '1.28.0', **GTK_SYSTEM_PACKAGES}.items():
         identifier = 'SPDXRef-gtk-' + re.sub(r'[^a-zA-Z0-9.-]', '-', name)
-        document['packages'].append({
-            'name': name, 'SPDXID': identifier, 'versionInfo': version,
-            'downloadLocation': 'NOASSERTION', 'licenseConcluded': 'NOASSERTION', 'filesAnalyzed': False,
-        })
-        document['relationships'].append({
-            'spdxElementId': identifier, 'relatedSpdxElement': document['packages'][0]['SPDXID'], 'relationshipType': 'DEPENDENCY_OF',
-        })
+        document['packages'].append(
+            {
+                'name': name,
+                'SPDXID': identifier,
+                'versionInfo': version,
+                'downloadLocation': 'NOASSERTION',
+                'licenseConcluded': 'NOASSERTION',
+                'filesAnalyzed': False,
+            }
+        )
+        document['relationships'].append(
+            {
+                'spdxElementId': identifier,
+                'relatedSpdxElement': document['packages'][0]['SPDXID'],
+                'relationshipType': 'DEPENDENCY_OF',
+            }
+        )
     dest.write_text(json.dumps(document, indent=2) + '\n')
 
 
@@ -284,7 +317,7 @@ def main() -> None:
         for asset in (ROOT / 'sw/dist').iterdir():
             shutil.copy2(asset, OUTPUT)
         # Test the extracted download, at a different location, without SW.
-        asset, = OUTPUT.glob('kitty-*.txz')
+        (asset,) = OUTPUT.glob('kitty-*.txz')
         with tempfile.TemporaryDirectory() as tmp:
             package = Path(tmp)
             with tarfile.open(asset) as tf:

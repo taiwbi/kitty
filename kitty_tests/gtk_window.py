@@ -29,11 +29,16 @@ class TestGtkWindow(BaseTest):
         # With Num Lock off, GDK emits KP_* navigation keysyms, which have
         # no Unicode value. Preserve their keypad identity for kitty's protocol.
         navigation = (
-            ('Home', 'HOME', '\x1b[H'), ('End', 'END', '\x1b[F'),
-            ('Page_Up', 'PAGE_UP', '\x1b[5~'), ('Page_Down', 'PAGE_DOWN', '\x1b[6~'),
-            ('Left', 'LEFT', '\x1b[D'), ('Right', 'RIGHT', '\x1b[C'),
-            ('Up', 'UP', '\x1b[A'), ('Down', 'DOWN', '\x1b[B'),
-            ('Insert', 'INSERT', '\x1b[2~'), ('Delete', 'DELETE', '\x1b[3~'),
+            ('Home', 'HOME', '\x1b[H'),
+            ('End', 'END', '\x1b[F'),
+            ('Page_Up', 'PAGE_UP', '\x1b[5~'),
+            ('Page_Down', 'PAGE_DOWN', '\x1b[6~'),
+            ('Left', 'LEFT', '\x1b[D'),
+            ('Right', 'RIGHT', '\x1b[C'),
+            ('Up', 'UP', '\x1b[A'),
+            ('Down', 'DOWN', '\x1b[B'),
+            ('Insert', 'INSERT', '\x1b[2~'),
+            ('Delete', 'DELETE', '\x1b[3~'),
             ('Begin', 'BEGIN', '\x1b[E'),
         )
         for gdk_name, kitty_name, encoded in navigation:
@@ -69,10 +74,10 @@ class TestGtkWindow(BaseTest):
                 self.assertTrue(window._key_pressed(controller, keyval, 79, 0))
                 self.assertTrue(window._key_pressed(controller, keyval, 79, 0))
                 self.assertTrue(window._key_released(controller, keyval, 79, 0))
-                self.ae(input_key.call_args_list, [
-                    call(1, key, 0, 0, keyval, action, 0, '')
-                    for action in (backend.GLFW_PRESS, backend.GLFW_REPEAT, backend.GLFW_RELEASE)
-                ])
+                self.ae(
+                    input_key.call_args_list,
+                    [call(1, key, 0, 0, keyval, action, 0, '') for action in (backend.GLFW_PRESS, backend.GLFW_REPEAT, backend.GLFW_RELEASE)],
+                )
                 self.assertFalse(window._pressed_keys)
 
     def test_gtk_timer_in_python_main_context(self):
@@ -83,7 +88,7 @@ class TestGtkWindow(BaseTest):
             self.skipTest('GTK and a display server are required')
         # MainContext.iteration() releases the GIL. Native GTK timer callbacks
         # must reacquire it before calling Python, even outside kitty's C loop.
-        code = r'''
+        code = r"""
 import warnings
 warnings.filterwarnings('ignore', message=r"'asyncio\..*' is deprecated", category=DeprecationWarning)
 from kitty.constants import configure_gtk_runtime_paths
@@ -96,7 +101,7 @@ add_timer(lambda timer_id, fired=fired: fired.append(timer_id), 0.001, False)
 while not fired:
     GLib.MainContext.default().iteration(True)
 assert len(fired) == 1
-'''
+"""
         result = subprocess.run([kitty_exe(), '+runpy', code], capture_output=True, timeout=10)
         self.ae(result.returncode, 0, result.stderr.decode(errors='replace'))
 
@@ -257,9 +262,14 @@ assert len(fired) == 1
         boss.gtk_context_menu_action(1, 42, 'paste')
         boss.gtk_context_menu_action(1, 42, 'clear')
         boss.gtk_context_menu_action(1, 42, 'set-title')
-        self.ae(boss.combine.call_args_list, [
-            call('paste_from_clipboard', window), call('clear_terminal clear active', window), call('set_tab_title', window),
-        ])
+        self.ae(
+            boss.combine.call_args_list,
+            [
+                call('paste_from_clipboard', window),
+                call('clear_terminal clear active', window),
+                call('set_tab_title', window),
+            ],
+        )
 
         # A menu must not act on a pane that closed, moved, or changed tabs.
         window.reset_mock()

@@ -2394,7 +2394,9 @@ def option_parser() -> argparse.ArgumentParser:  # {{{
     p.add_argument('--prefix', default=Options.prefix, help='Where to create the linux package')
     p.add_argument('--dir-for-static-binaries', default=Options.dir_for_static_binaries, help='Where to create the static kitten binary')
     p.add_argument(
-        '--static-binary-os', action='append', choices=('darwin', 'dragonfly', 'freebsd', 'linux', 'netbsd', 'openbsd'),
+        '--static-binary-os',
+        action='append',
+        choices=('darwin', 'dragonfly', 'freebsd', 'linux', 'netbsd', 'openbsd'),
         help='Build static kitten binaries only for this OS (repeatable)',
     )
     p.add_argument(
