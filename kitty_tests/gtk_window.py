@@ -4,7 +4,7 @@ import os
 import subprocess
 import warnings
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from .base import BaseTest
 
@@ -21,6 +21,58 @@ class TestGtkWindow(BaseTest):
         warning_context.__enter__()
         self.addCleanup(warning_context.__exit__, None, None, None)
         warnings.filterwarnings('ignore', message=r"'asyncio\..*' is deprecated", category=DeprecationWarning)
+
+    def test_gtk_keypad_navigation(self):
+        from kitty import fast_data_types as keys
+
+        backend = self.backend
+        # With Num Lock off, GDK emits KP_* navigation keysyms, which have
+        # no Unicode value. Preserve their keypad identity for kitty's protocol.
+        navigation = (
+            ('Home', 'HOME', '\x1b[H'), ('End', 'END', '\x1b[F'),
+            ('Page_Up', 'PAGE_UP', '\x1b[5~'), ('Page_Down', 'PAGE_DOWN', '\x1b[6~'),
+            ('Left', 'LEFT', '\x1b[D'), ('Right', 'RIGHT', '\x1b[C'),
+            ('Up', 'UP', '\x1b[A'), ('Down', 'DOWN', '\x1b[B'),
+            ('Insert', 'INSERT', '\x1b[2~'), ('Delete', 'DELETE', '\x1b[3~'),
+            ('Begin', 'BEGIN', '\x1b[E'),
+        )
+        for gdk_name, kitty_name, encoded in navigation:
+            keyval = getattr(backend.Gdk, f'KEY_KP_{gdk_name}')
+            expected = getattr(keys, f'GLFW_FKEY_KP_{kitty_name}')
+            for state in (0, backend.Gdk.ModifierType.SHIFT_MASK, backend.Gdk.ModifierType.CONTROL_MASK):
+                with self.subTest(key=gdk_name, state=state):
+                    key, shifted = backend.GtkKittyWindow._kitty_key(keyval, state)
+                    self.ae((key, shifted), (expected, 0))
+            self.ae(keys.encode_key_for_tty(key=key), encoded)
+
+        # Num Lock on still produces digits through the Unicode path.
+        for digit in range(10):
+            keyval = getattr(backend.Gdk, f'KEY_KP_{digit}')
+            self.ae(backend.GtkKittyWindow._kitty_key(keyval, 0), (ord(str(digit)), 0))
+
+    def test_gtk_keypad_navigation_events(self):
+        from kitty import fast_data_types as keys
+
+        backend = self.backend
+        window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+        window.os_window_id = 1
+        window._pressed_keys = set()
+        window._ime_filtered_keys = set()
+        controller = Mock()
+        controller.get_current_event.return_value = None
+
+        for name in ('HOME', 'END', 'PAGE_UP', 'PAGE_DOWN'):
+            keyval = getattr(backend.Gdk, f'KEY_KP_{name.title()}')
+            key = getattr(keys, f'GLFW_FKEY_KP_{name}')
+            with self.subTest(key=name), patch.object(backend, 'gtk_input_key', return_value=True) as input_key:
+                self.assertTrue(window._key_pressed(controller, keyval, 79, 0))
+                self.assertTrue(window._key_pressed(controller, keyval, 79, 0))
+                self.assertTrue(window._key_released(controller, keyval, 79, 0))
+                self.ae(input_key.call_args_list, [
+                    call(1, key, 0, 0, keyval, action, 0, '')
+                    for action in (backend.GLFW_PRESS, backend.GLFW_REPEAT, backend.GLFW_RELEASE)
+                ])
+                self.assertFalse(window._pressed_keys)
 
     def test_gtk_timer_in_python_main_context(self):
         from kitty.constants import kitty_exe
