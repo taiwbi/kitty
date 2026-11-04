@@ -24,8 +24,6 @@ jobs:
                  os: ubuntu-latest
                - language: c
                  os: ubuntu-latest
-               - language: c
-                 os: macos-latest
                - language: go
                  os: ubuntu-latest
                - language: actions
