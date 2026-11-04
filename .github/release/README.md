@@ -41,6 +41,8 @@ SPDX dependency SBOM, and `SHA256SUMS`.
    private package cache/VMs.
 6. Smoke-test the frozen runtime and extracted Linux archive without build-time
    Python/library paths, including importing the GTK window module. The workflow
+   also starts a complete GTK terminal under headless Weston with GNOME backend
+   selection enabled, and requires its child process to run and exit. The workflow
    repeats the archive check in the minimal `runtime` container stage, which has
    no GTK installation, Python, build prefix or toolchain.
 7. On Linux amd64, build standalone `kitten` binaries for Linux amd64, arm64,

@@ -1,5 +1,10 @@
 Portable Linux kitty and standalone kitten builds from this tag.
 
+Changes in 0.50.0.1:
+
+- Fix GTK startup failing with `RuntimeError: The GTK window callback did not return a GTK window` on GNOME Wayland.
+- Exercise full GTK terminal startup in the frozen portable runtime before publishing either Linux architecture.
+
 Changes in 0.50.0.0:
 
 - Set the default GTK window class and Wayland application ID to `com.taiwbi.kitty`.

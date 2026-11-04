@@ -3,9 +3,11 @@
 
 import importlib
 import os
+import shlex
 import ssl
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -56,6 +58,57 @@ assert window.gl_area.get_realized(), 'GTK OpenGL window did not realize'
 window.close()
 
 kitty = Path(kitty_exe())
+# The chrome checks above bypass main._run_app(). Start a complete GTK terminal
+# as well, so a broken first-window callback cannot pass release verification.
+# A headless Wayland compositor exercises the same backend as GNOME, including
+# backend selection, the native callback contract, rendering and the main loop.
+with TemporaryDirectory() as tdir:
+    marker = Path(tdir) / 'gtk-started'
+    env = dict(os.environ, XDG_RUNTIME_DIR=tdir, WAYLAND_DISPLAY='kitty-release-wayland', XDG_CURRENT_DESKTOP='GNOME', GDK_BACKEND='wayland')
+    compositor = subprocess.Popen(
+        [
+            'weston',
+            '--backend=headless-backend.so',
+            '--use-pixman',
+            '--shell=kiosk-shell.so',
+            '--no-config',
+            '--idle-time=0',
+            '--socket=kitty-release-wayland',
+            f'--log={tdir}/weston.log',
+        ],
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not (Path(tdir) / env['WAYLAND_DISPLAY']).exists():
+            if compositor.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError(f'Headless Wayland compositor did not start: {Path(tdir, "weston.log").read_text()}')
+            time.sleep(0.05)
+        subprocess.run(
+            [
+                str(kitty),
+                '--config',
+                'NONE',
+                '-o',
+                'linux_display_server=wayland',
+                '-o',
+                'linux_use_gtk_window=yes',
+                '-o',
+                'shell_integration=disabled',
+                '-o',
+                'remember_window_size=no',
+                '/bin/sh',
+                '-c',
+                f'printf ready > {shlex.quote(str(marker))}',
+            ],
+            env=env,
+            check=True,
+            timeout=60,
+        )
+    finally:
+        compositor.terminate()
+        compositor.wait(timeout=10)
+    assert marker.read_text() == 'ready', 'GTK terminal did not start its child process'
 # Emulate a development package on the host exposing an unversioned systemd
 # symlink. The portable process must keep using the runtime SONAME loaded by
 # GTK/GIO, rather than mixing two library instances and corrupting sd_bus data.

@@ -6,9 +6,10 @@ import locale
 import os
 import shutil
 import sys
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager, suppress
 from gettext import gettext as _
+from typing import TYPE_CHECKING
 
 from . import logout_session
 from .boss import Boss
@@ -83,6 +84,9 @@ from .utils import (
     safe_mtime,
     startup_notification_handler,
 )
+
+if TYPE_CHECKING:
+    from .gtk_window import GtkKittyWindow
 
 
 def set_custom_ibeam_cursor() -> None:
@@ -388,7 +392,7 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
 
         if run_app.gtk_window_enabled:
 
-            def create_first_gtk_window(window_handle: int) -> None:
+            def create_first_gtk_window(window_handle: int) -> 'GtkKittyWindow':
                 old_first_window_callback(window_handle)
                 from .gtk_window import GtkKittyEvents, GtkKittyWindow
 
@@ -404,6 +408,7 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
                 )
                 gtk_window.apply_chrome_mode(opts.hide_window_decorations)
                 run_app.pending_gtk_window = gtk_window
+                return gtk_window
 
             run_app.first_window_callback = create_first_gtk_window
         try:
@@ -454,7 +459,7 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
 class AppRunner:
     def __init__(self) -> None:
         self.cached_values_name = 'main'
-        self.first_window_callback = lambda window_handle: None
+        self.first_window_callback: Callable[[int], object] = lambda window_handle: None
         self.gtk_window_enabled = False
         self.pending_gtk_window = None
         self.layer_shell_config: LayerShellConfig | None = None

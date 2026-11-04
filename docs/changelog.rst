@@ -9,6 +9,12 @@ To update |kitty|, :doc:`follow the instructions <binary>`.
 Recent major new features
 ---------------------------
 
+GTK window startup fix [0.50.0.1]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Fix the first GTK window callback returning no window, which prevented startup
+on GNOME Wayland with ``The GTK window callback did not return a GTK window``.
+
 GTK windows on Wayland [0.50.0]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
