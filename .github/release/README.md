@@ -1,8 +1,10 @@
 # Linux tag releases
 
 `.github/workflows/release.yml` runs when a tag is pushed. It builds Linux
-releases for amd64 and arm64, then publishes those assets on the tag's GitHub
-Release. The release also includes standalone Linux `kitten` binaries for
+releases for amd64 and arm64, validates the complete asset matrix, then publishes
+those assets on the tag's GitHub Release. The workflow can also be dispatched
+manually to build and validate both architectures without publishing a release.
+The release also includes standalone Linux `kitten` binaries for
 amd64, arm64, arm, and 386, a source archive with HTML/man documentation, an
 SPDX dependency SBOM, and `SHA256SUMS`.
 

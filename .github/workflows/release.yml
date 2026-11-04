@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - '**'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -71,7 +72,7 @@ jobs:
               mkdir /tmp/kitty
               tar -xf /dist/kitty-*.txz -C /tmp/kitty
               xvfb-run -a /tmp/kitty/bin/kitty +launch /checks/smoke.py
-              printf 'Portable runtime smoke test passed.\n'
+              printf "Portable runtime smoke test passed.\n"
             '
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -82,9 +83,31 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  verify:
+    name: Verify all Linux release assets
+    needs: [linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify complete Linux asset matrix
+        run: python3 .github/release/verify.py
+
   publish:
     name: Verify all assets and publish GitHub release
-    needs: [linux]
+    needs: [verify]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
