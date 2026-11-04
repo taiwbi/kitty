@@ -311,8 +311,13 @@ def main() -> None:
     run(sys.executable, 'setup.py', 'build')
     # GTK is optional in regular CI. Release builders have the real bindings,
     # so require them and exercise both blur ownership paths before freezing.
-    run('kitty/launcher/kitty', '+runpy', 'import kitty.gtk_window')
-    run('./test.py', '--module', 'gtk_window')
+    # The exported GLib searches its own prefix for typelibs; GTK's typelibs
+    # belong to the builder's distro packages, in its multiarch library dir.
+    gtk_libdir = subprocess.check_output([os.environ['PKGCONFIG_EXE'], '--variable=libdir', 'gtk4'], text=True).strip()
+    typelib_paths = (str(Path(gtk_libdir) / 'girepository-1.0'), os.environ.get('GI_TYPELIB_PATH', ''))
+    gtk_test_env = dict(os.environ, GI_TYPELIB_PATH=os.pathsep.join(filter(None, typelib_paths)))
+    run('kitty/launcher/kitty', '+runpy', 'import kitty.gtk_window', env=gtk_test_env)
+    run('./test.py', '--module', 'gtk_window', env=gtk_test_env)
     check_gtk_fallback()
     docs_env = dict(os.environ, PYTHONPATH=os.environ['RELEASE_DOCS_DEPS'])
     run('make', 'docs', f'SPHINXBUILD={shlex.quote(sys.executable)} -m sphinx', env=docs_env)
