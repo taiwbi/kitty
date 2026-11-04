@@ -388,7 +388,7 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
 
         if run_app.gtk_window_enabled:
 
-            def create_first_gtk_window(window_handle: int) -> object:
+            def create_first_gtk_window(window_handle: int) -> None:
                 old_first_window_callback(window_handle)
                 from .gtk_window import GtkKittyEvents, GtkKittyWindow
 
@@ -404,7 +404,6 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
                 )
                 gtk_window.apply_chrome_mode(opts.hide_window_decorations)
                 run_app.pending_gtk_window = gtk_window
-                return gtk_window
 
             run_app.first_window_callback = create_first_gtk_window
         try:

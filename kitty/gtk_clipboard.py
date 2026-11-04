@@ -6,12 +6,12 @@ from collections.abc import Callable
 from time import monotonic
 from typing import Any
 
-import gi
+import gi  # ty: ignore[import-not-found]
 
 from .fast_data_types import GLFW_PRIMARY_SELECTION, get_boss
 
 gi.require_version('Gdk', '4.0')
-from gi.repository import Gdk, Gio, GLib  # type: ignore[import-not-found]  # noqa: E402
+from gi.repository import Gdk, Gio, GLib  # type: ignore[import-not-found]  # noqa: E402  # ty: ignore[import-not-found]
 
 
 def content_provider_for(ctype: int, mime_types: tuple[str, ...]) -> Any:

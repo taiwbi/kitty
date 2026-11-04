@@ -304,6 +304,7 @@ class Options:
     sanitize: bool = False
     prefix: str = './linux-package'
     dir_for_static_binaries: str = 'build/static'
+    static_binary_os: Optional[List[str]] = None
     skip_code_generation: bool = False
     skip_building_kitten: bool = False
     clean_for_cross_compile: bool = False

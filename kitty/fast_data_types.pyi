@@ -1138,6 +1138,8 @@ def get_fallback_font(text: str, bold: bool, italic: bool) -> Any:
 def create_test_font_group(sz: float, dpix: float, dpiy: float) -> tuple[int, int, int]: ...
 
 class HistoryBuf:
+    count: int
+
     def pagerhist_as_text(self, upto_output_start: bool = False) -> str:
         pass
 

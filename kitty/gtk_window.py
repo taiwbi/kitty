@@ -15,11 +15,11 @@ from functools import lru_cache
 from typing import Any
 from weakref import ReferenceType, ref
 
-import gi
+import gi  # ty: ignore[import-not-found]
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # type: ignore[import-not-found]  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # type: ignore[import-not-found]  # noqa: E402  # ty: ignore[import-not-found]
 
 from .constants import appname, is_wayland  # noqa: E402
 from .fast_data_types import (  # noqa: E402
