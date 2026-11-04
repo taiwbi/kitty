@@ -11,4 +11,6 @@ kitty/color-names.h
 kitty/parse-graphics-command.h
 kitty/parse-multicell-command.h
 kittens/unicode_input/names.h
+kitty/arabic-presentation-forms.h
+kitty/options/to-c-generated.h
 3rdparty/**

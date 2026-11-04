@@ -1076,10 +1076,7 @@ void
 _glfwPlatformPollEvents(void) {
     @autoreleasepool {
         for (;;) {
-            NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                              untilDate:[NSDate distantPast]
-                                                 inMode:NSDefaultRunLoopMode
-                                                dequeue:YES];
+            NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate distantPast] inMode:NSDefaultRunLoopMode dequeue:YES];
             if (event == nil) break;
             [NSApp sendEvent:event];
         }

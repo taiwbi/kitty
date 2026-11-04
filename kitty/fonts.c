@@ -1120,8 +1120,7 @@ extract_padded_cell_from_canvas(FontGroup *fg, unsigned int i, unsigned int canv
     const unsigned int sw = sprite_cell_width(fg);
     pixel *ans = calloc((size_t)sw * (ch + 1), sizeof(pixel));
     if (!ans) fatal("Out of memory allocating padded glyph sprite");
-    for (unsigned y = 0; y < ch; y++)
-        memcpy(ans + y * sw, fg->canvas.buf + y * canvas_width + i * cw, sizeof(pixel) * sw);
+    for (unsigned y = 0; y < ch; y++) memcpy(ans + y * sw, fg->canvas.buf + y * canvas_width + i * cw, sizeof(pixel) * sw);
     return ans;
 }
 

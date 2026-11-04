@@ -1241,7 +1241,8 @@ render_glyphs_in_cells(
             if (*was_colored && (colored = glyph_color_type(self, info[i].codepoint)) != NOT_COLORED) {
                 if (!render_color_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells + (horizontal_padding ? 1 : 0), baseline)) {
                     if (PyErr_Occurred()) PyErr_Print();
-                    if (!render_bitmap(self, info[i].codepoint, &bm, cell_width, cell_height, num_cells + (horizontal_padding ? 1 : 0), bold, italic, true, fg)) {
+                    if (!render_bitmap(
+                            self, info[i].codepoint, &bm, cell_width, cell_height, num_cells + (horizontal_padding ? 1 : 0), bold, italic, true, fg)) {
                         free_processed_bitmap(&bm);
                         return false;
                     }

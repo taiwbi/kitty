@@ -742,7 +742,8 @@ cursor_pos_callback(GLFWwindow *w, double x, double y) {
 static void
 scroll_callback(GLFWwindow *w, const GLFWScrollEvent *ev) {
     if (!set_callback_window(w)) return;
-    if (global_state.callback_os_window->is_focused && !global_state.callback_os_window->gtk_window) refresh_mouse_position_for_hit_test(w, global_state.callback_os_window);
+    if (global_state.callback_os_window->is_focused && !global_state.callback_os_window->gtk_window)
+        refresh_mouse_position_for_hit_test(w, global_state.callback_os_window);
     monotonic_t now = monotonic();
     if (OPT(mouse_hide.scroll_unhide)) cursor_active_callback(now);
     global_state.callback_os_window->last_mouse_activity_at = now;
@@ -1033,7 +1034,8 @@ window_focus_callback(GLFWwindow *w, int focused) {
         }
     }
     request_tick_callback();
-    if (osw && osw->handle && !focused && focus_changed && osw->hide_on_focus_loss && (osw->gtk_window ? osw->gtk_window_mapped : glfwGetWindowAttrib(osw->handle, GLFW_VISIBLE))) {
+    if (osw && osw->handle && !focused && focus_changed && osw->hide_on_focus_loss &&
+        (osw->gtk_window ? osw->gtk_window_mapped : glfwGetWindowAttrib(osw->handle, GLFW_VISIBLE))) {
         add_main_loop_timer(0, false, update_os_window_visibility_based_on_focus, (void *)(uintptr_t)osw->id, NULL);
     }
     osw = NULL;
@@ -2913,8 +2915,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         Py_CLEAR(gtk_window_obj);
     }
     // Ignore positions that are not on any monitor, for example, because the monitor was disconnected
-    if (x != INT_MIN && y != INT_MIN && !is_gtk_backend_enabled() && is_visible_on_a_monitor(x, y, width, height))
-        glfwSetWindowPos(glfw_window, x, y);
+    if (x != INT_MIN && y != INT_MIN && !is_gtk_backend_enabled() && is_visible_on_a_monitor(x, y, width, height)) glfwSetWindowPos(glfw_window, x, y);
     if (!is_gtk_backend_enabled() && !global_state.is_apple && !global_state.is_wayland && window_state != WINDOW_HIDDEN) glfwShowWindow(glfw_window, false);
     if (global_state.is_wayland || global_state.is_apple) {
         float n_xscale, n_yscale;
@@ -3022,7 +3023,8 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     if (w->gtk_window) apply_gtk_chrome_style(w, OPT(background), w->last_window_chrome.background_opacity, w->last_window_chrome.background_blur);
     if (w->is_layer_shell) {
         if (global_state.is_apple) set_layer_shell_config_for(w, lsc);
-    } else if (!w->gtk_window) apply_window_chrome_state(w->handle, w->last_window_chrome, width, height, global_state.is_apple ? OPT(hide_window_decorations) != 0 : false);
+    } else if (!w->gtk_window)
+        apply_window_chrome_state(w->handle, w->last_window_chrome, width, height, global_state.is_apple ? OPT(hide_window_decorations) != 0 : false);
 #ifdef __APPLE__
     if (!w->is_layer_shell) glfwCocoaSetWindowLevel(w->handle, OPT(macos_ns_window_layer));
 #endif

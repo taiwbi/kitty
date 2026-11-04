@@ -4481,7 +4481,10 @@ screen_apply_selection(Screen *self, void *address_, size_t size) {
                 Line overlay_line = {0};
                 if (is_overlay_row) {
                     overlay_line = (Line){
-                        .xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
+                        .xnum = self->columns,
+                        .cpu_cells = self->overlay_line.cpu_cells,
+                        .gpu_cells = self->overlay_line.gpu_cells,
+                        .text_cache = self->text_cache};
                     line = &overlay_line;
                 } else if (self->paused_rendering.expires_at) {
                     if (r < self->lines) {
@@ -5262,10 +5265,7 @@ update_overlay_line_data(Screen *self, uint8_t *data, FONTS_DATA_HANDLE fonts_da
     const size_t base = sizeof(GPUCell) * (self->overlay_line.ynum + self->scrolled_by + render_row_offset) * self->columns;
     Line overlay = {
         .xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
-    memcpy(
-        data + base,
-        render_visual_line(fonts_data, &overlay, self->disable_ligatures, (int)self->overlay_line.cursor_x),
-        self->columns * sizeof(GPUCell));
+    memcpy(data + base, render_visual_line(fonts_data, &overlay, self->disable_ligatures, (int)self->overlay_line.cursor_x), self->columns * sizeof(GPUCell));
 }
 
 // }}}
@@ -5715,7 +5715,8 @@ index_type
 screen_visual_cursor_x(Screen *self, index_type x, index_type y) {
     if (!OPT(bidi_rendering) || OPT(force_ltr) || y >= self->lines) return MIN(x, self->columns);
     if (screen_is_overlay_active(self) && self->overlay_line.ynum == y && self->overlay_line.cpu_cells) {
-        Line overlay = {.xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
+        Line overlay = {
+            .xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
         return bidi_logical_to_visual_x(&overlay, x);
     }
     LineBuf *linebuf = self->paused_rendering.expires_at ? self->paused_rendering.linebuf : self->linebuf;

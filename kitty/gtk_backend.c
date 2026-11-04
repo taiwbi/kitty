@@ -43,8 +43,7 @@ typedef struct GTKTimer {
 static GTKTimer *gtk_timers = NULL;
 static id_type next_gtk_timer_id = 0;
 
-#if defined(KITTY_WITH_GTK) && \
-    (defined(KITTY_WITH_GTK_WAYLAND_BLUR) || (defined(GDK_WINDOWING_WAYLAND) && GTK_CHECK_VERSION(4, 12, 0)))
+#if defined(KITTY_WITH_GTK) && (defined(KITTY_WITH_GTK_WAYLAND_BLUR) || (defined(GDK_WINDOWING_WAYLAND) && GTK_CHECK_VERSION(4, 12, 0)))
 static void *
 gtk_pointer_from_capsule(PyObject *capsule) {
     if (!PyCapsule_CheckExact(capsule)) {
@@ -140,13 +139,11 @@ gtk_wayland_blur_initialize(GdkDisplay *display) {
 
 static void
 gtk_wayland_blur_update(GTKWaylandBlurSurface *entry) {
-    if (!entry->effect && gtk_blur_manager && entry->blur_radius > 0 &&
-        (gtk_blur_capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {
+    if (!entry->effect && gtk_blur_manager && entry->blur_radius > 0 && (gtk_blur_capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {
         entry->effect = ext_background_effect_manager_v1_get_background_effect(gtk_blur_manager, entry->wl_surface);
     }
     if (!entry->effect) return;
-    if (entry->blur_radius <= 0 || !gtk_blur_manager ||
-        !(gtk_blur_capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {
+    if (entry->blur_radius <= 0 || !gtk_blur_manager || !(gtk_blur_capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {
         if (entry->region_set) {
             ext_background_effect_surface_v1_set_blur_region(entry->effect, NULL);
             entry->region_set = false;
@@ -379,8 +376,8 @@ gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
     const int region_x = (int)floor(surface_x), region_y = (int)floor(surface_y);
     const int region_width = gtk_widget_get_width(GTK_WIDGET(window));
     const int region_height = gtk_widget_get_height(GTK_WIDGET(window));
-    if (entry->region_x != region_x || entry->region_y != region_y ||
-        entry->region_width != region_width || entry->region_height != region_height) entry->region_set = false;
+    if (entry->region_x != region_x || entry->region_y != region_y || entry->region_width != region_width || entry->region_height != region_height)
+        entry->region_set = false;
     entry->region_x = region_x;
     entry->region_y = region_y;
     entry->region_width = region_width;
@@ -600,13 +597,31 @@ gtk_backend_stop_main_loop(void) {
     if (gtk_main_loop) g_main_loop_quit(gtk_main_loop);
 }
 #else
-bool is_gtk_backend_active(void) { return false; }
-bool is_gtk_backend_enabled(void) { return false; }
-GLFWglproc gtk_backend_get_proc_address(const char UNUSED *name) { return NULL; }
-void gtk_backend_wakeup(void) {}
-id_type gtk_backend_add_main_loop_timer(monotonic_t UNUSED interval, bool UNUSED repeats, timer_callback_fun UNUSED callback, void UNUSED *callback_data, timer_callback_fun UNUSED free_callback) { return 0; }
-void gtk_backend_update_main_loop_timer(id_type UNUSED timer_id, monotonic_t UNUSED interval, bool UNUSED enabled) {}
-void gtk_backend_remove_main_loop_timer(id_type UNUSED timer_id) {}
-void gtk_backend_run_main_loop(tick_callback_fun UNUSED callback, void UNUSED *callback_data) {}
-void gtk_backend_stop_main_loop(void) {}
+bool
+is_gtk_backend_active(void) {
+    return false;
+}
+bool
+is_gtk_backend_enabled(void) {
+    return false;
+}
+GLFWglproc
+gtk_backend_get_proc_address(const char UNUSED *name) {
+    return NULL;
+}
+void
+gtk_backend_wakeup(void) {}
+id_type
+gtk_backend_add_main_loop_timer(
+    monotonic_t UNUSED interval, bool UNUSED repeats, timer_callback_fun UNUSED callback, void UNUSED *callback_data, timer_callback_fun UNUSED free_callback) {
+    return 0;
+}
+void
+gtk_backend_update_main_loop_timer(id_type UNUSED timer_id, monotonic_t UNUSED interval, bool UNUSED enabled) {}
+void
+gtk_backend_remove_main_loop_timer(id_type UNUSED timer_id) {}
+void
+gtk_backend_run_main_loop(tick_callback_fun UNUSED callback, void UNUSED *callback_data) {}
+void
+gtk_backend_stop_main_loop(void) {}
 #endif
