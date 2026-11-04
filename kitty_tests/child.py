@@ -217,7 +217,7 @@ time.sleep(300)
                 # The original process properties use the root process
                 c = self._child_for(p.pid, KittyWrapper(('/usr/bin/login',), False))
                 self.ae(c.current_cwd, os.path.realpath(tdir))
-                self.ae(c.cmdline, cmdline_of_pid(inner))
+                self.ae(c.cmdline, cmdline_of_pid(inner) or ['unused'])
             finally:
                 self._terminate_tree(p)
 
