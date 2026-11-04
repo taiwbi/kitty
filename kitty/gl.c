@@ -46,7 +46,7 @@ void
 gl_init(void) {
     static bool glad_loaded = false;
     if (!glad_loaded) {
-        global_state.gl_version = gladLoadGL(glfwGetProcAddress);
+        global_state.gl_version = gladLoadGL(is_gtk_backend_enabled() ? gtk_backend_get_proc_address : glfwGetProcAddress);
         if (!global_state.gl_version) { fatal("Loading the OpenGL library failed"); }
         if (!global_state.debug_rendering) { gladUninstallGLDebug(); }
         gladSetGLPostCallback(check_for_gl_error);

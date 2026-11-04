@@ -111,6 +111,59 @@ assert len(fired) == 1
             events.resized(640, 480, 2)
             resized.assert_called_once_with(1, 640, 480, 2)
 
+    def test_gtk_realization_wait(self):
+        backend = self.backend
+        for present in (False, True):
+            with self.subTest(present=present):
+                window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+                window.window, window.gl_area = Mock(), Mock()
+                window.gl_area.get_realized.side_effect = (False, True, True)
+                window.gl_area.get_width.side_effect = (0, 640)
+                window.gl_area.get_height.return_value = 480
+                window.gl_area.get_error.return_value = None
+                context = Mock()
+                with (
+                    patch.object(backend.GLib.MainContext, 'default', return_value=context),
+                    patch.object(backend.GLib, 'timeout_add', return_value=42),
+                    patch.object(backend.GLib, 'source_remove') as remove,
+                    patch.object(backend, 'gtk_backend_activate') as activate,
+                ):
+                    window.realize_gl_area(present)
+                self.ae(context.iteration.call_args_list, [call(True), call(True)])
+                remove.assert_called_once_with(42)
+                window.gl_area.make_current.assert_called_once_with()
+                if present:
+                    activate.assert_called_once_with()
+                    window.window.present.assert_called_once_with()
+                    window.gl_area.grab_focus.assert_called_once_with()
+                else:
+                    activate.assert_not_called()
+                    window.window.realize.assert_called_once_with()
+                    window.window.set_visible.assert_called_once_with(False)
+
+    def test_gtk_realization_failure(self):
+        backend = self.backend
+        for failure in ('timeout', 'gl-error'):
+            with self.subTest(failure=failure):
+                window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)
+                window.window, window.gl_area = Mock(), Mock()
+                window.gl_area.get_realized.return_value = failure != 'timeout'
+                window.gl_area.get_width.return_value = 640
+                window.gl_area.get_height.return_value = 480
+                window.gl_area.get_error.return_value = SimpleNamespace(message='GL failed')
+                context = Mock()
+                with (
+                    patch.object(backend.GLib.MainContext, 'default', return_value=context),
+                    patch.object(backend.GLib, 'timeout_add', return_value=42) as add_timeout,
+                    patch.object(backend.GLib, 'source_remove') as remove,
+                    patch.object(backend, 'gtk_backend_activate'),
+                ):
+                    context.iteration.side_effect = lambda block: add_timeout.call_args.args[1]()
+                    message = 'Timed out waiting' if failure == 'timeout' else 'GL failed'
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        window.realize_gl_area()
+                remove.assert_called_once_with(42)
+
     def test_gtk_context_menu_selection_and_target(self):
         backend = self.backend
         window = backend.GtkKittyWindow.__new__(backend.GtkKittyWindow)

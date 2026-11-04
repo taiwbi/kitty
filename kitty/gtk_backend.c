@@ -10,6 +10,7 @@
 #ifdef KITTY_WITH_GTK
 #include <adwaita.h>
 #include <gtk/gtk.h>
+#include <dlfcn.h>
 #include "glfw-wrapper.h"
 #include <stdatomic.h>
 #if defined(GDK_WINDOWING_WAYLAND)
@@ -493,6 +494,21 @@ is_gtk_backend_enabled(void) {
     return gtk_backend_enabled;
 }
 
+GLFWglproc
+gtk_backend_get_proc_address(const char *name) {
+    // GTK's Wayland GLArea uses EGL. Resolve entry points directly instead of
+    // requiring a current GLFW context solely for glfwGetProcAddress(). Keep
+    // the library loaded for as long as its entry points are in use.
+    static GLFWglproc (*get_proc_address)(const char *) = NULL;
+    if (!get_proc_address) {
+        void *library = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (!library) fatal("Failed to load GTK's OpenGL library: %s", dlerror());
+        *(void **)(&get_proc_address) = dlsym(library, "eglGetProcAddress");
+        if (!get_proc_address) fatal("Failed to load GTK's OpenGL entry points: %s", dlerror());
+    }
+    return get_proc_address(name);
+}
+
 void
 gtk_backend_wakeup(void) {
     if (gtk_backend_active) gtk_schedule_tick();
@@ -586,6 +602,7 @@ gtk_backend_stop_main_loop(void) {
 #else
 bool is_gtk_backend_active(void) { return false; }
 bool is_gtk_backend_enabled(void) { return false; }
+GLFWglproc gtk_backend_get_proc_address(const char UNUSED *name) { return NULL; }
 void gtk_backend_wakeup(void) {}
 id_type gtk_backend_add_main_loop_timer(monotonic_t UNUSED interval, bool UNUSED repeats, timer_callback_fun UNUSED callback, void UNUSED *callback_data, timer_callback_fun UNUSED free_callback) { return 0; }
 void gtk_backend_update_main_loop_timer(id_type UNUSED timer_id, monotonic_t UNUSED interval, bool UNUSED enabled) {}

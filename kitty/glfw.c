@@ -2786,7 +2786,10 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     // creation, which causes a resize event and all the associated processing.
     // The temp window is used to get the DPI. On Wayland no temp window can be
     // used, so start with window visible unless hidden window requested.
-    GLFWwindow *common_context = global_state.num_os_windows ? global_state.os_windows[0].handle : NULL;
+    // GTK owns the rendering contexts. Its hidden GLFW windows only carry
+    // platform state and must not allocate a second, unused OpenGL context.
+    glfwWindowHint(GLFW_CLIENT_API, is_gtk_backend_enabled() ? GLFW_NO_API : GLFW_OPENGL_API);
+    GLFWwindow *common_context = !is_gtk_backend_enabled() && global_state.num_os_windows ? global_state.os_windows[0].handle : NULL;
     GLFWwindow *temp_window = NULL;
     glfwWindowHint(GLFW_VISIBLE, !is_gtk_backend_enabled() && window_state != WINDOW_HIDDEN && global_state.is_wayland);
     float xscale, yscale;
@@ -2871,7 +2874,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
 #undef glfw_failure
     // Set titlebar-only mode before the window becomes visible
     if (global_state.is_wayland && (OPT(hide_window_decorations) & 2) && glfwWaylandSetTitlebarHidden) { glfwWaylandSetTitlebarHidden(glfw_window, true); }
-    glfwMakeContextCurrent(glfw_window);
+    if (!is_gtk_backend_enabled()) glfwMakeContextCurrent(glfw_window);
     if (is_first_window && !is_gtk_backend_enabled()) initialize_gpu();
     bool is_semi_transparent = glfwGetWindowAttrib(glfw_window, GLFW_TRANSPARENT_FRAMEBUFFER);
     if (!is_gtk_backend_enabled()) {

@@ -9,6 +9,13 @@ To update |kitty|, :doc:`follow the instructions <binary>`.
 Recent major new features
 ---------------------------
 
+GTK window startup [unreleased]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Speed up the optional GTK window backend by avoiding unused OpenGL contexts
+for its hidden GLFW windows and waiting for GTK startup events without polling
+delays. Cache repeated GTK key translations to reduce work when typing.
+
 Choose an edge when resizing [unreleased]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

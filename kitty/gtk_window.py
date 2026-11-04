@@ -11,6 +11,7 @@ user actions through callbacks.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from functools import lru_cache
 from typing import Any
 from weakref import ReferenceType, ref
 
@@ -869,6 +870,7 @@ class GtkKittyWindow:
         return ans
 
     @staticmethod
+    @lru_cache(maxsize=512)
     def _kitty_key(keyval: int, state: Gdk.ModifierType) -> tuple[int, int]:
         special = {
             Gdk.KEY_Escape: GLFW_FKEY_ESCAPE,
@@ -1106,23 +1108,33 @@ class GtkKittyWindow:
             gtk_backend_activate()
         else:
             self.window.realize()
-        import time
-
         context = GLib.MainContext.default()
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if self.gl_area.get_realized() and self.gl_area.get_width() > 0 and self.gl_area.get_height() > 0:
-                self.gl_area.make_current()
-                if error := self.gl_area.get_error():
-                    raise RuntimeError(f'Failed to create GTK OpenGL area: {error.message}')
-                if present:
-                    self.window.set_focus(self.gl_area)
-                    self.gl_area.grab_focus()
-                if not present and self.window.get_mapped():
-                    self.window.set_visible(False)
-                return
-            context.iteration(False)
-            time.sleep(0.005)
+        timed_out = False
+
+        def timeout() -> bool:
+            nonlocal timed_out
+            timed_out = True
+            # Removed in finally, along with the successful startup path.
+            return GLib.SOURCE_CONTINUE
+
+        timeout_source = GLib.timeout_add(5000, timeout)
+        try:
+            while not timed_out:
+                if self.gl_area.get_realized() and self.gl_area.get_width() > 0 and self.gl_area.get_height() > 0:
+                    self.gl_area.make_current()
+                    if error := self.gl_area.get_error():
+                        raise RuntimeError(f'Failed to create GTK OpenGL area: {error.message}')
+                    if present:
+                        self.window.set_focus(self.gl_area)
+                        self.gl_area.grab_focus()
+                    if not present and self.window.get_mapped():
+                        self.window.set_visible(False)
+                    return
+                # Dispatch pending work immediately, then block until GTK has
+                # another event. Fixed sleeps delay every startup round trip.
+                context.iteration(True)
+        finally:
+            GLib.source_remove(timeout_source)
         raise RuntimeError('Timed out waiting for GTK OpenGL area realization')
 
     def make_gl_current(self) -> None:

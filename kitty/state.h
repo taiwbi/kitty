@@ -855,6 +855,7 @@ typedef void (*timer_callback_fun)(id_type, void *);
 typedef void (*tick_callback_fun)(void *);
 bool is_gtk_backend_active(void);
 bool is_gtk_backend_enabled(void);
+GLFWglproc gtk_backend_get_proc_address(const char *name);
 void gtk_backend_wakeup(void);
 id_type gtk_backend_add_main_loop_timer(monotonic_t interval, bool repeats, timer_callback_fun callback, void *callback_data, timer_callback_fun free_callback);
 void gtk_backend_update_main_loop_timer(id_type timer_id, monotonic_t interval, bool enabled);
