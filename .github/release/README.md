@@ -45,6 +45,9 @@ SPDX dependency SBOM, and `SHA256SUMS`.
    selection enabled, and requires its child process to run and exit. The workflow
    repeats the archive check in the minimal `runtime` container stage, which has
    no GTK installation, Python, build prefix or toolchain.
+   Before freezing, run the GTK regression tests with the real bindings,
+   including protocol fallback and CSS blur ownership. Enable transparency and
+   blur in the complete Wayland terminal startup check.
 7. On Linux amd64, build standalone `kitten` binaries for Linux amd64, arm64,
    arm, and 386 after native code generation.
 8. Download all Linux job artifacts in one publishing job. Validate the exact

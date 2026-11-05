@@ -9,6 +9,14 @@ To update |kitty|, :doc:`follow the instructions <binary>`.
 Recent major new features
 ---------------------------
 
+GTK background blur fix [0.50.0.2]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Restore background blur for GTK versions older than 4.23.3, including the
+portable Linux builds. Keep using GTK's CSS backdrop filter on newer versions
+so each Wayland surface has a single background-effect owner. Refresh the blur
+region after resizing or recreating a window and when background opacity changes.
+
 GTK window startup fix [0.50.0.1]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -120,6 +120,7 @@ from .fast_data_types import (  # noqa: E402
     gtk_backend_clear_window_blur,
     gtk_backend_initialize,
     gtk_backend_set_window_app_id,
+    gtk_backend_set_window_blur,
     gtk_input_close,
     gtk_input_focus,
     gtk_input_key,
@@ -133,7 +134,8 @@ from .tab_bar import TabBarData  # noqa: E402
 
 # GTK owns this Wayland surface and may already have attached a background
 # effect to it. Use GTK's CSS filter where supported instead of sending a
-# second ext_background_effect_manager_v1 request for the same surface.
+# second ext_background_effect_manager_v1 request for the same surface. Older
+# GTK versions need kitty's protocol bridge because they have no CSS filter.
 _use_gtk_css_wayland_blur = (Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()) >= (4, 23, 3)
 
 if (Adw.get_major_version(), Adw.get_minor_version()) < (1, 4):
@@ -579,6 +581,7 @@ class GtkKittyWindow:
 
     def _window_realized(self, _window: Gtk.Window) -> None:
         gtk_backend_set_window_app_id(self.window.__gpointer__, self.application_id)
+        self._apply_wayland_blur()
 
     def _window_unrealized(self, _window: Gtk.Window) -> None:
         if self.os_window_id:
@@ -588,6 +591,7 @@ class GtkKittyWindow:
         self._gtk_scale = max(1, self.gl_area.get_scale_factor())
         if self.os_window_id and width > 0 and height > 0:
             gtk_input_resize(self.os_window_id, width, height, self._gtk_scale)
+            self._apply_wayland_blur()
 
     def _area_rendered(self, _area: Gtk.GLArea, context: Any) -> bool:
         rendered = bool(self.events.render(context))
@@ -1009,9 +1013,15 @@ class GtkKittyWindow:
         topbar_visible = not bool(hide_window_decorations & 0b01) and self._tab_bar_visible
         self.tab_chrome.set_visible(topbar_visible)
 
+    def _apply_wayland_blur(self) -> None:
+        if _use_gtk_css_wayland_blur or not is_wayland() or not self.os_window_id or not self.window.get_realized():
+            return
+        gtk_backend_set_window_blur(self.os_window_id, self.window.__gpointer__, self._background_blur)
+
     def apply_chrome_style(self, background_color: int, background_opacity: float, background_blur: int) -> None:
         """Match GTK's header surface to kitty's active terminal background."""
         self._background_blur = max(0, int(background_blur)) if background_opacity < 1.0 else 0
+        self._apply_wayland_blur()
         style_key = (background_color, float(background_opacity), self._background_blur)
         if getattr(self, '_chrome_style_key', None) == style_key:
             return
@@ -1058,6 +1068,7 @@ class GtkKittyWindow:
         self._gtk_scale = max(1, self.gl_area.get_scale_factor())
         self.events.resized(self.gl_area.get_width(), self.gl_area.get_height(), self._gtk_scale)
         self.events.focus_changed(self.window.is_active())
+        self._apply_wayland_blur()
 
     def set_tab_actions(
         self,
