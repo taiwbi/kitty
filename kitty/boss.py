@@ -136,6 +136,7 @@ from .fast_data_types import (
     toggle_os_window_visibility,
     toggle_secure_input,
     viewport_for_window,
+    wakeup_main_loop,
     wrapped_kitten_names,
 )
 from .key_encoding import get_name_to_functional_number_map
@@ -2306,12 +2307,16 @@ class Boss:
             tm.new_tab()
         if window := self.gtk_windows.get(os_window_id):
             window.gl_area.grab_focus()
+        self.queue_gtk_render(os_window_id)
+        wakeup_main_loop()
 
     def gtk_select_tab(self, os_window_id: int, tab_id: int) -> None:
         if (tm := self.os_window_map.get(os_window_id)) and (tab := tm.tab_for_id(tab_id)) is not None:
             tm.set_active_tab(tab)
         if window := self.gtk_windows.get(os_window_id):
             window.gl_area.grab_focus()
+        self.queue_gtk_render(os_window_id)
+        wakeup_main_loop()
 
     def gtk_close_tab(self, os_window_id: int, tab_id: int) -> None:
         if (tm := self.os_window_map.get(os_window_id)) and (tab := tm.tab_for_id(tab_id)) is not None:
