@@ -63,7 +63,7 @@ typedef struct GTKWaylandBlurSurface {
     struct wl_surface *wl_surface;
     struct ext_background_effect_surface_v1 *effect;
     int blur_radius;
-    int region_x, region_y, region_width, region_height;
+    cairo_region_t *region;
     bool region_set;
     struct GTKWaylandBlurSurface *next;
 } GTKWaylandBlurSurface;
@@ -137,6 +137,71 @@ gtk_wayland_blur_initialize(GdkDisplay *display) {
     }
 }
 
+// Snapshot only the CSS background, not the terminal contents. GTK exposes the
+// computed corner radii in the shadow outline even when the background is
+// transparent. This follows libadwaita's theme and its tiled/maximized styles.
+static const GskRoundedRect *
+gtk_background_outline(GskRenderNode *node) {
+    switch (gsk_render_node_get_node_type(node)) {
+        case GSK_OUTSET_SHADOW_NODE: return gsk_outset_shadow_node_get_outline(node);
+        case GSK_INSET_SHADOW_NODE: return gsk_inset_shadow_node_get_outline(node);
+        case GSK_ROUNDED_CLIP_NODE: return gsk_rounded_clip_node_get_clip(node);
+        case GSK_BORDER_NODE: return gsk_border_node_get_outline(node);
+        case GSK_CONTAINER_NODE:
+            for (guint i = 0; i < gsk_container_node_get_n_children(node); i++) {
+                const GskRoundedRect *outline = gtk_background_outline(gsk_container_node_get_child(node, i));
+                if (outline) return outline;
+            }
+            break;
+        case GSK_DEBUG_NODE: return gtk_background_outline(gsk_debug_node_get_child(node));
+        default: break;
+    }
+    return NULL;
+}
+
+static cairo_region_t *
+gtk_window_blur_region(GtkWindow *window) {
+    GtkWidget *widget = GTK_WIDGET(window);
+    const int width = gtk_widget_get_width(widget), height = gtk_widget_get_height(widget);
+    double surface_x = 0.0, surface_y = 0.0;
+    gtk_native_get_surface_transform(GTK_NATIVE(window), &surface_x, &surface_y);
+    // Surface coordinates are logical pixels, including the CSD shadow inset.
+    const int x = (int)floor(surface_x), y = (int)floor(surface_y);
+    GskRoundedRect rect;
+    gsk_rounded_rect_init_from_rect(&rect, &GRAPHENE_RECT_INIT(0, 0, width, height), 0);
+    GtkSnapshot *snapshot = gtk_snapshot_new();
+    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+    GtkStyleContext *context = gtk_widget_get_style_context(widget);
+    gtk_snapshot_render_background(snapshot, context, 0, 0, width, height);
+    gtk_snapshot_render_frame(snapshot, context, 0, 0, width, height);
+    G_GNUC_END_IGNORE_DEPRECATIONS
+    GskRenderNode *node = gtk_snapshot_free_to_node(snapshot);
+    if (node) {
+        const GskRoundedRect *outline = gtk_background_outline(node);
+        if (outline) rect = *outline;
+        gsk_render_node_unref(node);
+    }
+    const cairo_rectangle_int_t bounds = {x, y, MAX(0, width), MAX(0, height)};
+    cairo_region_t *region = cairo_region_create_rectangle(&bounds);
+    if (gsk_rounded_rect_is_rectilinear(&rect)) return region;
+    for (int row = 0; row < height; row++) {
+        int left = 0, right = width;
+        // Include only whole pixels inside the rounded outline. This keeps
+        // blur out of the antialiased, transparent fringe of each corner.
+        while (left < right && !gsk_rounded_rect_contains_rect(&rect, &GRAPHENE_RECT_INIT(left, row, 1, 1))) left++;
+        while (right > left && !gsk_rounded_rect_contains_rect(&rect, &GRAPHENE_RECT_INIT(right - 1, row, 1, 1))) right--;
+        if (left > 0) {
+            const cairo_rectangle_int_t strip = {x, y + row, left, 1};
+            cairo_region_subtract_rectangle(region, &strip);
+        }
+        if (right < width) {
+            const cairo_rectangle_int_t strip = {x + right, y + row, width - right, 1};
+            cairo_region_subtract_rectangle(region, &strip);
+        }
+    }
+    return region;
+}
+
 static void
 gtk_wayland_blur_update(GTKWaylandBlurSurface *entry) {
     if (!entry->effect && gtk_blur_manager && entry->blur_radius > 0 && (gtk_blur_capabilities & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR)) {
@@ -151,12 +216,14 @@ gtk_wayland_blur_update(GTKWaylandBlurSurface *entry) {
         }
         return;
     }
-    const int x = entry->region_x, y = entry->region_y;
-    const int width = entry->region_width, height = entry->region_height;
-    if (entry->region_set && width > 0 && height > 0) return;
-    struct wl_region *region = width > 0 && height > 0 ? wl_compositor_create_region(gtk_blur_compositor) : NULL;
+    if (entry->region_set || !entry->region || cairo_region_is_empty(entry->region)) return;
+    struct wl_region *region = wl_compositor_create_region(gtk_blur_compositor);
     if (region) {
-        wl_region_add(region, x, y, width, height);
+        for (int i = 0; i < cairo_region_num_rectangles(entry->region); i++) {
+            cairo_rectangle_int_t rect;
+            cairo_region_get_rectangle(entry->region, i, &rect);
+            wl_region_add(region, rect.x, rect.y, rect.width, rect.height);
+        }
         ext_background_effect_surface_v1_set_blur_region(entry->effect, region);
         wl_region_destroy(region);
         entry->region_set = true;
@@ -183,6 +250,7 @@ gtk_wayland_blur_remove(id_type window_id) {
         }
         if (entry->effect) ext_background_effect_surface_v1_destroy(entry->effect);
         g_object_unref(entry->gdk_surface);
+        if (entry->region) cairo_region_destroy(entry->region);
         *link = entry->next;
         free(entry);
         if (gtk_blur_display) wl_display_flush(gtk_blur_display);
@@ -368,20 +436,10 @@ gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
         entry->gdk_surface = g_object_ref(surface);
         entry->wl_surface = wl_surface;
     }
-    double surface_x = 0.0, surface_y = 0.0;
-    gtk_native_get_surface_transform(GTK_NATIVE(window), &surface_x, &surface_y);
-    // GTK's Wayland surface includes transparent client-side shadow margins.
-    // GtkWindow reports the inset of its allocation in the native surface.
-    // Negating it moves the blur into the transparent shadow, outside the window.
-    const int region_x = (int)floor(surface_x), region_y = (int)floor(surface_y);
-    const int region_width = gtk_widget_get_width(GTK_WIDGET(window));
-    const int region_height = gtk_widget_get_height(GTK_WIDGET(window));
-    if (entry->region_x != region_x || entry->region_y != region_y || entry->region_width != region_width || entry->region_height != region_height)
-        entry->region_set = false;
-    entry->region_x = region_x;
-    entry->region_y = region_y;
-    entry->region_width = region_width;
-    entry->region_height = region_height;
+    cairo_region_t *region = gtk_window_blur_region(window);
+    if (!entry->region || !cairo_region_equal(entry->region, region)) entry->region_set = false;
+    if (entry->region) cairo_region_destroy(entry->region);
+    entry->region = region;
     entry->blur_radius = blur_radius;
     gtk_wayland_blur_update(entry);
     wl_display_flush(gtk_blur_display);
@@ -391,6 +449,39 @@ gtk_backend_set_window_blur(PyObject UNUSED *self, PyObject *args) {
     (void)blur_radius;
 #endif
     Py_RETURN_NONE;
+}
+
+PyObject *
+gtk_backend_get_window_blur_region(PyObject UNUSED *self, PyObject *args) {
+    PyObject *window_capsule = NULL;
+    if (!PyArg_ParseTuple(args, "O", &window_capsule)) return NULL;
+#if defined(KITTY_WITH_GTK) && defined(KITTY_WITH_GTK_WAYLAND_BLUR)
+    GtkWindow *window = gtk_pointer_from_capsule(window_capsule);
+    if (!window) return NULL;
+    if (!GTK_IS_WINDOW(window)) {
+        PyErr_SetString(PyExc_TypeError, "expected a GTK window");
+        return NULL;
+    }
+    cairo_region_t *region = gtk_window_blur_region(window);
+    PyObject *result = PyTuple_New(cairo_region_num_rectangles(region));
+    if (result) {
+        for (int i = 0; i < cairo_region_num_rectangles(region); i++) {
+            cairo_rectangle_int_t rect;
+            cairo_region_get_rectangle(region, i, &rect);
+            PyObject *item = Py_BuildValue("(iiii)", rect.x, rect.y, rect.width, rect.height);
+            if (!item) {
+                Py_CLEAR(result);
+                break;
+            }
+            PyTuple_SET_ITEM(result, i, item);
+        }
+    }
+    cairo_region_destroy(region);
+    return result;
+#else
+    PyErr_SetString(PyExc_NotImplementedError, "GTK Wayland blur support is unavailable");
+    return NULL;
+#endif
 }
 
 PyObject *

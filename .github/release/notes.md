@@ -1,5 +1,11 @@
 Portable Linux kitty and standalone kitten builds from this tag.
 
+Changes in 0.50.0.3:
+
+- Clip GTK Wayland background blur to the window's themed rounded corners, keeping blur out of transparent corners and shadows.
+- Refresh the blur shape after resizing and window state or theme changes.
+- Verify the native blur geometry against GTK's CSS in release regression tests.
+
 Changes in 0.50.0.2:
 
 - Restore background blur on GTK versions older than 4.23.3, including the portable Linux builds.

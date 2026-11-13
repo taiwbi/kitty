@@ -2211,6 +2211,7 @@ static PyMethodDef module_methods[] = {
     M(gtk_backend_activate, METH_NOARGS),
     M(gtk_backend_register_window, METH_VARARGS),
     M(gtk_backend_set_window_app_id, METH_VARARGS),
+    M(gtk_backend_get_window_blur_region, METH_VARARGS),
     M(gtk_backend_set_window_blur, METH_VARARGS),
     M(gtk_backend_clear_window_blur, METH_VARARGS),
     M(gtk_backend_is_active, METH_NOARGS),

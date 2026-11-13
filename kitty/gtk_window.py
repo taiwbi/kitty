@@ -604,6 +604,7 @@ class GtkKittyWindow:
 
     def _sync_scrollbar_after_render(self) -> bool:
         self._scrollbar_sync_source = 0
+        self._apply_wayland_blur()
         self._sync_scrollbar()
         return GLib.SOURCE_REMOVE
 

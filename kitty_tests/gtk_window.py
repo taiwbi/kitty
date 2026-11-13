@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import time
 import warnings
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -203,6 +204,66 @@ assert len(fired) == 1
             window._window_realized(window.window)
             set_blur.assert_called_once_with(1, window.window.__gpointer__, 20)
 
+    def test_gtk_blur_rounded_region(self):
+        from kitty.fast_data_types import gtk_backend_get_window_blur_region, gtk_backend_has_wayland_blur
+
+        if not gtk_backend_has_wayland_blur() or not any(os.environ.get(k) for k in ('DISPLAY', 'WAYLAND_DISPLAY')):
+            self.skipTest('GTK Wayland blur support and a display server are required')
+        backend = self.backend
+        warnings.filterwarnings('ignore', message=r'.*Gtk\..*is deprecated', category=DeprecationWarning)
+        backend.initialize_gtk()
+        window = backend.Gtk.Window()
+        window.set_default_size(160, 120)
+        provider = backend.Gtk.CssProvider()
+        context = window.get_style_context()
+        context.add_provider(provider, backend.Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        window.present()
+        self.addCleanup(window.destroy)
+        main_context = backend.GLib.MainContext.default()
+
+        def region_for(radius, size=(160, 120)):
+            window.set_default_size(*size)
+            provider.load_from_data(
+                f"""
+                window {{
+                    background: transparent;
+                    border-radius: {radius};
+                    box-shadow: 0 0 8px 2px black;
+                    border: none;
+                }}
+            """.encode()
+            )
+            # Wait for CSS and allocation to reach the same state as a frame.
+            for _ in range(5):
+                while main_context.pending():
+                    main_context.iteration(False)
+                time.sleep(0.02)
+            rects = gtk_backend_get_window_blur_region(window.__gpointer__)
+            return {(x + dx, y + dy) for x, y, w, h in rects for dx in range(w) for dy in range(h)}
+
+        for size in ((160, 120), (240, 180), (30, 24)):
+            with self.subTest(size=size):
+                square = region_for('0', size)
+                rounded = region_for('12px', size)
+                self.assertTrue(rounded < square)
+                left, top = min(x for x, _ in square), min(y for _, y in square)
+                right, bottom = max(x for x, _ in square), max(y for _, y in square)
+                for corner in ((left, top), (right, top), (left, bottom), (right, bottom)):
+                    self.assertNotIn(corner, rounded)
+                center = ((left + right) // 2, (top + bottom) // 2)
+                self.assertTrue(center in rounded)
+                if size[1] > 24:
+                    self.assertTrue((left, center[1]) in rounded)
+                self.assertTrue((center[0], top) in rounded)
+                self.ae(region_for('0', size), square)
+        square = region_for('0')
+        asymmetric = region_for('16px 0 0 0')
+        left, top = min(x for x, _ in square), min(y for _, y in square)
+        right, bottom = max(x for x, _ in square), max(y for _, y in square)
+        self.assertNotIn((left, top), asymmetric)
+        for corner in ((right, top), (left, bottom), (right, bottom)):
+            self.assertIn(corner, asymmetric)
+
     def test_gtk_realization_wait(self):
         backend = self.backend
         for present in (False, True):
@@ -367,6 +428,7 @@ assert len(fired) == 1
         window.events = SimpleNamespace(render=Mock(return_value=True))
         window._scrollbar_sync_source = 0
         window._sync_scrollbar = Mock()
+        window._apply_wayland_blur = Mock()
 
         # GTK must finish snapshotting before scrollbar changes invalidate its
         # allocation. Multiple renders should share a single pending update.
@@ -376,10 +438,12 @@ assert len(fired) == 1
         self.assertTrue(window._area_rendered(None, None))
         self.ae(window._scrollbar_sync_source, source)
         window._sync_scrollbar.assert_not_called()
+        window._apply_wayland_blur.assert_not_called()
         context = backend.GLib.MainContext.default()
         while window._scrollbar_sync_source:
             context.iteration(True)
         window._sync_scrollbar.assert_called_once_with()
+        window._apply_wayland_blur.assert_called_once_with()
         self.ae(window._scrollbar_sync_source, 0)
 
     def test_gtk_scrollbar_sync_cancelled_on_close(self):

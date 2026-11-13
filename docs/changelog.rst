@@ -9,6 +9,13 @@ To update |kitty|, :doc:`follow the instructions <binary>`.
 Recent major new features
 ---------------------------
 
+GTK rounded background blur [0.50.0.3]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clip the Wayland background blur to the GTK window's themed rounded corners,
+keeping it out of transparent corners and client-side shadows. Update the blur
+shape when the window is resized, tiled, maximized, or restored.
+
 GTK background blur fix [0.50.0.2]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
