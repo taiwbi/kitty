@@ -270,6 +270,9 @@ Unreleased
   font run cannot be shaped or uploaded. This prevents rows of Persian and
   Arabic text from flipping order while scrolling in applications like Neovim.
 
+- GTK window backend: Remove the terminal's right-click menu so right-click
+  follows kitty's mouse mappings again.
+
 0.50.0 [2026-11-03]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
