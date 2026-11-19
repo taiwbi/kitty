@@ -160,6 +160,12 @@ render_bidi_run(FontGroup *fg, const BidiLayout *layout, unsigned first_cell, un
 
 static bool
 render_bidi_row(FontGroup *fg, const Line *line, const BidiLayout *layout, DisableLigature strategy, int cursor_x, GPUCell *output) {
+    // Establish visual order before reshaping. A run can keep its existing
+    // sprites if shaping or sprite upload fails during a redraw.
+    for (unsigned i = 0; i < layout->num_cells; i++) {
+        const BidiCell *cell = layout->cells + i;
+        memcpy(output + cell->visual_x, line->gpu_cells + cell->x, cell->width * sizeof(GPUCell));
+    }
     RAII_ListOfChars(lc);
     ssize_t *fonts = malloc(layout->num_cells * sizeof(*fonts));
     TextCache *tc = tc_alloc();
@@ -175,8 +181,8 @@ render_bidi_row(FontGroup *fg, const Line *line, const BidiLayout *layout, Disab
         // Keep color emoji and private-use icons, whose existing sprites can
         // occupy adjacent blank cells, in addition to special/blank sprites.
         if (emoji || is_private_use(char_props_for(lc.chars[0]))) fonts[i] = NO_FONT;
-        memcpy(output + cell->visual_x, line->gpu_cells + cell->x, cell->width * sizeof(GPUCell));
     }
+    ok = true;
     for (unsigned i = 0; i < layout->num_cells;) {
         const unsigned start = i++;
         const BidiCell *cell = layout->cells + start;
@@ -185,9 +191,11 @@ render_bidi_row(FontGroup *fg, const Line *line, const BidiLayout *layout, Disab
         const BidiCell *last = layout->cells + i - 1;
         const bool disable = strategy == DISABLE_LIGATURES_ALWAYS ||
                              (strategy == DISABLE_LIGATURES_CURSOR && cursor_x >= (int)cell->x && cursor_x < (int)(last->x + last->width));
-        if (!render_bidi_run(fg, layout, start, i, fonts[start], disable, output)) goto cleanup;
+        if (!render_bidi_run(fg, layout, start, i, fonts[start], disable, output)) {
+            if (PyErr_Occurred()) PyErr_Print();
+            ok = false;
+        }
     }
-    ok = true;
 cleanup:
     free(fonts);
     if (tc) tc_decref(tc);
@@ -207,47 +215,52 @@ evict_bidi_row(FontGroup *fg, BidiCachedRow *row) {
     *row = (BidiCachedRow){0};
 }
 
-const GPUCell *
-render_visual_line(FONTS_DATA_HANDLE handle, Line *line, DisableLigature strategy, int cursor_x) {
-    if (!OPT(bidi_rendering) || OPT(force_ltr)) return line->gpu_cells;
+void
+render_visual_line(FONTS_DATA_HANDLE handle, const Line *line, DisableLigature strategy, int cursor_x, GPUCell *output) {
+    const size_t cells_size = line->xnum * sizeof(GPUCell);
     BidiLayout layout;
-    if (!bidi_layout(line, &layout)) return line->gpu_cells;
+    if (!OPT(bidi_rendering) || OPT(force_ltr) || !bidi_layout(line, &layout)) {
+        memcpy(output, line->gpu_cells, cells_size);
+        return;
+    }
     FontGroup *fg = (FontGroup *)handle;
     const uint32_t header[] = {line->xnum, layout.count, layout.num_cells, strategy, strategy == DISABLE_LIGATURES_CURSOR ? (uint32_t)cursor_x : UINT32_MAX};
-    const size_t cells_size = line->xnum * sizeof(GPUCell);
     const size_t key_size =
         sizeof(header) + line->xnum * (sizeof(CPUCell) + sizeof(GPUCell)) + layout.count * sizeof(char_type) + layout.num_cells * sizeof(BidiCell);
-    uint8_t *key = NULL;
-    GPUCell *output = NULL;
-    const GPUCell *ans = line->gpu_cells;
-    if (key_size + cells_size > BIDI_ROW_CACHE_BYTES) goto cleanup;
-    key = malloc(key_size);
-    if (!key) goto cleanup;
-    uint8_t *p = key;
+    uint8_t *key = key_size + cells_size <= BIDI_ROW_CACHE_BYTES ? malloc(key_size) : NULL;
+    GPUCell *cached_cells = NULL;
+    uint64_t hash = 0;
+    unsigned victim = 0;
+    if (key) {
+        uint8_t *p = key;
 #define append_key(data, sz) \
     do {                     \
         memcpy(p, data, sz); \
         p += sz;             \
     } while (0)
-    append_key(header, sizeof(header));
-    append_key(line->cpu_cells, line->xnum * sizeof(CPUCell));
-    append_key(line->gpu_cells, cells_size);
-    append_key(layout.text, layout.count * sizeof(char_type));
-    append_key(layout.cells, layout.num_cells * sizeof(BidiCell));
+        append_key(header, sizeof(header));
+        append_key(line->cpu_cells, line->xnum * sizeof(CPUCell));
+        append_key(line->gpu_cells, cells_size);
+        append_key(layout.text, layout.count * sizeof(char_type));
+        append_key(layout.cells, layout.num_cells * sizeof(BidiCell));
 #undef append_key
-    const uint64_t hash = vt_hash_bytes(key, key_size);
-    unsigned victim = 0;
-    for (unsigned i = 0; i < BIDI_CACHED_ROWS; i++) {
-        BidiCachedRow *row = fg->bidi_rows + i;
-        if (row->key && row->hash == hash && row->key_size == key_size && memcmp(row->key, key, key_size) == 0) {
-            row->age = ++fg->bidi_cache_clock;
-            ans = row->cells;
-            goto cleanup;
+        hash = vt_hash_bytes(key, key_size);
+        for (unsigned i = 0; i < BIDI_CACHED_ROWS; i++) {
+            BidiCachedRow *row = fg->bidi_rows + i;
+            if (row->key && row->hash == hash && row->key_size == key_size && memcmp(row->key, key, key_size) == 0) {
+                row->age = ++fg->bidi_cache_clock;
+                memcpy(output, row->cells, cells_size);
+                goto cleanup;
+            }
+            if (row->age < fg->bidi_rows[victim].age) victim = i;
         }
-        if (row->age < fg->bidi_rows[victim].age) victim = i;
     }
-    output = malloc(cells_size);
-    if (!output || !render_bidi_row(fg, line, &layout, strategy, cursor_x, output)) goto cleanup;
+    if (key) cached_cells = malloc(cells_size);
+    const bool complete = render_bidi_row(fg, line, &layout, strategy, cursor_x, cached_cells ? cached_cells : output);
+    // The GPU destination can be write-only.
+    if (cached_cells) memcpy(output, cached_cells, cells_size);
+    // Cache only fully shaped rows so a later redraw can retry failed runs.
+    if (!complete || !cached_cells) goto cleanup;
     evict_bidi_row(fg, fg->bidi_rows + victim);
     while (fg->bidi_cache_bytes + key_size + cells_size > BIDI_ROW_CACHE_BYTES) {
         unsigned oldest = 0;
@@ -255,15 +268,13 @@ render_visual_line(FONTS_DATA_HANDLE handle, Line *line, DisableLigature strateg
             if (fg->bidi_rows[i].key && (!fg->bidi_rows[oldest].key || fg->bidi_rows[i].age < fg->bidi_rows[oldest].age)) oldest = i;
         evict_bidi_row(fg, fg->bidi_rows + oldest);
     }
-    fg->bidi_rows[victim] = (BidiCachedRow){.key = key, .key_size = key_size, .hash = hash, .age = ++fg->bidi_cache_clock, .cells = output};
+    fg->bidi_rows[victim] = (BidiCachedRow){.key = key, .key_size = key_size, .hash = hash, .age = ++fg->bidi_cache_clock, .cells = cached_cells};
     fg->bidi_cache_bytes += key_size + cells_size;
-    ans = output;
     key = NULL;
-    output = NULL;
+    cached_cells = NULL;
 cleanup:
     free(key);
-    free(output);
+    free(cached_cells);
     free_bidi_layout(&layout);
     if (PyErr_Occurred()) PyErr_Print();
-    return ans;
 }

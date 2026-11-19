@@ -1170,8 +1170,7 @@ extract_cell_region(Canvas *canvas, unsigned i, Region *src, const Region *dest,
 
 static void
 set_cell_sprite(GPUCell *cell, const SpritePosition *sp) {
-    cell->sprite_idx = sp->idx & 0x7fffffff;
-    if (sp->colored) cell->sprite_idx |= 0x80000000;
+    cell->sprite_idx = (sp->idx & 0x7fffffff) | (sp->colored ? 0x80000000 : 0);
 }
 
 static Region
@@ -2724,7 +2723,9 @@ test_render_line(PyObject UNUSED *self, PyObject *args) {
     render_line((FONTS_DATA_HANDLE)font_groups, (Line *)line, 0, NULL, DISABLE_LIGATURES_NEVER, &lc);
     if (visual) {
         Line *l = (Line *)line;
-        const GPUCell *cells = render_visual_line((FONTS_DATA_HANDLE)font_groups, l, DISABLE_LIGATURES_NEVER, -1);
+        RAII_ALLOC(GPUCell, cells, malloc(l->xnum * sizeof(GPUCell)));
+        if (!cells) return PyErr_NoMemory();
+        render_visual_line((FONTS_DATA_HANDLE)font_groups, l, DISABLE_LIGATURES_NEVER, -1, cells);
         return gpu_cells_as_python(cells, l->xnum);
     }
     Py_RETURN_NONE;

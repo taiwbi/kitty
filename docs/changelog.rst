@@ -263,6 +263,13 @@ you use a decent Wayland compositor.
 Detailed list of changes
 -------------------------------------
 
+Unreleased
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Keep bidirectional text in visual order during redraws when an individual
+  font run cannot be shaped or uploaded. This prevents rows of Persian and
+  Arabic text from flipping order while scrolling in applications like Neovim.
+
 0.50.0 [2026-11-03]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

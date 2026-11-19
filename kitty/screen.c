@@ -3963,9 +3963,8 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
 
 
 static void
-update_line_data(Line *line, unsigned int dest_y, uint8_t *data, FONTS_DATA_HANDLE fonts_data, DisableLigature disable_ligatures, int cursor_x) {
-    size_t base = sizeof(GPUCell) * dest_y * line->xnum;
-    memcpy(data + base, render_visual_line(fonts_data, line, disable_ligatures, cursor_x), line->xnum * sizeof(GPUCell));
+update_line_data(const Line *line, unsigned int dest_y, uint8_t *data, FONTS_DATA_HANDLE fonts_data, DisableLigature disable_ligatures, int cursor_x) {
+    render_visual_line(fonts_data, line, disable_ligatures, cursor_x, (GPUCell *)data + (size_t)dest_y * line->xnum);
 }
 
 static void
@@ -5262,10 +5261,10 @@ render_overlay_line(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data) {
 static void
 update_overlay_line_data(Screen *self, uint8_t *data, FONTS_DATA_HANDLE fonts_data) {
     const int render_row_offset = pixel_scroll_enabled(self);
-    const size_t base = sizeof(GPUCell) * (self->overlay_line.ynum + self->scrolled_by + render_row_offset) * self->columns;
+    const unsigned int render_row = self->overlay_line.ynum + self->scrolled_by + render_row_offset;
     Line overlay = {
         .xnum = self->columns, .cpu_cells = self->overlay_line.cpu_cells, .gpu_cells = self->overlay_line.gpu_cells, .text_cache = self->text_cache};
-    memcpy(data + base, render_visual_line(fonts_data, &overlay, self->disable_ligatures, (int)self->overlay_line.cursor_x), self->columns * sizeof(GPUCell));
+    update_line_data(&overlay, render_row, data, fonts_data, self->disable_ligatures, (int)self->overlay_line.cursor_x);
 }
 
 // }}}

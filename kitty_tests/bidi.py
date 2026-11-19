@@ -1,7 +1,19 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2026
 
-from kitty.fast_data_types import Screen, sprite_idx_to_pos, test_bidi_coordinates, test_bidi_layout, test_render_line, test_render_screen
+from contextlib import redirect_stderr
+from io import StringIO
+
+from kitty.fast_data_types import (
+    Screen,
+    sprite_idx_to_pos,
+    sprite_map_set_layout,
+    sprite_map_set_limits,
+    test_bidi_coordinates,
+    test_bidi_layout,
+    test_render_line,
+    test_render_screen,
+)
 from kitty.fonts.render import setup_for_testing
 
 from .base import BaseTest, draw_multicell, parse_bytes
@@ -142,6 +154,24 @@ class BidiRendering(FontBaseTest):
         self.ae(len(result), len(compressed))
         self.ae(str(compressed), before)
         self.assertTrue(any(any(self.pixels(result)[x]) for x in range(2, 5)))
+
+    def test_bidi_redraw_when_a_sprite_cannot_be_uploaded(self):
+        self.set_options({'bidi_rendering': True, 'pixel_scroll': False})
+        screen = Screen(None, 2, 20)
+        parse_bytes(screen, '\x1b[?1049h\x1b[2;1H\x1b[31mﺱﻼﻣ\x1b[32m ﺪﻨﯾﺍ \x1b[0mtext'.encode())
+        before = test_render_screen(screen)[1]
+
+        # Scroll and repaint the text with different highlighting, as Neovim
+        # can do. Make the new italic sprites fail to upload.
+        parse_bytes(screen, '\x1b[S\x1b[H\x1b[3;31mﺱﻼﻣ\x1b[32m ﺪﻨﯾﺍ \x1b[0mtext'.encode())
+        test_render_line(screen.line(0))
+        sprite_map_set_limits(1, 1)
+        sprite_map_set_layout(1, 1)
+        with redirect_stderr(StringIO()) as errors:
+            rendered = test_render_screen(screen)[0]
+        self.assertIn('Out of texture space for sprites', errors.getvalue())
+        self.ae([cell[1] for cell in rendered], [cell[1] for cell in before])
+        self.ae(rendered[9:], before[9:])
 
     def test_bidi_cache_eviction(self):
         self.set_options({'bidi_rendering': True})
