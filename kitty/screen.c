@@ -91,6 +91,7 @@ init_overlay_line(Screen *self, index_type columns, bool keep_active) {
     if (!keep_active) {
         self->overlay_line.is_active = false;
         self->overlay_line.xnum = 0;
+        self->overlay_line.preedit_cursor = -1;
     }
     self->overlay_line.is_dirty = true;
     self->overlay_line.ynum = 0;
@@ -159,7 +160,6 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
         self->scroll_changed = false;
         self->margin_top = 0;
         self->margin_bottom = self->lines - 1;
-        self->history_line_added_count = 0;
         reset_vt_parser(self->vt_parser);
         self->callbacks = callbacks;
         Py_INCREF(callbacks);
@@ -209,6 +209,15 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
 static Line *range_line_(Screen *self, int y);
 
 static void
+clamp_scroll_position(Screen *self) {
+    // Ensure the scroll position is valid after the scrollback has shrunk
+    if (self->scrolled_by >= self->historybuf->count) {
+        self->scrolled_by = self->historybuf->count;
+        self->pixel_scroll_offset_y = 0;
+    }
+}
+
+static void
 do_screen_reset(Screen *self, bool is_hard_reset) {
     screen_pause_rendering(self, false, 0);
     self->dnd_chunking.active = false;
@@ -238,6 +247,14 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
     if (is_hard_reset) {
         linebuf_clear(self->linebuf, BLANK_CHAR);
         historybuf_clear(self->historybuf);
+        linebuf_clear(self->alt_linebuf, BLANK_CHAR);
+        // all buffers are now empty
+        self->multiline_chars_used = false;
+        zero_at_ptr(&self->multiline_chars_cut_off_at_bottom);
+        self->last_visited_prompt.is_set = false;
+        self->scrolled_by = 0;
+        self->pixel_scroll_offset_y = 0;
+        self->scroll_changed = true;
         clear_hyperlink_pool(self->hyperlink_pool);
         grman_clear(self->main_grman, false, self->cell_size); // dont delete images in scrollback
         grman_clear(self->alt_grman, true, self->cell_size);
@@ -441,6 +458,59 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
     }
 }
 
+static void
+last_visited_prompt_index(Screen *self, index_type top, index_type bottom, bool up, bool via_history) {
+    // Keep the last visited prompt on the same content when the lines in
+    // [top, bottom] of the main screen are scrolled by one. via_history means
+    // the line scrolled off the top goes into the scrollback (up) or the line
+    // scrolled in at the top comes from it (down), so the scrollback rows move too.
+    if (!self->last_visited_prompt.is_set || self->linebuf != self->main_linebuf) return;
+    int *row = &self->last_visited_prompt.row;
+    const int t = top, b = bottom;
+    if (*row > b) return;
+    if (!via_history && *row < t) return;
+    if (up) {
+        if (!via_history && *row == t) self->last_visited_prompt.is_set = false;
+        else {
+            (*row)--;
+            // a full scrollback drops its oldest line when one is added
+            if (*row < -(int)self->historybuf->count) self->last_visited_prompt.is_set = false;
+        }
+    } else {
+        if (*row == b) self->last_visited_prompt.is_set = false;
+        else (*row)++;
+    }
+}
+
+static void
+last_visited_prompt_insert_or_delete_lines(Screen *self, index_type at, index_type bottom, index_type count, bool insert) {
+    // Keep the last visited prompt on the same content when count lines are
+    // inserted or deleted at row at, moving the lines in [at, bottom].
+    if (!self->last_visited_prompt.is_set || self->linebuf != self->main_linebuf) return;
+    int *row = &self->last_visited_prompt.row;
+    if (*row < (int)at || *row > (int)bottom) return;
+    const index_type r = *row;
+    if (insert) {
+        if (count > bottom - r) self->last_visited_prompt.is_set = false; // pushed out of the region
+        else *row += count;
+    } else {
+        if (count > r - at) self->last_visited_prompt.is_set = false; // deleted
+        else *row -= count;
+    }
+}
+
+static bool
+last_visited_prompt_viewport(const Screen *self, index_type *y, unsigned int *scrolled_by) {
+    // Return the viewport position of the last visited prompt, showing it at
+    // the row it was visited at if the scrollback allows it.
+    if (!self->last_visited_prompt.is_set || self->linebuf != self->main_linebuf) return false;
+    const int row = self->last_visited_prompt.row, history_count = self->historybuf->count;
+    if (row < -history_count || row >= (int)self->lines) return false;
+    const int sb = MAX(0, MIN((int)self->last_visited_prompt.preferred_y - row, history_count));
+    *scrolled_by = sb;
+    *y = row + sb;
+    return true;
+}
 
 #define INDEX_GRAPHICS(amtv, histv)                                                          \
     {                                                                                        \
@@ -461,11 +531,7 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
 #define INDEX_DOWN(scroll_history)                                                                      \
     linebuf_reverse_index(self->linebuf, top, bottom);                                                  \
     linebuf_clear_line(self->linebuf, top, true);                                                       \
-    if (self->linebuf == self->main_linebuf && self->last_visited_prompt.is_set) {                      \
-        if (self->last_visited_prompt.scrolled_by > 0) self->last_visited_prompt.scrolled_by--;         \
-        else if (self->last_visited_prompt.y < self->lines - 1) self->last_visited_prompt.y++;          \
-        else self->last_visited_prompt.is_set = false;                                                  \
-    }                                                                                                   \
+    last_visited_prompt_index(self, top, bottom, false, scroll_history);                                \
     INDEX_GRAPHICS(1, scroll_history)                                                                   \
     self->is_dirty = true;                                                                              \
     if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, false, top, bottom); \
@@ -476,35 +542,55 @@ static void
 nuke_in_line(CPUCell *cp, GPUCell *gp, index_type start, index_type x_limit, char_type ch) {
     for (index_type x = start; x < x_limit; x++) {
         cell_set_char(cp + x, ch);
-        cp[x].is_multicell = false;
+        cell_clear_multicell(cp + x);
         clear_sprite_position(gp[x]);
     }
 }
 
+typedef struct MulticellRows {
+    int start, limit;
+} MulticellRows;
+
+static MulticellRows
+multicell_char_rows(Screen *self, index_type x, index_type y) {
+    // The rows [start, limit) occupied by the multicell char that has a cell
+    // at (x, y), negative rows are in the history buffer. Multiline chars can
+    // be partial, with some of their rows scrolled off the screen or out of
+    // the history buffer, or torn, with some of their rows replaced by
+    // unrelated lines. So rather than trusting the y and scale of the cell,
+    // only the adjacent rows that actually continue the char are included.
+    const CPUCell ref = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
+    MulticellRows ans = {.start = (int)y, .limit = (int)y + 1};
+    if (!ref.is_multicell) return ans;
+    const int min_y = self->linebuf == self->main_linebuf ? -(int)self->historybuf->count : 0;
+    for (int r = (int)y - 1, ry = (int)ref.y - 1; ry >= 0 && r >= min_y; r--, ry--) {
+        if (!continues_multicell_char(range_line_(self, r)->cpu_cells + x, &ref, ry)) break;
+        ans.start = r;
+    }
+    for (index_type r = y + 1, ry = ref.y + 1u; ry < ref.scale && r < self->lines; r++, ry++) {
+        if (!continues_multicell_char(linebuf_cpu_cells_for_line(self->linebuf, r) + x, &ref, ry)) break;
+        ans.limit = (int)r + 1;
+    }
+    return ans;
+}
+
+static void
+mark_range_line_dirty(Screen *self, int y) {
+    if (y > -1) linebuf_mark_line_dirty(self->linebuf, y);
+    else historybuf_mark_line_dirty(self->historybuf, -(y + 1));
+}
+
 static void
 nuke_multicell_char_at(Screen *self, index_type x_, index_type y_, bool replace_with_spaces) {
-    CPUCell *cp;
-    GPUCell *gp;
-    linebuf_init_cells(self->linebuf, y_, &cp, &gp);
-    index_type num_lines_above = cp[x_].y;
-    index_type y_max_limit = MIN(self->lines, y_ + cp[x_].scale - num_lines_above);
+    const MulticellRows rows = multicell_char_rows(self, x_, y_);
+    const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, y_);
     while (cp[x_].x && x_ > 0) x_--;
-    index_type x_limit = MIN(self->columns, x_ + mcd_x_limit(&cp[x_]));
-    char_type ch = replace_with_spaces ? ' ' : 0;
-    for (index_type y = y_; y < y_max_limit; y++) {
-        linebuf_init_cells(self->linebuf, y, &cp, &gp);
-        nuke_in_line(cp, gp, x_, x_limit, ch);
-        linebuf_mark_line_dirty(self->linebuf, y);
-    }
-    int y_min_limit = -1;
-    if (self->linebuf == self->main_linebuf) y_min_limit = -(self->historybuf->count + 1);
-    for (int y = (int)y_ - 1; y > y_min_limit && num_lines_above; y--, num_lines_above--) {
+    const index_type x_limit = MIN(self->columns, x_ + mcd_x_limit(&cp[x_]));
+    const char_type ch = replace_with_spaces ? ' ' : 0;
+    for (int y = rows.start; y < rows.limit; y++) {
         Line *line = range_line_(self, y);
-        cp = line->cpu_cells;
-        gp = line->gpu_cells;
-        nuke_in_line(cp, gp, x_, x_limit, ch);
-        if (y > -1) linebuf_mark_line_dirty(self->linebuf, y);
-        else historybuf_mark_line_dirty(self->historybuf, -(y + 1));
+        nuke_in_line(line->cpu_cells, line->gpu_cells, x_, x_limit, ch);
+        mark_range_line_dirty(self, y);
     }
     self->is_dirty = true;
 }
@@ -519,6 +605,69 @@ nuke_multiline_char_intersecting_with(Screen *self, index_type x_start, index_ty
             if (cp[x].is_multicell && cp[x].scale > 1) nuke_multicell_char_at(self, x, y, replace_with_spaces);
         }
     }
+}
+
+static bool *
+multiline_chars_cut_off_at_bottom(Screen *self) {
+    return self->multiline_chars_cut_off_at_bottom + (self->linebuf == self->alt_linebuf ? 1 : 0);
+}
+
+static void
+nuke_multiline_chars_extending_below(Screen *self, index_type bottom) {
+    // Remove chars extending below the line bottom when a new line is about to come in below it, tearing
+    // them. When bottom is the last line of the screen these are chars cut off at the bottom of the screen.
+    bool *cut_off = multiline_chars_cut_off_at_bottom(self);
+    const bool at_screen_bottom = bottom + 1 >= self->lines;
+    if (at_screen_bottom && !*cut_off) return;
+    const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, bottom);
+    if (cells_have_multiline_chars(cp, self->columns)) {
+        for (index_type x = 0; x < self->columns; x++) {
+            if (cp[x].is_multicell && cp[x].y + 1u < cp[x].scale) nuke_multicell_char_at(self, x, bottom, false);
+        }
+    }
+    if (at_screen_bottom) *cut_off = false;
+}
+
+static void
+nuke_multiline_chars_torn_by_scroll(Screen *self, index_type top, index_type bottom, bool up, bool history_adjoins_top) {
+    // Scrolling the region [top, bottom] moves its lines by one, removing the line
+    // at one edge and bringing a new line in at the other. Multiline chars
+    // that end up cut off at the edge of the screen (or of the history buffer)
+    // are left alone, they are partially scrolled off and are rendered as
+    // such. Chars that would end up torn, with the rows adjacent to the
+    // remaining part of the char being from unrelated lines, are removed.
+    // history_adjoins_top must be true when the line removed from (up) or
+    // brought into (down) the top of the region is moved into or out of the
+    // history buffer.
+    if (!self->multiline_chars_used || top >= bottom || bottom >= self->lines) return;
+#define has_multiline(y) cells_have_multiline_chars(linebuf_cpu_cells_for_line(self->linebuf, y), self->columns)
+    if (up) {
+        // The top line is removed. This cuts chars at the edge of the screen
+        // only if there is nothing above it, i.e. on the alternate screen.
+        // On the main screen, the line above the screen is the newest
+        // history line.
+        const bool at_edge = top == 0 && (history_adjoins_top || self->linebuf == self->alt_linebuf);
+        if (!at_edge && has_multiline(top)) nuke_multiline_char_intersecting_with(self, 0, self->columns, top, top + 1, false);
+        // A new line comes in at the bottom
+        nuke_multiline_chars_extending_below(self, bottom);
+    } else {
+        // The bottom line is removed, cutting chars at the edge of the screen
+        // if it is the last line of the screen. Rather than scanning for such
+        // chars here, the flag is set unconditionally, the next scroll up scans
+        // for them once and clears it.
+        if (bottom + 1 < self->lines) {
+            if (has_multiline(bottom)) nuke_multiline_char_intersecting_with(self, 0, self->columns, bottom, bottom + 1, false);
+        } else *multiline_chars_cut_off_at_bottom(self) = true;
+        // A new line comes in at the top, tearing chars that extend above the
+        // top line unless the new line is the history line above the top line
+        if (!(top == 0 && history_adjoins_top) && has_multiline(top)) {
+            const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, top);
+            for (index_type x = 0; x < self->columns; x++) {
+                if (cp[x].is_multicell && cp[x].y > 0) nuke_multicell_char_at(self, x, top, false);
+            }
+        }
+    }
+#undef has_multiline
 }
 
 static void
@@ -559,9 +708,12 @@ nuke_incomplete_single_line_multicell_chars_in_range(Screen *self, index_type st
     linebuf_init_cells(self->linebuf, y, &cpu_cells, &gpu_cells);
     for (index_type x = start; x < limit; x++) {
         if (cpu_cells[x].is_multicell) {
-            index_type mcd_x_limit = x + cpu_cells[x].width - cpu_cells[x].x;
-            if (cpu_cells[x].x || mcd_x_limit > limit) nuke_in_line(cpu_cells, gpu_cells, x, MIN(mcd_x_limit, limit), replace_with_spaces ? ' ' : 0);
-            x = mcd_x_limit - 1;
+            // The end of the char, at least x + 1, so that the loop always makes
+            // progress, even for fragments of chars whose first cell is missing
+            const index_type w = mcd_x_limit(cpu_cells + x);
+            const index_type char_limit = x + (w > cpu_cells[x].x ? w - cpu_cells[x].x : 1);
+            if (cpu_cells[x].x || char_limit > limit) nuke_in_line(cpu_cells, gpu_cells, x, MIN(char_limit, limit), replace_with_spaces ? ' ' : 0);
+            x = char_limit - 1;
         }
     }
 }
@@ -635,10 +787,17 @@ preserve_blank_output_start_line(Cursor *cursor, LineBuf *linebuf) {
 
 static void
 remove_blank_output_line_reservation_marker(Cursor *cursor, LineBuf *linebuf) {
+    // The cursor was moved past the marker, so the marker is just before it.
+    // It is not necessarily at the start of the line, as rewrap places it
+    // after the lower rows of multiline chars from the lines above.
     if (cursor->y < linebuf->ynum) {
-        linebuf_init_line(linebuf, cursor->y);
-        cell_set_char(linebuf->line->cpu_cells, 0);
-        cursor->x = 0;
+        CPUCell *cells = linebuf_cpu_cells_for_line(linebuf, cursor->y);
+#define is_marker(x) (!cells[x].is_multicell && cell_is_char(cells + (x), '<'))
+        index_type x = cursor->x ? MIN(cursor->x, linebuf->xnum) - 1 : 0;
+        if (!is_marker(x)) x = 0;
+        if (is_marker(x)) cell_set_char(cells + x, 0);
+#undef is_marker
+        cursor->x = x;
     }
 }
 
@@ -738,6 +897,9 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
         const unsigned int top = 0, bottom = self->lines - 1;
         Savepoint *sp = is_main ? &self->main_savepoint : &self->alt_savepoint;
         while (self->cursor->y + 1 < self->lines && self->lines - self->cursor->y > lines_after_cursor_before_resize) {
+            if (!self->historybuf->count) break;
+            // must be done before popping the history line
+            nuke_multiline_chars_torn_by_scroll(self, top, bottom, false, true);
             if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
             INDEX_DOWN(true);
             linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
@@ -745,6 +907,7 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
             sp->cursor.y = MIN(sp->cursor.y + 1, self->lines - 1);
         }
     }
+    clamp_scroll_position(self);
     if (main_has_blank_line) remove_blank_output_line_reservation_marker(is_main ? self->cursor : &self->main_savepoint.cursor, self->main_linebuf);
     if (alt_has_blank_line) remove_blank_output_line_reservation_marker(is_main ? &self->alt_savepoint.cursor : self->cursor, self->alt_linebuf);
     if (num_of_prompt_lines) {
@@ -1033,35 +1196,28 @@ insert_characters(Screen *self, index_type at, index_type num, index_type y, boo
     nuke_split_multicell_char_at_right_boundary(self, self->columns - 1, y, replace_with_spaces);
 }
 
-static bool
+static void
 halve_multicell_width(Screen *self, index_type x_, index_type y_) {
-    CPUCell *cp;
-    GPUCell *gp;
-    linebuf_init_cells(self->linebuf, y_, &cp, &gp);
-    int y_min_limit = -1;
-    if (self->linebuf == self->main_linebuf) y_min_limit = -(self->historybuf->count + 1);
-    int expected_y_min_limit = ((int)y_) - cp[x_].scale;
-    if (expected_y_min_limit < y_min_limit) return false;
-    y_min_limit = expected_y_min_limit;
-    unsigned new_width = cp[x_].width / 2;
+    const MulticellRows rows = multicell_char_rows(self, x_, y_);
+    const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, y_);
+    const unsigned new_width = cp[x_].width / 2;
     while (cp[x_].x && x_ > 0) x_--;
     const index_type ws = mcd_x_limit(&cp[x_]);
     const index_type x_limit = MIN(self->columns, x_ + ws);
     const index_type half_x_limit = MIN(self->columns, x_ + ws / 2);
-    int y_max_limit = MIN(self->lines, y_ + cp[x_].scale);
-    for (int y = y_min_limit + 1; y < y_max_limit; y++) {
+    for (int y = rows.start; y < rows.limit; y++) {
         Line *line = range_line_(self, y);
-        cp = line->cpu_cells;
-        gp = line->gpu_cells;
-        for (index_type x = x_; x < half_x_limit; x++) cp[x].width = new_width;
+        CPUCell *c = line->cpu_cells;
+        GPUCell *g = line->gpu_cells;
+        for (index_type x = x_; x < half_x_limit; x++) c[x].width = new_width;
         for (index_type x = half_x_limit; x < x_limit; x++) {
-            cp[x] = (CPUCell){0};
-            clear_sprite_position(gp[x]);
+            // preserve the soft wrap marker, which lives in the last cell of the line
+            c[x] = (CPUCell){.next_char_was_wrapped = c[x].next_char_was_wrapped};
+            clear_sprite_position(g[x]);
         }
-        if (y > -1) linebuf_mark_line_dirty(self->linebuf, y);
+        mark_range_line_dirty(self, y);
     }
     self->is_dirty = true;
-    return true;
 }
 
 void
@@ -1122,6 +1278,8 @@ add_combining_char(Screen *self, char_type ch, index_type x, index_type y) {
     if (!cell_has_text(cell) || (cell->is_multicell && cell->y)) return false; // don't allow adding combining chars to a null cell
     text_in_cell(cell, self->text_cache, self->lc);
     if (self->lc->count >= MAX_NUM_CODEPOINTS_PER_CELL) return false; // don't allow too many combining chars to prevent DoS attacks
+    // must be computed before the char is changed
+    const MulticellRows rows = cell->is_multicell ? multicell_char_rows(self, x, y) : (MulticellRows){0};
     ensure_space_for_chars(self->lc, self->lc->count + 1);
     self->lc->chars[self->lc->count++] = ch;
     cell->ch_or_idx = tc_get_or_insert_chars(self->text_cache, self->lc);
@@ -1130,7 +1288,8 @@ add_combining_char(Screen *self, char_type ch, index_type x, index_type y) {
         char_type ch_and_idx = cell->ch_and_idx;
         while (cell->x && x) cell = cpu_cells + --x;
         index_type x_limit = MIN(x + mcd_x_limit(cell), self->columns);
-        for (index_type v = y; v < y + cell->scale; v++) {
+        // the cell has y == 0 so rows.start == y, the lower rows can be cut off at the bottom of the screen
+        for (int v = rows.start; v < rows.limit; v++) {
             cpu_cells = linebuf_cpu_cells_for_line(self->linebuf, v);
             for (index_type h = x; h < x_limit; h++) cpu_cells[h].ch_and_idx = ch_and_idx;
             linebuf_mark_line_dirty(self->linebuf, v);
@@ -1143,56 +1302,80 @@ add_combining_char(Screen *self, char_type ch, index_type x, index_type y) {
 static bool
 has_multiline_cells_in_span(const CPUCell *cells, const index_type start, const index_type count) {
     for (index_type x = start; x < start + count; x++)
-        if (cells[x].y) return true;
+        if (cells[x].is_multicell && cells[x].y) return true;
     return false;
+}
+
+static void
+nuke_multicell_chars_in_span(Screen *self, index_type start, index_type count) {
+    // Remove all multicell chars intersecting the span of count cells at start
+    // in the cursor line, so that the span can be overwritten without tearing them
+    const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, self->cursor->y);
+    for (index_type x = start; x < start + count; x++) {
+        if (cp[x].is_multicell) nuke_multicell_char_at(self, x, self->cursor->y, cp[x].x != 0);
+    }
+}
+
+static bool
+linefeed_moves_to_new_line(const Screen *self) {
+    // A linefeed scrolls when the cursor is on the bottom margin and otherwise
+    // moves the cursor down, unless it is on the last line, below the bottom margin
+    return self->cursor->y == self->margin_bottom || self->cursor->y + 1 < self->lines;
 }
 
 static bool
 move_cursor_past_multicell(Screen *self, index_type required_width) {
+    // Move the cursor to the first place at or after it where there are
+    // required_width cells free of the lower rows of multiline chars, removing
+    // any other multicell chars in those cells.
     if (required_width > self->columns) return false;
-    index_type orig_x = self->cursor->x, orig_y = self->cursor->y;
     while (true) {
         CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, self->cursor->y);
         while (self->cursor->x + required_width <= self->columns) {
             if (!has_multiline_cells_in_span(cp, self->cursor->x, required_width)) {
-                if (cp[self->cursor->x].is_multicell) nuke_multicell_char_at(self, self->cursor->x, self->cursor->y, cp[self->cursor->x].x != 0);
+                nuke_multicell_chars_in_span(self, self->cursor->x, required_width);
                 return true;
             }
             self->cursor->x++;
         }
-        if (self->modes.mDECAWM || has_multiline_cells_in_span(cp, self->columns - required_width, required_width)) {
+        if ((self->modes.mDECAWM || has_multiline_cells_in_span(cp, self->columns - required_width, required_width)) && linefeed_moves_to_new_line(self)) {
             continue_to_next_line(self);
         } else {
+            // Either there is no auto wrap or there is no new line to move to,
+            // as the cursor is on the last line below the bottom margin, so
+            // make space at the end of the line
             self->cursor->x = self->columns - required_width;
-            if (cp[self->cursor->x].is_multicell) nuke_multicell_char_at(self, self->cursor->x, self->cursor->y, cp[self->cursor->x].x != 0);
+            nuke_multicell_chars_in_span(self, self->cursor->x, required_width);
             return true;
         }
     }
-    self->cursor->x = orig_x;
-    self->cursor->y = orig_y;
-    return false;
 }
 
 static void
 move_widened_char_past_multiline_chars(Screen *self, text_loop_state *s, CPUCell *cpu_cell, GPUCell *gpu_cell, index_type xpos, index_type ypos) {
     index_type before = self->cursor->y;
+    // Remove the char from its current cell before moving it, so that it is
+    // not removed as a multicell char in the way and the cells it is moved to
+    // can include its current cell
+    const CPUCell c = *cpu_cell;
+    GPUCell g = *gpu_cell;
+    *cpu_cell = (CPUCell){0};
+    *gpu_cell = (GPUCell){0};
     self->cursor->x = xpos;
     self->cursor->y = ypos;
     if (move_cursor_past_multicell(self, 2)) {
         CPUCell *cp;
         GPUCell *gp;
-        clear_sprite_position(*gpu_cell);
+        clear_sprite_position(g);
         linebuf_init_cells(self->linebuf, self->cursor->y, &cp, &gp);
-        cp[self->cursor->x] = *cpu_cell;
-        gp[self->cursor->x] = *gpu_cell;
+        cp[self->cursor->x] = c;
+        gp[self->cursor->x] = g;
         self->cursor->x++;
-        cp[self->cursor->x] = *cpu_cell;
-        gp[self->cursor->x] = *gpu_cell;
+        cp[self->cursor->x] = c;
+        gp[self->cursor->x] = g;
         cp[self->cursor->x].x = 1;
         self->cursor->x++;
     }
-    *cpu_cell = (CPUCell){0};
-    *gpu_cell = (GPUCell){0};
     if (self->cursor->y == before) init_segmentation_state(self, s);
     else init_text_loop_line(self, s);
 }
@@ -1248,11 +1431,17 @@ draw_combining_char(Screen *self, text_loop_state *s, char_type ch) {
         // matching how VS16 and Thai/Lao SARA AM leave such cells alone.
         if (self->lc->chars[base_pos + 1] == VS15 && cpu_cell->is_multicell && cpu_cell->natural_width && cpu_cell->width == 2 &&
             is_emoji_presentation_base(self->lc->chars[base_pos])) {
-            index_type deltax = (cpu_cell->scale * cpu_cell->width) / 2;
-            if (halve_multicell_width(self, xpos, s->prev.y)) {
-                self->cursor->x -= deltax;
-                init_segmentation_state(self, s);
+            const index_type old_limit = xpos + cpu_cell->scale * cpu_cell->width;
+            const index_type new_limit = old_limit - (cpu_cell->scale * cpu_cell->width) / 2;
+            halve_multicell_width(self, xpos, s->prev.y);
+            // The cursor only needs to move if it is on the same line as the
+            // narrowed char, the char can also be on the previous line when the
+            // cursor is at the start of a line that the char soft wrapped onto.
+            if (self->cursor->y == s->prev.y && self->cursor->x > new_limit) {
+                if (self->cursor->x >= old_limit) self->cursor->x -= old_limit - new_limit;
+                else self->cursor->x = new_limit;
             }
+            init_segmentation_state(self, s);
         }
     } else if (s->seg.grapheme_break == GBP_SpacingMark && !cp[xpos].is_multicell && wcwidth_std(char_props_for(ch)) > 0) {
         // Thai/Lao SARA AM is a SpacingMark with non-zero width, it widens a narrow base cell.
@@ -1472,10 +1661,10 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
             CPUCell *c = &s->cp[self->cursor->x];
             if (c->is_multicell) {
                 if (c->y) {
+                    // this also removes the multicell chars in the cells the char will occupy
                     move_cursor_past_multicell(self, char_width);
                     reinit_text_loop_line(self, s);
-                }
-                nuke_multicell_char_at(self, self->cursor->x, self->cursor->y, c->x > 0);
+                } else nuke_multicell_char_at(self, self->cursor->x, self->cursor->y, c->x > 0);
             }
         }
         if (self->modes.mIRM) insert_characters(self, self->cursor->x, char_width, self->cursor->y, true);
@@ -1658,6 +1847,7 @@ screen_handle_multicell_command(Screen *self, const MultiCellCommand *cmd, const
         .halign = MIN(cmd->horizontal_align, M(HALIGN_BITS)),
         .is_multicell = true};
 #undef M
+    if (mcd.scale > 1) self->multiline_chars_used = true;
     if (mcd.width) handle_fixed_width_multicell_command(self, mcd, self->lc);
     else {
         RAII_ListOfChars(lc);
@@ -1982,7 +2172,9 @@ screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_scree
         self->grman = self->alt_grman;
         screen_cursor_position(self, 1, 1);
         cursor_reset(self->cursor);
+        self->alternate_screen.entered_at = monotonic();
     } else {
+        self->alternate_screen.exited_at = monotonic();
         self->linebuf = self->main_linebuf;
         self->tabstops = self->main_tabstops;
         self->key_encoding_flags = self->main_key_encoding_flags;
@@ -2523,22 +2715,27 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
     }
 }
 
-#define INDEX_UP(add_to_history)                                                                                          \
-    linebuf_index(self->linebuf, top, bottom);                                                                            \
-    INDEX_GRAPHICS(-1, add_to_history)                                                                                    \
-    if (add_to_history) {                                                                                                 \
-        /* Only add to history when no top margin has been set */                                                         \
-        linebuf_init_line(self->linebuf, bottom);                                                                         \
-        historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf);                                   \
-        self->history_line_added_count++;                                                                                 \
-        if (self->last_visited_prompt.is_set) {                                                                           \
-            if (self->last_visited_prompt.scrolled_by < self->historybuf->count) self->last_visited_prompt.scrolled_by++; \
-            else self->last_visited_prompt.is_set = false;                                                                \
-        }                                                                                                                 \
-    }                                                                                                                     \
-    linebuf_clear_line(self->linebuf, bottom, true);                                                                      \
-    self->is_dirty = true;                                                                                                \
-    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, true, top, bottom);                    \
+#define INDEX_UP(add_to_history)                                                                       \
+    nuke_multiline_chars_torn_by_scroll(self, top, bottom, true, add_to_history);                      \
+    linebuf_index(self->linebuf, top, bottom);                                                         \
+    INDEX_GRAPHICS(-1, add_to_history)                                                                 \
+    if (add_to_history) {                                                                              \
+        /* Only add to history when no top margin has been set */                                      \
+        linebuf_init_line(self->linebuf, bottom);                                                      \
+        historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf);                \
+        /* Keep a scrolled back viewport anchored on the same content */                               \
+        if (self->scrolled_by) {                                                                       \
+            if (self->scrolled_by < self->historybuf->count) self->scrolled_by++;                      \
+            if (self->scrolled_by >= self->historybuf->count && self->pixel_scroll_offset_y) {         \
+                reset_pixel_scroll(self, 0);                                                           \
+                self->scroll_changed = true;                                                           \
+            }                                                                                          \
+        }                                                                                              \
+    }                                                                                                  \
+    last_visited_prompt_index(self, top, bottom, true, add_to_history);                                \
+    linebuf_clear_line(self->linebuf, bottom, true);                                                   \
+    self->is_dirty = true;                                                                             \
+    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, true, top, bottom); \
     if (UNLIKELY(self->url_ranges.count || self->url_ranges.in_progress)) clear_selection(&self->url_ranges);
 
 void
@@ -2582,6 +2779,7 @@ screen_reverse_index(Screen *self) {
     // Move cursor up one line, scrolling screen if needed
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
     if (self->cursor->y == top) {
+        nuke_multiline_chars_torn_by_scroll(self, top, bottom, false, false);
         INDEX_DOWN(false);
     } else screen_cursor_up(self, 1, false, -1);
 }
@@ -2590,14 +2788,23 @@ static void
 _reverse_scroll(Screen *self, unsigned int count, bool fill_from_scrollback) {
     // Scroll the screen down by count lines, not moving the cursor
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
-    fill_from_scrollback = fill_from_scrollback && self->linebuf == self->main_linebuf;
+    // The scrollback only adjoins the scroll region when the region starts at
+    // the top of the screen, otherwise the lines must come in blank, as with SD
+    fill_from_scrollback = fill_from_scrollback && self->linebuf == self->main_linebuf && top == 0;
     if (fill_from_scrollback) {
         unsigned limit = MAX(self->lines, self->historybuf->count);
         count = MIN(limit, count);
     } else count = MIN(self->lines, count);
     while (count-- > 0) {
         bool copied = false;
-        if (fill_from_scrollback) copied = historybuf_pop_line(self->historybuf, self->alt_linebuf->line);
+        // must be done before popping the history line as removing chars
+        // can modify the parts of them that are in the history buffer
+        nuke_multiline_chars_torn_by_scroll(self, top, bottom, false, fill_from_scrollback && self->historybuf->count > 0);
+        if (fill_from_scrollback) {
+            copied = historybuf_pop_line(self->historybuf, self->alt_linebuf->line);
+            // Keep a scrolled back viewport anchored on the same content
+            if (copied && self->scrolled_by) self->scrolled_by--;
+        }
         INDEX_DOWN(copied);
         if (copied) linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
     }
@@ -2942,15 +3149,15 @@ screen_clear_scrollback(Screen *self) {
     self->linebuf = orig;
 }
 
-static Line *visual_line_(Screen *self, int y_);
-
 static void
 screen_move_into_scrollback(Screen *self) {
     if (self->linebuf != self->main_linebuf || self->margin_top != 0 || self->margin_bottom != self->lines - 1) return;
     unsigned int num_of_lines_to_move = self->lines;
     while (num_of_lines_to_move) {
-        Line *line = visual_line_(self, num_of_lines_to_move - 1);
-        if (!line_is_empty(line)) break;
+        // the lines of the screen, not the visual lines, which are lines from
+        // the scrollback when it is scrolled
+        linebuf_init_line(self->linebuf, num_of_lines_to_move - 1);
+        if (!line_is_empty(self->linebuf->line)) break;
         num_of_lines_to_move--;
     }
     if (num_of_lines_to_move) {
@@ -3054,23 +3261,22 @@ screen_insert_lines(Screen *self, unsigned int count) {
         for (index_type x = 0; x < self->columns; x++) {
             if (cells[x].is_multicell && cells[x].y) nuke_multicell_char_at(self, x, self->cursor->y, false);
         }
+        const bool at_screen_bottom = bottom + 1 >= self->lines;
+        // remove chars straddling the bottom margin, as the lines at the bottom
+        // of the region are pushed out, tearing them
+        if (self->multiline_chars_used && !at_screen_bottom) nuke_multiline_chars_extending_below(self, bottom);
         screen_dirty_line_graphics(self, top, bottom, self->linebuf == self->main_linebuf);
         linebuf_insert_lines(self->linebuf, count, self->cursor->y, bottom);
+        last_visited_prompt_insert_or_delete_lines(self, self->cursor->y, bottom, count, true);
         self->is_dirty = true;
         clear_all_selections(self);
         screen_carriage_return(self);
-        // remove split multiline chars at bottom of screen
-        cells = linebuf_cpu_cells_for_line(self->linebuf, bottom);
-        for (index_type x = 0; x < self->columns; x++) {
-            if (cells[x].is_multicell) {
-                index_type y_limit = cells[x].scale;
-                if (cells[x].y + 1u < y_limit) {
-                    index_type orig = self->lines;
-                    self->lines = bottom + 1;
-                    nuke_multicell_char_at(self, x, bottom, false);
-                    self->lines = orig;
-                }
-            }
+        if (self->multiline_chars_used) {
+            // Chars whose lower rows were pushed out of the region are now cut
+            // off at its bottom. At the bottom of the screen they are partially
+            // scrolled off, as when scrolling down, otherwise they are torn.
+            if (at_screen_bottom) *multiline_chars_cut_off_at_bottom(self) = true;
+            else nuke_multiline_chars_extending_below(self, bottom);
         }
     }
 }
@@ -3098,6 +3304,9 @@ screen_delete_lines_impl(Screen *self, index_type start, index_type count, index
     y += count;
     y = MIN(bottom, y);
     nuke_multiline_char_intersecting_with(self, 0, self->columns, y, y + 1, false);
+    // blank lines come in at the bottom, tearing chars that extend below it, which
+    // includes chars that are cut off at the bottom of the screen
+    if (self->multiline_chars_used) nuke_multiline_chars_extending_below(self, bottom);
     screen_dirty_line_graphics(self, top, bottom, self->linebuf == self->main_linebuf);
     linebuf_delete_lines(self->linebuf, count, start, bottom);
     self->is_dirty = true;
@@ -3110,6 +3319,7 @@ screen_delete_lines(Screen *self, unsigned int count) {
     if (count == 0) count = 1;
     if (top <= self->cursor->y && self->cursor->y <= bottom) {
         screen_delete_lines_impl(self, self->cursor->y, count, top, bottom);
+        last_visited_prompt_insert_or_delete_lines(self, self->cursor->y, bottom, count, false);
         screen_carriage_return(self);
     }
 }
@@ -3199,6 +3409,28 @@ screen_invert_colors(Screen *self) {
     return self->paused_rendering.expires_at ? self->paused_rendering.inverted : (self->modes.mDECSCNM ? true : false);
 }
 
+// Fire the custom shader bell event, independently of the visual bell, but
+// only if the window is visible, i.e. in the active tab and not hidden by an
+// overlay or the layout, as otherwise the shader has nothing to draw over.
+static void
+fire_bell_shader_event(id_type window_id) {
+    for (size_t o = 0; o < global_state.num_os_windows; o++) {
+        OSWindow *osw = global_state.os_windows + o;
+        if (osw->active_tab >= osw->num_tabs) continue;
+        Tab *tab = osw->tabs + osw->active_tab;
+        for (size_t i = 0; i < tab->num_windows; i++) {
+            if (tab->windows[i].id == window_id) {
+                if (tab->windows[i].visible) {
+                    osw->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_BELL_IN_WINDOW);
+                    osw->last_bell_window_id = window_id;
+                    wakeup_main_loop();
+                }
+                return;
+            }
+        }
+    }
+}
+
 void
 screen_bell(Screen *self) {
     if (self->ignore_bells.start) {
@@ -3211,6 +3443,7 @@ screen_bell(Screen *self) {
     }
     request_window_attention(self->window_id, OPT(enable_audio_bell));
     if (OPT(visual_bell_duration) > 0.0f) self->start_visual_bell_at = monotonic();
+    if (self->window_id) fire_bell_shader_event(self->window_id);
     CALLBACK("on_bell", NULL);
 }
 
@@ -3634,6 +3867,14 @@ parse_prompt_mark(Screen *self, char *buf, PromptKind *pk) {
     }
 }
 
+static void
+mark_command_finished(Screen *self) {
+    if (self->command_state.running) {
+        self->command_state.running = false;
+        self->command_state.finished_at = monotonic();
+    }
+}
+
 void
 shell_prompt_marking(Screen *self, char *buf) {
     if (self->cursor->y < self->lines) {
@@ -3645,10 +3886,15 @@ shell_prompt_marking(Screen *self, char *buf) {
                 self->prompt_settings.redraws_prompts_at_all = 1;
                 parse_prompt_mark(self, buf + 1, &pk);
                 self->linebuf->line_attrs[self->cursor->y].prompt_kind = pk;
-                if (pk == PROMPT_START) CALLBACK("cmd_output_marking", "O", Py_False);
+                if (pk == PROMPT_START) {
+                    mark_command_finished(self);
+                    CALLBACK("cmd_output_marking", "O", Py_False);
+                }
             } break;
             case 'C': {
                 self->linebuf->line_attrs[self->cursor->y].prompt_kind = OUTPUT_START;
+                self->command_state.running = true;
+                self->command_state.started_at = monotonic();
                 const char *cmdline = "";
                 if (strstr(buf + 1, ";cmdline") == buf + 1) { cmdline = buf + 2; }
                 RAII_PyObject(c, PyUnicode_DecodeUTF8(cmdline, strlen(cmdline), "replace"));
@@ -3658,6 +3904,7 @@ shell_prompt_marking(Screen *self, char *buf) {
             } break;
             case 'D': {
                 const char *exit_status = buf[1] == ';' ? buf + 2 : "";
+                mark_command_finished(self);
                 CALLBACK("cmd_output_marking", "Os", Py_None, exit_status);
             } break;
         }
@@ -3669,15 +3916,17 @@ screen_history_scroll_to_prompt(Screen *self, int num_of_prompts_to_jump, int sc
     if (self->linebuf != self->main_linebuf) return false;
     unsigned int old = self->scrolled_by;
     if (num_of_prompts_to_jump == 0) {
-        if (!self->last_visited_prompt.is_set || self->last_visited_prompt.scrolled_by > self->historybuf->count || self->last_visited_prompt.y >= self->lines)
-            return false;
-        self->scrolled_by = self->last_visited_prompt.scrolled_by;
+        index_type y;
+        unsigned int scrolled_by;
+        if (!last_visited_prompt_viewport(self, &y, &scrolled_by)) return false;
+        self->scrolled_by = scrolled_by;
     } else {
         int delta = num_of_prompts_to_jump < 0 ? -1 : 1;
         num_of_prompts_to_jump = num_of_prompts_to_jump < 0 ? -num_of_prompts_to_jump : num_of_prompts_to_jump;
-        int y = -self->scrolled_by;
+        const int oldest_y = -(int)self->historybuf->count;
+        int y = -(int)self->scrolled_by;
 #define ensure_y_ok \
-    if (y >= (int)self->lines || -y > (int)self->historybuf->count) return false;
+    if (y >= (int)self->lines || y < oldest_y) return false;
         ensure_y_ok;
         y += scroll_offset;
         while (num_of_prompts_to_jump) {
@@ -3685,10 +3934,12 @@ screen_history_scroll_to_prompt(Screen *self, int num_of_prompts_to_jump, int sc
             ensure_y_ok;
             if (range_line_(self, y)->attrs.prompt_kind == PROMPT_START) { num_of_prompts_to_jump--; }
         }
-        y -= scroll_offset;
 #undef ensure_y_ok
-        self->scrolled_by = y >= 0 ? 0 : -y;
-        screen_set_last_visited_prompt(self, 0);
+        const int viewport_top = MAX(oldest_y, MIN(0, y - scroll_offset));
+        self->scrolled_by = -viewport_top;
+        const int prompt_y = y - viewport_top;
+        // The context above the prompt can include another command's output.
+        screen_set_last_visited_prompt(self, prompt_y >= 0 && prompt_y < (int)self->lines ? prompt_y : 0);
     }
     if (old != self->scrolled_by) {
         reset_pixel_scroll(self, 0);
@@ -3706,17 +3957,43 @@ set_color_table_color(Screen *self, unsigned int code, PyObject *color) {
     }
 }
 
+static void
+set_last_reported_cwd(Screen *self, const char *data, size_t sz) {
+    PyObject *x = PyBytes_FromStringAndSize(data, sz);
+    if (x) {
+        bool changed = !self->last_reported_cwd || PyBytes_GET_SIZE(self->last_reported_cwd) != (Py_ssize_t)sz ||
+                       memcmp(PyBytes_AS_STRING(self->last_reported_cwd), data, sz) != 0;
+        Py_CLEAR(self->last_reported_cwd);
+        self->last_reported_cwd = x;
+        if (changed) CALLBACK("on_cwd_change", "O", x);
+    } else {
+        PyErr_Clear();
+    }
+}
+
 void
 process_cwd_notification(Screen *self, unsigned int code, const char *data, size_t sz) {
-    if (code == 7) {
-        PyObject *x = PyBytes_FromStringAndSize(data, sz);
-        if (x) {
-            Py_CLEAR(self->last_reported_cwd);
-            self->last_reported_cwd = x;
-        } else {
-            PyErr_Clear();
+    if (code == 7) set_last_reported_cwd(self, data, sz);
+    else if (code == 9) {
+        // ConEmu OSC 9;9;path where path is a plain, possibly quoted, path
+        if (sz > 1 && data[0] == '"' && data[sz - 1] == '"') {
+            data++;
+            sz -= 2;
         }
-    } // we ignore OSC 6 document reporting as we dont have a use for it
+        if (!sz || data[0] != '/') return; // only absolute paths are meaningful
+        static const char prefix[] = "kitty-shell-cwd://";
+        const size_t psz = sizeof(prefix) - 1;
+        char *url = malloc(psz + sz);
+        if (!url) {
+            log_error("Out of memory processing OSC 9;9 cwd report");
+            return;
+        }
+        memcpy(url, prefix, psz);
+        memcpy(url + psz, data, sz);
+        set_last_reported_cwd(self, url, psz + sz);
+        free(url);
+    }
+    // we ignore OSC 6 document reporting as we dont have a use for it
 }
 
 bool
@@ -3857,6 +4134,8 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     self->paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms);
     self->paused_rendering.inverted = self->modes.mDECSCNM;
     self->paused_rendering.scrolled_by = self->scrolled_by;
+    self->paused_rendering.history_count = self->historybuf->count;
+    self->paused_rendering.on_main_screen = self->linebuf == self->main_linebuf;
     self->paused_rendering.cell_data_updated = false;
     self->paused_rendering.cursor_visible = self->modes.mDECTCEM;
     // Preserve the pixel scroll geometry so that pausing does not cause the rendered content to jump, see #10794
@@ -4002,7 +4281,6 @@ render_line_for_virtual_y(Screen *self, int y, Line *line, index_type *lnum, boo
 static void
 screen_reset_dirty(Screen *self) {
     self->is_dirty = false;
-    self->history_line_added_count = 0;
 }
 
 static bool
@@ -4109,9 +4387,8 @@ screen_render_line_graphics(Screen *self, Line *line, int32_t row) {
 // exclusively for testing unicode placeholders.
 static void
 screen_update_only_line_graphics_data(Screen *self) {
-    unsigned int history_line_added_count = self->history_line_added_count;
     index_type lnum = 0;
-    if (self->scrolled_by) self->scrolled_by = MIN(self->scrolled_by + history_line_added_count, self->historybuf->count);
+    clamp_scroll_position(self);
     screen_reset_dirty(self);
     self->scroll_changed = false;
     const unsigned int render_lines = render_lines_for_screen(self);
@@ -4161,11 +4438,10 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
         return;
     }
     const bool is_overlay_active = screen_is_overlay_active(self);
-    unsigned int history_line_added_count = self->history_line_added_count;
+    clamp_scroll_position(self);
     screen_reset_dirty(self);
     update_overlay_position(self);
     const bool force_history_render = pixel_scroll_enabled(self) && self->scroll_changed;
-    if (self->scrolled_by) self->scrolled_by = MIN(self->scrolled_by + history_line_added_count, self->historybuf->count);
     self->scroll_changed = false;
     const unsigned int render_lines = render_lines_for_screen(self);
     const int render_row_offset = pixel_scroll_enabled(self);
@@ -4453,12 +4729,53 @@ screen_is_cell_selected(Screen *self, index_type x, index_type y) {
     return false;
 }
 
+bool
+screen_update_graphics_layers(Screen *self) {
+    // While rendering is paused, the frozen image placements must be positioned using the
+    // scroll position captured with the frozen text, not the live one, which new output may have changed
+    GraphicsManager *grman = self->paused_rendering.expires_at ? self->paused_rendering.grman : self->grman;
+    return grman_update_layers(
+        grman,
+        rendered_scrolled_by(self),
+        scroll_offset_lines_for_screen(self),
+        -1.f,
+        1.f,
+        2.f / self->columns,
+        2.f / self->lines,
+        self->columns,
+        self->lines,
+        self->cell_size);
+}
+
+bool
+screen_has_scrollbar(const Screen *self, bool is_hovering) {
+    if (!rendered_on_main_screen(self) || !rendered_history_count(self)) return false;
+    const bool scrolled = rendered_scrolled_by(self) > 0;
+    switch (OPT(scrollbar)) {
+        case SCROLLBAR_NEVER: return false;
+        case SCROLLBAR_ALWAYS: return true;
+        case SCROLLBAR_ON_SCROLLED: return scrolled;
+        case SCROLLBAR_ON_HOVERED: return is_hovering;
+        case SCROLLBAR_ON_SCROLL_AND_HOVER: return scrolled && is_hovering;
+        case SCROLLBAR_ON_SCROLL_OR_HOVER: return scrolled || is_hovering;
+    }
+    return false;
+}
+
+void
+screen_scrollbar_geometry(const Screen *self, float *handle_position, float *visible_fraction) {
+    // handle_position is 0 at the bottom of the scrollback and 1 at the top
+    const unsigned history_count = rendered_history_count(self);
+    *handle_position = (float)((rendered_scrolled_by(self) + (double)scroll_offset_lines_for_screen(self)) / MAX(1u, history_count));
+    *visible_fraction = (float)self->lines / (float)(self->lines + history_count);
+}
+
 void
 screen_apply_selection(Screen *self, void *address_, size_t size) {
     uint8_t *address = address_;
     memset(address, 0, size);
     const unsigned offset = pixel_scroll_enabled(self);
-    const unsigned scrolled_by = self->paused_rendering.expires_at ? self->paused_rendering.scrolled_by : self->scrolled_by;
+    const unsigned scrolled_by = rendered_scrolled_by(self);
     Selections *sel = self->paused_rendering.expires_at ? &self->paused_rendering.selections : &self->selections;
     for (size_t i = 0; i < sel->count; i++) apply_selection(self, address, sel->items + i, 1, offset, scrolled_by);
     sel->last_rendered_count = sel->count;
@@ -5081,10 +5398,34 @@ deactivate_overlay_line(Screen *self) {
     self->overlay_line.ynum = 0;
     self->overlay_line.xstart = 0;
     self->overlay_line.cursor_x = 0;
+    self->overlay_line.preedit_cursor = -1;
+}
+
+static index_type
+overlay_line_cursor_x(const Screen *self) {
+    // The column at which the cursor is shown while the pre-edit text is
+    // active: at the IME cursor if known, otherwise after the pre-edit text.
+    // This is computed without drawing the pre-edit text as the cursor
+    // position is collected for rendering before the overlay is drawn.
+    const OverlayLine *ol = &self->overlay_line;
+    const index_type columns_exceeded = ol->text_len <= self->columns ? 0 : ol->text_len - self->columns;
+    const index_type start = screen_overlay_line_start(self);
+    index_type width_before_cursor = ol->text_len;
+    if (ol->overlay_text && ol->preedit_cursor >= 0 && ol->preedit_cursor < PyUnicode_GET_LENGTH(ol->overlay_text)) {
+        RAII_PyObject(prefix, PyUnicode_Substring(ol->overlay_text, 0, ol->preedit_cursor));
+        RAII_PyObject(width, prefix ? wcswidth_std(NULL, prefix) : NULL);
+        if (width) {
+            const long w = PyLong_AsLong(width);
+            if (w >= 0) width_before_cursor = MIN((index_type)w, ol->text_len);
+        }
+        if (PyErr_Occurred()) PyErr_Print();
+    }
+    if (width_before_cursor < columns_exceeded) return 0;
+    return MIN(start + width_before_cursor - columns_exceeded, self->columns);
 }
 
 void
-screen_update_overlay_text(Screen *self, const char *utf8_text) {
+screen_update_overlay_text(Screen *self, const char *utf8_text, int preedit_cursor) {
     if (screen_is_overlay_active(self)) deactivate_overlay_line(self);
     if (!utf8_text || !utf8_text[0]) return;
     PyObject *text = PyUnicode_FromString(utf8_text);
@@ -5098,7 +5439,8 @@ screen_update_overlay_text(Screen *self, const char *utf8_text) {
     self->overlay_line.xstart = self->cursor->x;
     self->overlay_line.xnum = !text_len ? 0 : PyLong_AsLong(text_len);
     self->overlay_line.text_len = self->overlay_line.xnum;
-    self->overlay_line.cursor_x = MIN(self->overlay_line.xstart + self->overlay_line.xnum, self->columns);
+    self->overlay_line.preedit_cursor = preedit_cursor;
+    self->overlay_line.cursor_x = overlay_line_cursor_x(self);
     self->overlay_line.ynum = self->cursor->y;
     cursor_copy_to(self->cursor, &(self->overlay_line.original_line.cursor));
     linebuf_mark_line_dirty(self->linebuf, self->overlay_line.ynum);
@@ -5207,7 +5549,7 @@ screen_draw_overlay_line(Screen *self) {
         }
         self->overlay_line.xnum += len;
     }
-    self->overlay_line.cursor_x = self->cursor->x;
+    self->overlay_line.cursor_x = overlay_line_cursor_x(self);
     self->cursor->sgr.italic = orig_italic;
     self->cursor->sgr.decoration = orig_decoration;
     self->cursor->sgr.decoration_fg = orig_decoration_fg;
@@ -5224,7 +5566,7 @@ update_overlay_position(Screen *self) {
         if (self->cursor->x != self->overlay_line.xstart) {
             cursor_update = true;
             self->overlay_line.xstart = self->cursor->x;
-            self->overlay_line.cursor_x = MIN(self->overlay_line.xstart + self->overlay_line.xnum, self->columns);
+            self->overlay_line.cursor_x = overlay_line_cursor_x(self);
         }
         if (self->cursor->y != self->overlay_line.ynum) {
             cursor_update = true;
@@ -5494,6 +5836,29 @@ find_cmd_output(Screen *self, OutputOffset *oo, index_type start_screen_y, unsig
     return oo->num_lines > 0;
 }
 
+static void
+remove_multicell_fragments_cut_off_above_screen(Screen *self, index_type num_lines_above_screen) {
+    // Lines were deleted from the scrollback leaving num_lines_above_screen
+    // lines between them and the top of the screen. Remove the parts of
+    // multicell chars on screen whose top was in the deleted lines.
+    for (index_type y = 0; y < self->lines; y++) {
+        linebuf_init_line(self->linebuf, y);
+        Line *line = self->linebuf->line;
+        bool found = false;
+        for (index_type x = 0; x < self->columns; x++) {
+            CPUCell *c = line->cpu_cells + x;
+            if (c->is_multicell && c->y > num_lines_above_screen + y) {
+                found = true;
+                cell_set_char(c, 0);
+                cell_clear_multicell(c);
+                clear_sprite_position(line->gpu_cells[x]);
+            }
+        }
+        if (!found) break; // a multicell char cannot skip a line
+        linebuf_mark_line_dirty(self->linebuf, y);
+    }
+}
+
 static PyObject *
 erase_last_command(Screen *self, PyObject *args UNUSED) {
     if (self->linebuf != self->main_linebuf) Py_RETURN_FALSE;
@@ -5504,7 +5869,8 @@ erase_last_command(Screen *self, PyObject *args UNUSED) {
     // ...) emit no OSC 133;C, so a search anchored on OUTPUT_START would skip
     // them and erase an older command instead. Selecting by prompt marks makes
     // every submitted command one unit, removed newest-first.
-    int y = self->cursor->y + self->scrolled_by;
+    // Range line numbers are relative to the live screen, independent of scrolled_by
+    int y = self->cursor->y;
     bool found = false;
     for (; (line = checked_range_line(self, y)); y--) {
         if (line->attrs.prompt_kind == PROMPT_START) {
@@ -5523,23 +5889,50 @@ erase_last_command(Screen *self, PyObject *args UNUSED) {
     }
     if (!found) Py_RETURN_FALSE; // nothing above the current prompt to erase
     const int start = y;
-    const index_type num_lines = (index_type)(live_prompt_start - start);
-    index_type num_lines_to_erase_in_screen = start >= 0 ? num_lines : num_lines + start;
-    num_lines_to_erase_in_screen = MIN(self->cursor->y, num_lines_to_erase_in_screen);
+    // The erased region is [start, live_prompt_start). Its part in the
+    // scrollback is [start, history_end) and its part on screen is
+    // [screen_start, live_prompt_start). Either can be empty, the screen part
+    // is when a long live prompt has itself scrolled into the scrollback.
+    const int history_end = MIN(live_prompt_start, 0), screen_start = MAX(start, 0);
+    const index_type num_deleted_from_history = start < history_end ? (index_type)(history_end - start) : 0;
+    const index_type num_lines_to_erase_in_screen = live_prompt_start > screen_start ? (index_type)(live_prompt_start - screen_start) : 0;
+    // The lines of the live prompt that are in the scrollback, newer than the erased lines
+    const index_type num_newer_in_history = (index_type)(-history_end);
+    if (self->last_visited_prompt.is_set) {
+        // Move the last visited prompt with the lines that remain: lines above
+        // the erased region move down by the number of lines removed from the
+        // scrollback, lines below it move up by the number removed from the screen.
+        int *r = &self->last_visited_prompt.row;
+        if (start <= *r && *r < live_prompt_start) self->last_visited_prompt.is_set = false;
+        else *r += *r < start ? (int)num_deleted_from_history : -(int)num_lines_to_erase_in_screen;
+    }
+    // The line above the erased region no longer wraps into the line after it
+    if ((line = checked_range_line(self, start - 1))) line->cpu_cells[line->xnum - 1].next_char_was_wrapped = false;
     if (num_lines_to_erase_in_screen) {
         // Anchor the on-screen deletion at the top of the region, not at
         // cursor->y - count: a multi-line prompt or rows skipped above would
         // otherwise shift the deletion and leave residual lines on screen.
-        index_type screen_erase_start = start >= 0 ? (index_type)start : 0;
-        screen_delete_lines_impl(self, screen_erase_start, num_lines_to_erase_in_screen, 0, self->lines - 1);
+        screen_delete_lines_impl(self, (index_type)screen_start, num_lines_to_erase_in_screen, 0, self->lines - 1);
         self->cursor->y -= num_lines_to_erase_in_screen;
     }
-    if (num_lines > num_lines_to_erase_in_screen) {
-        historybuf_delete_newest_lines(self->historybuf, num_lines - num_lines_to_erase_in_screen);
-        // The scrollback shrank: clamp the scroll position and signal a redraw,
-        // otherwise the deletion of off-screen lines is not reflected until the
-        // next scroll event forces the history viewport to be recomputed.
-        self->scrolled_by = MIN(self->scrolled_by, self->historybuf->count);
+    if (num_deleted_from_history) {
+        if (num_newer_in_history) historybuf_delete_lines(self->historybuf, num_newer_in_history, num_deleted_from_history);
+        else historybuf_delete_newest_lines(self->historybuf, num_deleted_from_history);
+        if (!num_lines_to_erase_in_screen) remove_multicell_fragments_cut_off_above_screen(self, num_newer_in_history);
+        clear_all_selections(self);
+        // Keep a scrolled back viewport anchored on the same content: lines
+        // above the removed ones move down, lines below them do not move. If
+        // the top of the viewport was among the removed lines, there is
+        // nothing to anchor to, so go to the bottom. Signal a redraw, otherwise
+        // the deletion of off-screen lines is not reflected until the next
+        // scroll event forces the history viewport to be recomputed.
+        const int viewport_top = -(int)self->scrolled_by;
+        if (viewport_top < start) self->scrolled_by -= num_deleted_from_history;
+        else if (viewport_top < history_end) {
+            self->scrolled_by = 0;
+            reset_pixel_scroll(self, 0);
+        }
+        clamp_scroll_position(self);
         self->is_dirty = true;
         dirty_scroll(self);
     }
@@ -5566,11 +5959,11 @@ cmd_output(Screen *self, PyObject *args) {
         case 1: // first on screen
             found = find_cmd_output(self, &oo, 0, self->scrolled_by, 1, true);
             break;
-        case 2: // last visited cmd
-            if (self->last_visited_prompt.scrolled_by <= self->historybuf->count && self->last_visited_prompt.is_set) {
-                found = find_cmd_output(self, &oo, self->last_visited_prompt.y, self->last_visited_prompt.scrolled_by, 0, false);
-            }
-            break;
+        case 2: { // last visited cmd
+            index_type y;
+            unsigned int scrolled_by;
+            if (last_visited_prompt_viewport(self, &y, &scrolled_by)) found = find_cmd_output(self, &oo, y, scrolled_by, 0, false);
+        } break;
         case 3: { // last non-empty output
             int y = self->cursor->y;
             Line *line;
@@ -5612,8 +6005,8 @@ cmd_output(Screen *self, PyObject *args) {
 bool
 screen_set_last_visited_prompt(Screen *self, index_type y) {
     if (y >= self->lines) return false;
-    self->last_visited_prompt.scrolled_by = self->scrolled_by;
-    self->last_visited_prompt.y = y;
+    self->last_visited_prompt.row = (int)y - (int)self->scrolled_by;
+    self->last_visited_prompt.preferred_y = y;
     self->last_visited_prompt.is_set = true;
     return true;
 }
@@ -7174,8 +7567,33 @@ current_selections(Screen *self, PyObject *a UNUSED) {
     PyObject *ans = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)render_lines_for_screen(self) * self->columns);
     if (!ans) return NULL;
     screen_apply_selection(self, PyBytes_AS_STRING(ans), PyBytes_GET_SIZE(ans));
-    self->last_rendered.scrolled_by = self->scrolled_by; // mimic what the renderer does
+    self->last_rendered.scrolled_by = rendered_scrolled_by(self); // mimic what the renderer does
     return ans;
+}
+
+static PyObject *
+update_graphics_layers(Screen *self, PyObject *a UNUSED) {
+    screen_update_graphics_layers(self);
+    return grman_render_data_as_python(self->paused_rendering.expires_at ? self->paused_rendering.grman : self->grman);
+}
+
+static PyObject *
+rendered_scroll_state(Screen *self, PyObject *a UNUSED) {
+    return Py_BuildValue("III", rendered_scrolled_by(self), rendered_pixel_scroll_offset_y(self), rendered_history_count(self));
+}
+
+static PyObject *
+has_scrollbar(Screen *self, PyObject *is_hovering) {
+    const int hovering = PyObject_IsTrue(is_hovering);
+    if (hovering < 0) return NULL;
+    return Py_NewRef(screen_has_scrollbar(self, hovering) ? Py_True : Py_False);
+}
+
+static PyObject *
+scrollbar_geometry(Screen *self, PyObject *a UNUSED) {
+    float handle_position, visible_fraction;
+    screen_scrollbar_geometry(self, &handle_position, &visible_fraction);
+    return Py_BuildValue("ff", handle_position, visible_fraction);
 }
 
 static PyObject *
@@ -7206,20 +7624,39 @@ static PyObject *
 test_draw_overlay_line(Screen *self, PyObject *args) {
     PyObject *text;
     unsigned int xstart, ynum;
-    if (!PyArg_ParseTuple(args, "UII", &text, &xstart, &ynum)) return NULL;
+    int preedit_cursor = -1;
+    if (!PyArg_ParseTuple(args, "UII|i", &text, &xstart, &ynum, &preedit_cursor)) return NULL;
     if (ynum >= self->lines || xstart >= self->columns) {
         PyErr_SetString(PyExc_IndexError, "ynum or xstart out of range");
+        return NULL;
+    }
+    RAII_PyObject(text_width, wcswidth_std(NULL, text));
+    if (!text_width) return NULL;
+    const long width = PyLong_AsLong(text_width);
+    if (width < 0) {
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "pre-edit text has negative width");
         return NULL;
     }
     Py_INCREF(text);
     Py_XDECREF(self->overlay_line.overlay_text);
     self->overlay_line.overlay_text = text;
-    self->overlay_line.text_len = (index_type)PyUnicode_GET_LENGTH(text);
+    self->overlay_line.text_len = (index_type)width;
     self->overlay_line.xstart = xstart;
     self->overlay_line.ynum = ynum;
+    self->overlay_line.preedit_cursor = preedit_cursor;
     self->overlay_line.is_active = true;
     screen_draw_overlay_line(self);
-    Py_RETURN_NONE;
+    return PyLong_FromUnsignedLong(self->overlay_line.cursor_x);
+}
+
+static PyObject *
+test_update_overlay_text(Screen *self, PyObject *args) {
+    const char *text;
+    int preedit_cursor = -1;
+    if (!PyArg_ParseTuple(args, "s|i", &text, &preedit_cursor)) return NULL;
+    screen_update_overlay_text(self, text, preedit_cursor);
+    // Nothing is drawn here, the cursor position must be correct without drawing
+    return PyLong_FromUnsignedLong(self->overlay_line.cursor_x);
 }
 
 static PyObject *
@@ -7374,6 +7811,7 @@ static PyMethodDef methods[] = {
     METHODB(test_commit_write_buffer, METH_VARARGS),
     METHODB(test_parse_written_data, METH_VARARGS),
     METHODB(test_draw_overlay_line, METH_VARARGS),
+    METHODB(test_update_overlay_text, METH_VARARGS),
     METHODB(restore_scrollback, METH_O),
     METHODB(cursor_prompt_line, METH_NOARGS),
     MND(overlay_line_start, METH_NOARGS) MND(line_edge_colors, METH_NOARGS) MND(ime_text_around_cursor, METH_NOARGS) MND(line, METH_O)
@@ -7405,8 +7843,10 @@ static PyMethodDef methods[] = {
                             MND(paste, METH_O) MND(paste_bytes, METH_O) MND(focus_changed, METH_O) MND(has_focus, METH_NOARGS)
                                 MND(has_activity_since_last_focus, METH_NOARGS) MND(copy_colors_from, METH_O) MND(set_marker, METH_VARARGS)
                                     MND(marked_cells, METH_NOARGS) MND(scroll_to_next_mark, METH_VARARGS) MND(update_only_line_graphics_data, METH_NOARGS)
-                                        MND(bell, METH_NOARGS) MND(current_selections, METH_NOARGS) MND(is_selection_dirty, METH_NOARGS){
-                                            "select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
+                                        MND(bell, METH_NOARGS) MND(current_selections, METH_NOARGS) MND(update_graphics_layers, METH_NOARGS)
+                                            MND(rendered_scroll_state, METH_NOARGS) MND(scrollbar_geometry, METH_NOARGS) MND(has_scrollbar, METH_O)
+                                                MND(is_selection_dirty,
+                                                    METH_NOARGS){"select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
 
     {NULL} /* Sentinel */
 };
@@ -7436,13 +7876,17 @@ static PyMemberDef members[] = {
     {"linebuf", T_OBJECT_EX, offsetof(Screen, linebuf), READONLY, "linebuf"},
     {"main_linebuf", T_OBJECT_EX, offsetof(Screen, main_linebuf), READONLY, "main_linebuf"},
     {"historybuf", T_OBJECT_EX, offsetof(Screen, historybuf), READONLY, "historybuf"},
+    {"command_running", T_BOOL, offsetof(Screen, command_state.running), READONLY, "command_running"},
+    {"command_started_at", T_LONGLONG, offsetof(Screen, command_state.started_at), READONLY, "command_started_at"},
+    {"command_finished_at", T_LONGLONG, offsetof(Screen, command_state.finished_at), READONLY, "command_finished_at"},
+    {"alternate_screen_entered_at", T_LONGLONG, offsetof(Screen, alternate_screen.entered_at), READONLY, "alternate_screen_entered_at"},
+    {"alternate_screen_exited_at", T_LONGLONG, offsetof(Screen, alternate_screen.exited_at), READONLY, "alternate_screen_exited_at"},
     {"scrolled_by", T_UINT, offsetof(Screen, scrolled_by), READONLY, "scrolled_by"},
     {"pixel_scroll_offset_y", T_UINT, offsetof(Screen, pixel_scroll_offset_y), READONLY, "pixel_scroll_offset_y"},
     {"lines", T_UINT, offsetof(Screen, lines), READONLY, "lines"},
     {"columns", T_UINT, offsetof(Screen, columns), READONLY, "columns"},
     {"margin_top", T_UINT, offsetof(Screen, margin_top), READONLY, "margin_top"},
     {"margin_bottom", T_UINT, offsetof(Screen, margin_bottom), READONLY, "margin_bottom"},
-    {"history_line_added_count", T_UINT, offsetof(Screen, history_line_added_count), 0, "history_line_added_count"},
     {NULL}};
 
 PyTypeObject Screen_Type = {

@@ -18,6 +18,7 @@ from .types import run_once
 from .utils import cmdline_for_hold, log_error, resolved_shell, which
 
 if TYPE_CHECKING:
+    from .launch_wrapper import LaunchRequest
     from .window import CwdRequest
 
 
@@ -46,6 +47,9 @@ if is_macos:
 
     def cmdline_of_pid(pid: int) -> list[str]:
         return cmdline_(pid)
+
+    def _ppid_of_live_process(pid: int) -> int:
+        return _ppid_of_process(pid)
 
     def _get_descendants_of_macos(pid: int) -> set[int]:
         children_map: DefaultDict[int, list[int]] = defaultdict(list)
@@ -144,6 +148,22 @@ else:
                     ans.extend(map(int, f.read().split()))
         return ans
 
+    def _state_and_ppid_of_process(pid: int) -> tuple[bytes, int]:
+        with open(f'/proc/{pid}/stat', 'rb') as f:
+            raw = f.read()
+        # The process name can contain spaces and parentheses
+        state, ppid = raw[raw.rindex(b')') + 2 :].split()[:2]
+        return state, int(ppid)
+
+    def _ppid_of_process(pid: int) -> int:
+        return _state_and_ppid_of_process(pid)[1]
+
+    def _ppid_of_live_process(pid: int) -> int:
+        state, ppid = _state_and_ppid_of_process(pid)
+        if state == b'Z':
+            raise ProcessLookupError(f'The process {pid} has exited')
+        return ppid
+
     def _children_map() -> DefaultDict[int, list[int]]:
         ans: DefaultDict[int, list[int]] = defaultdict(list)
         try:
@@ -154,10 +174,8 @@ else:
             if not x.isdigit():
                 continue
             with suppress(OSError, ValueError, IndexError):
-                with open(f'/proc/{x}/stat', 'rb') as f:
-                    raw = f.read()
-                # The process name can contain spaces and parentheses
-                ans[int(raw[raw.rindex(b')') + 2 :].split()[1])].append(int(x))
+                pid = int(x)
+                ans[_ppid_of_process(pid)].append(pid)
         return ans
 
     def children_of_process(pid: int) -> list[int]:
@@ -370,12 +388,58 @@ class ProcessDesc(TypedDict):
     cmdline: Sequence[str] | None
 
 
+def _as_in_cmdline(args: Sequence[str]) -> tuple[str, ...]:
+    # cmdline_of_pid() drops empty arguments on Linux
+    return tuple(args) if is_macos else tuple(filter(None, args))
+
+
+def _is_program(arg0: str, name: str) -> bool:
+    # Whether arg0 is that of the program run as name. Programs run by name
+    # can have the path they were found at as argv[0], for example, when run
+    # by the hold kitten, or when they are scripts.
+    return arg0 == name or (os.sep not in name and os.path.basename(arg0) == name)
+
+
+def _runs_as_script(cmdline: tuple[str, ...], name: str, args: tuple[str, ...]) -> bool:
+    # Scripts are run by their interpreter as: interpreter [interpreter args]
+    # script_path args
+    i = len(cmdline) - len(args) - 1
+    return i > 0 and cmdline[i + 1 :] == args and _is_program(cmdline[i], name)
+
+
 class KittyWrapper(NamedTuple):
     # The argv the wrapper process was started with
     argv: tuple[str, ...]
-    # True if the wrapper eventually replaces itself (via exec) with
-    # something else, at which point it is no longer a wrapper
+    # True if the wrapper might replace itself (via exec) with something
+    # else, at which point it is no longer a wrapper
     replaces_itself: bool
+    # For wrappers that might be scripts, all the arguments the wrapper is run
+    # with, including the wrapped command, after its own argv[0]
+    script_args: tuple[str, ...] | None = None
+
+    def matches_cmdline(self, cmdline: Sequence[str]) -> bool:
+        """True if cmdline, from cmdline_of_pid(), is that of the wrapper"""
+        argv, cmdline = _as_in_cmdline(self.argv), tuple(cmdline)
+        if not argv or not cmdline:
+            return False
+        if _is_program(cmdline[0], argv[0]) and cmdline[1 : len(argv)] == argv[1:]:
+            return True
+        # Since script_args includes the wrapped command, the command cannot
+        # match after the wrapper has exec-ed it.
+        return self.script_args is not None and _runs_as_script(cmdline, argv[0], _as_in_cmdline(self.script_args))
+
+    def runs_command(self, cmdline: Sequence[str]) -> bool:
+        """True if cmdline, from cmdline_of_pid(), is that of the command
+        the wrapper runs, as long as the command has not exec-ed something else"""
+        if self.script_args is None:
+            return False
+        command, cmdline = _as_in_cmdline(self.script_args[len(self.argv) - 1 :]), tuple(cmdline)
+        if not command or not cmdline:
+            return False
+        if _is_program(cmdline[0], command[0]) and cmdline[1:] == command[1:]:
+            return True
+        # The cmdline of the wrapper itself also ends with the command
+        return _runs_as_script(cmdline, command[0], command[1:]) and not self.matches_cmdline(cmdline)
 
 
 child_counter = count()
@@ -404,8 +468,10 @@ class Child:
         remote_control_fd: int = -1,
         hold_after_ssh: bool = False,
         startup_command_via_shell_integration: Sequence[str] | str = (),
+        launch_request: Optional['LaunchRequest'] = None,
     ):
         self.is_clone_launch = is_clone_launch
+        self.launch_request = launch_request
         self.id = next(child_counter)
         # Used to cache the root pid, see root_pid
         self.wrapper_children: dict[int, int] = {}
@@ -512,6 +578,7 @@ class Child:
         self.initial_termios_state = termios.tcgetattr(master)
         argv = list(self.argv)
         kitty_wrappers: list[KittyWrapper] = []
+        login_argv: list[str] = []
         cwd = self.cwd
         pass_fds = self.pass_fds
         if self.remote_control_fd > -1:
@@ -558,6 +625,20 @@ class Child:
                 kitty_wrappers.insert(0, KittyWrapper(tuple(login_argv), False))
         self.final_exe = final_exe = which(argv[0]) or argv[0]
         self.final_argv0 = argv[0]
+        if self.launch_request is not None:
+            from .launch_wrapper import prefix_for_launch
+
+            if user_prefix := prefix_for_launch(self.launch_request, self.argv, self.cwd, self.final_env):
+                # The user's wrapper goes inside /usr/bin/login, if present,
+                # but outside everything else, so that kitty's own helpers
+                # such as the run-shell kitten see the actual command.
+                pos = len(login_argv) if login_argv else 0
+                argv[pos:pos] = user_prefix
+                if pos == 0:
+                    final_exe = which(argv[0]) or argv[0]
+                # The wrapper either replaces itself with the command or runs
+                # it as a child, either way it is not the root process
+                kitty_wrappers.append(KittyWrapper(user_prefix, True, tuple(argv[pos + 1 :])))
         if self.hold:
             hold_argv = cmdline_for_hold()
             argv = hold_argv + argv
@@ -695,12 +776,34 @@ class Child:
             return cwd_of_process(pid)
         return None
 
+    @staticmethod
+    def _is_child_of(pid: int, ppid: int) -> bool:
+        try:
+            return _ppid_of_live_process(pid) == ppid
+        except Exception:  # pid has exited
+            return False
+
+    @staticmethod
+    def _wrapped_child(w: KittyWrapper, children: list[int]) -> tuple[int, bool]:
+        # The child of the wrapper that is running the command and whether
+        # it is certain to be the one
+        if w.script_args is None:
+            return min(children), len(children) == 1
+        # A sole child can be a helper that stays alive after the wrapped
+        # command starts. Cache it only if its command line matches.
+        running_command = []
+        for c in children:
+            with suppress(Exception):  # child has exited
+                if w.runs_command(cmdline_of_pid(c)):
+                    running_command.append(c)
+        return min(running_command or children), bool(running_command)
+
     @property
     def root_pid(self) -> int | None:
         """
         The pid of the process originally started when the window was created,
         skipping over any wrapper processes kitty itself inserted, such as
-        /usr/bin/login on macOS. A wrapper is replaced by its first child.
+        /usr/bin/login on macOS. A wrapper is replaced by its child.
         """
         if self.resolved_root_pid is not None:
             return self.resolved_root_pid
@@ -716,16 +819,23 @@ class Child:
                 except Exception:
                     final = False
                     break
-                if cmdline[: len(w.argv)] != w.argv:
+                if not w.matches_cmdline(cmdline):
                     # Either the wrapper has replaced itself, which is
                     # permanent, or it has not been exec-ed yet and the forked
                     # process is still running kitty code
                     final = final and i in self.wrappers_seen
                     break
                 self.wrappers_seen.add(i)
-                final = False  # it will replace itself later
-            # A wrapper only ever runs a single child, so cache it
+                final = False  # it might replace itself later
+            # A wrapper runs the command as its child, so cache it. However,
+            # wrappers that run it as a child, rather than exec-ing it, can
+            # run other children before, after or alongside it, such as a
+            # script that runs some setup commands first, so check the cached
+            # child is still running.
             child = self.wrapper_children.get(pid)
+            if child is not None and not self._is_child_of(child, pid):
+                del self.wrapper_children[pid]
+                child = None
             if child is None:
                 try:
                     children = children_of_process(pid)
@@ -734,9 +844,14 @@ class Child:
                     final = False
                     break
                 if not children:
-                    final = False  # the wrapper has not started its child yet
+                    # The wrapper has not started its child yet, or it has exited
+                    final = False
                     break
-                child = self.wrapper_children[pid] = min(children)
+                child, certain = self._wrapped_child(w, children)
+                if certain:
+                    self.wrapper_children[pid] = child
+                else:
+                    final = False
             pid = child
         if final:
             self.resolved_root_pid = pid

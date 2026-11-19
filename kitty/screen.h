@@ -91,6 +91,8 @@ typedef struct {
     CPUCell *cpu_cells;
     GPUCell *gpu_cells;
     index_type xstart, ynum, xnum, cursor_x, text_len;
+    // Position of the IME cursor inside the pre-edit text in unicode code points, negative if unknown
+    int preedit_cursor;
     bool is_active;
     bool is_dirty;
     struct {
@@ -139,6 +141,12 @@ typedef struct {
         CursorRenderInfo cursor;
     } last_rendered;
     bool is_dirty, scroll_changed, reload_all_gpu_data, sgr_blink_was_used;
+    // set once a multiline (scale > 1) char has been drawn, used to skip scanning for such chars in hot paths
+    bool multiline_chars_used;
+    // set when multiline chars may be cut off at the bottom of the main ([0]) or
+    // alternate ([1]) screen, which only happens when scrolling down, used to
+    // avoid scanning for them on every linefeed
+    bool multiline_chars_cut_off_at_bottom[2];
     Cursor *cursor;
     Savepoint main_savepoint, alt_savepoint;
     PyObject *callbacks, *test_child;
@@ -146,11 +154,19 @@ typedef struct {
     LineBuf *linebuf, *main_linebuf, *alt_linebuf;
     GraphicsManager *grman, *main_grman, *alt_grman;
     HistoryBuf *historybuf;
-    unsigned int history_line_added_count;
     bool *tabstops, *main_tabstops, *alt_tabstops;
     ScreenModes modes, saved_modes;
     ColorProfile *color_profile;
     monotonic_t start_visual_bell_at;
+    // Shell integration (OSC 133) command state and alternate screen
+    // changes, used by custom shaders. Times are zero until the first change.
+    struct {
+        monotonic_t started_at, finished_at;
+        bool running;
+    } command_state;
+    struct {
+        monotonic_t entered_at, exited_at;
+    } alternate_screen;
     monotonic_t start_drag_overlay_at; // 0 = inactive
     uint8_t drag_overlay_quadrant;     // 1=left 2=right 3=top 4=bottom 0=none
 
@@ -193,8 +209,14 @@ typedef struct {
         size_t requested_height, width_px, height_px;
     } last_rendered_window_char;
     struct {
-        unsigned int scrolled_by;
-        index_type y;
+        // The row of the visited line in the coordinate system used by
+        // range_line_(): 0 is the top of the live screen and negative rows are
+        // in the scrollback. This is the only position that is kept up to date
+        // as lines move, the scroll offset is derived from it when needed.
+        int row;
+        // The viewport row the line was visited at, used only as a hint for
+        // where to show it when jumping back to it.
+        index_type preferred_y;
         bool is_set;
     } last_visited_prompt;
     PyObject *last_reported_cwd;
@@ -211,8 +233,8 @@ typedef struct {
         monotonic_t expires_at;
         Cursor cursor;
         ColorProfile color_profile;
-        bool inverted, cell_data_updated, cursor_visible, pixel_scroll;
-        unsigned int scrolled_by, pixel_scroll_offset_y;
+        bool inverted, cell_data_updated, cursor_visible, pixel_scroll, on_main_screen;
+        unsigned int scrolled_by, pixel_scroll_offset_y, history_count;
         LineBuf *linebuf;
         GraphicsManager *grman;
         Selections selections, url_ranges;
@@ -242,7 +264,19 @@ typedef struct {
 #define pixel_scroll_enabled(screen) ((screen)->paused_rendering.expires_at ? (screen)->paused_rendering.pixel_scroll : live_pixel_scroll_enabled(screen))
 #define rendered_pixel_scroll_offset_y(screen) \
     ((screen)->paused_rendering.expires_at ? (screen)->paused_rendering.pixel_scroll_offset_y : (screen)->pixel_scroll_offset_y)
+// The scroll position and scrollback size of the frame being rendered. While
+// rendering is paused these are the values captured at pause time, so that
+// everything drawn over the frozen text (images, cursor, scrollbar, etc.)
+// stays aligned with it even as new output changes the live values.
+#define rendered_scrolled_by(screen) ((screen)->paused_rendering.expires_at ? (screen)->paused_rendering.scrolled_by : (screen)->scrolled_by)
+#define rendered_history_count(screen) ((screen)->paused_rendering.expires_at ? (screen)->paused_rendering.history_count : (screen)->historybuf->count)
+#define rendered_on_main_screen(screen) \
+    ((screen)->paused_rendering.expires_at ? (screen)->paused_rendering.on_main_screen : (screen)->linebuf == (screen)->main_linebuf)
 #define render_lines_for_screen(screen) (screen->lines + pixel_scroll_enabled(screen))
+
+// The fraction of a line by which the rendered content is scrolled when pixel scrolling
+#define scroll_offset_lines_for_screen(screen) \
+    ((pixel_scroll_enabled(screen) && (screen)->cell_size.height) ? (float)(rendered_pixel_scroll_offset_y(screen) / (double)(screen)->cell_size.height) : 0.f)
 
 void screen_align(Screen *);
 void screen_garbage_collect_text_cache(Screen *screen);
@@ -319,6 +353,9 @@ void select_graphic_rendition(Screen *self, int *params, unsigned int count, boo
 void report_device_status(Screen *self, unsigned int which, bool UNUSED);
 void report_mode_status(Screen *self, unsigned int which, bool);
 void screen_apply_selection(Screen *self, void *address, size_t size);
+bool screen_update_graphics_layers(Screen *self);
+void screen_scrollbar_geometry(const Screen *self, float *handle_position, float *visible_fraction);
+bool screen_has_scrollbar(const Screen *self, bool is_hovering);
 bool screen_is_selection_dirty(Screen *self);
 bool screen_has_selection(Screen *);
 bool screen_is_cell_selected(Screen *, index_type x, index_type y);
@@ -356,7 +393,7 @@ void screen_report_size(Screen *, unsigned which, unsigned modifier);
 void screen_manipulate_title_stack(Screen *, unsigned int op, unsigned int which);
 bool screen_is_overlay_active(Screen *self);
 index_type screen_overlay_line_start(const Screen *self);
-void screen_update_overlay_text(Screen *self, const char *utf8_text);
+void screen_update_overlay_text(Screen *self, const char *utf8_text, int preedit_cursor);
 bool screen_ime_text_around_cursor(Screen *self, char **before, char **after);
 void screen_set_key_encoding_flags(Screen *self, uint32_t val, uint32_t how);
 void screen_push_key_encoding_flags(Screen *self, uint32_t val);

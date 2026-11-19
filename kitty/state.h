@@ -347,6 +347,7 @@ typedef struct Window {
         bool is_dragging;
         double drag_start_y;
         double drag_start_scrolled_by;
+        unsigned int drag_last_scrolled_by;
         bool is_hovering;
     } scrollbar;
     struct {
@@ -487,6 +488,8 @@ typedef struct Tab {
 
 enum RENDER_STATE { RENDER_FRAME_NOT_REQUESTED, RENDER_FRAME_REQUESTED, RENDER_FRAME_READY };
 typedef enum { NO_CLOSE_REQUESTED, CONFIRMABLE_CLOSE_REQUESTED, CLOSE_BEING_CONFIRMED, IMPERATIVE_CLOSE_REQUESTED } CloseRequest;
+// What caused kitty to quit, reported to on_close watchers
+typedef enum { QUIT_CAUSE_NONE, QUIT_CAUSE_ACTION, QUIT_CAUSE_OS_REQUEST, QUIT_CAUSE_LOGOUT, QUIT_CAUSE_SIGNAL, QUIT_CAUSE_FATAL_ERROR } QuitCause;
 
 typedef struct LiveResizeInfo {
     monotonic_t last_resize_event_at;
@@ -562,11 +565,16 @@ typedef enum {
     SHADER_ANIM_EVENT_USER_IDLE,
     SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE,
     SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP,
+    SHADER_ANIM_EVENT_COMMAND_START,
+    SHADER_ANIM_EVENT_COMMAND_FINISH,
+    SHADER_ANIM_EVENT_ALTERNATE_SCREEN_ENTER,
+    SHADER_ANIM_EVENT_ALTERNATE_SCREEN_EXIT,
     NUM_SHADER_ANIM_EVENTS
 } ShaderAnimationEvent;
 // Events named by the pipeline itself, with the user: prefix, and fired by the
 // shader_event action occupy the bits above the builtin events
 #define SHADER_ANIM_FIRST_USER_EVENT 16
+_Static_assert(NUM_SHADER_ANIM_EVENTS <= SHADER_ANIM_FIRST_USER_EVENT, "Too many builtin shader animation events");
 #define MAX_SHADER_ANIM_USER_EVENTS (64 - SHADER_ANIM_FIRST_USER_EVENT)
 #define MAX_SHADER_ANIM_USER_EVENT_NAME_LEN 63
 // Bitmask of ShaderAnimationEvent values and user events
@@ -658,6 +666,8 @@ typedef struct OSWindow {
     } scroll;
     ShaderAnimEventMask shader_anim_event_registry;
     id_type last_bell_window_id; // ID of the most recent window that received a bell event
+    // Time up to which command and alternate screen changes in the active window have been turned into shader events
+    monotonic_t screen_state_checked_at;
     ShaderGroupAnimState shader_group_anim[MAX_CUSTOM_SHADER_GROUPS];
     ShaderAnimState shader_anim;
     struct {
@@ -701,6 +711,7 @@ typedef struct GlobalState {
     int active_drag_button, tracked_drag_button;
     int mods_at_last_key_or_button_event;
     CloseRequest quit_request;
+    QuitCause quit_cause;
     struct {
         bool requested;
         monotonic_t at;
@@ -898,6 +909,7 @@ void update_menu_bar_title(PyObject *title UNUSED);
 void change_live_resize_state(OSWindow *, bool);
 bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images);
 void update_mouse_pointer_shape(void);
+void update_pointer_shape_for_kitty_window(id_type kitty_window_id);
 bool update_link_hover_for_modifiers(int old_mods, int new_mods);
 void link_hover_cleared_by_output(Screen *screen);
 void adjust_window_size_for_csd(OSWindow *w, int width, int height, int *adjusted_width, int *adjusted_height);
@@ -907,6 +919,19 @@ bool screen_needs_rendering_in_layers(OSWindow *os_window, Window *w, Screen *sc
 void setup_os_window_for_rendering(OSWindow *, Tab *, Window *, bool, monotonic_t);
 monotonic_t update_custom_shader_animations(ShaderAnimEventMask event_mask, monotonic_t now, OSWindow *os_window);
 void init_shader_animation_state(OSWindow *os_window);
+
+// Records an OS window focus change for the custom shader animation state
+// machine. The pending events are only consumed when the OS window is next
+// rendered, which can be much later, for instance, when the window is hidden
+// or occluded. So a focus change replaces any pending opposite focus change
+// rather than accumulating with it, as both together would be indistinguishable
+// from simultaneous events, where focus-out wins.
+static inline void
+record_os_window_focus_change_for_shaders(OSWindow *osw, bool focused) {
+    const ShaderAnimEventMask in = (1u << SHADER_ANIM_EVENT_OS_WINDOW_FOCUS_IN) | (1u << SHADER_ANIM_EVENT_WINDOW_FOCUS_IN);
+    const ShaderAnimEventMask out = (1u << SHADER_ANIM_EVENT_OS_WINDOW_FOCUS_OUT) | (1u << SHADER_ANIM_EVENT_WINDOW_FOCUS_OUT);
+    osw->shader_anim_event_registry = (osw->shader_anim_event_registry & ~(focused ? out : in)) | (focused ? in : out);
+}
 bool custom_shader_needs_render(const ShaderAnimState *before, const ShaderAnimState *after, ShaderAnimEventMask event_mask, monotonic_t now);
 void map_pointer_position(const OSWindow *os_window, double *x, double *y);
 void set_os_window_mouse_position(OSWindow *window, double x, double y);

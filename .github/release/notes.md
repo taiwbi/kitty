@@ -1,5 +1,13 @@
 Portable Linux kitty and standalone kitten builds from this tag.
 
+Changes in 0.51.0.0:
+
+- Merge upstream kitty 0.51.0, including OS-window docks, launch wrappers, and new shader events.
+- Keep bidirectional text in visual order during redraws when a font run cannot be rendered.
+- Route right-clicks in GTK windows through kitty's mouse mappings.
+- Add a choice of pane divider when resizing in the Splits layout.
+- Speed up GTK window startup and cache repeated key translations.
+
 Changes in 0.50.0.3:
 
 - Clip GTK Wayland background blur to the window's themed rounded corners, keeping blur out of transparent corners and shadows.

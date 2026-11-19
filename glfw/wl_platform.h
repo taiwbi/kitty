@@ -364,6 +364,14 @@ typedef struct _GLFWlibraryWayland {
         uint32_t last_event_time;
         bool has_event_time;
     } touch_state;
+    struct {
+        bool active;
+        int32_t id;
+        GLFWid window_id;
+        struct wl_surface *surface;
+        int button; // a GLFWTitlebarButton
+        double x, y;
+    } decoration_touch;
     struct wl_data_device_manager *dataDeviceManager;
     struct wl_data_device *dataDevice;
     struct xdg_wm_base *wmBase;
@@ -397,6 +405,13 @@ typedef struct _GLFWlibraryWayland {
     struct zwp_pointer_gestures_v1 *pointer_gestures;
     struct zwp_pointer_gesture_hold_v1 *pointer_gesture_hold;
     struct zxdg_output_manager_v1 *xdg_output_manager;
+    // Outputs that have been bound but not yet announced to GLFW via
+    // wl_output.done. They are not in _glfw.monitors yet but must still be
+    // freed if their global is removed before the done event arrives.
+    struct {
+        _GLFWmonitor **array;
+        int count;
+    } pending_monitors;
     struct zwlr_virtual_pointer_manager_v1 *virtual_pointer_manager;
     struct zwlr_virtual_pointer_v1 *virtual_pointer;
     struct zwp_virtual_keyboard_manager_v1 *virtual_keyboard_manager;
@@ -519,6 +534,10 @@ typedef struct _GLFWmonitorWayland {
     double fractional_scale;
     bool xdg_size_received;
     bool xdg_position_received;
+    // Set once we have given up waiting for xdg_output geometry for this
+    // monitor, so that we dont block repeatedly on a compositor that never
+    // sends it.
+    bool xdg_geometry_wait_abandoned;
 
 } _GLFWmonitorWayland;
 
@@ -539,9 +558,13 @@ typedef struct _GLFWcursorWayland {
 
 void _glfwAddOutputWayland(uint32_t name, uint32_t version);
 void _glfwCreateXdgOutputWayland(_GLFWmonitor *monitor);
+bool _glfwRemoveOutputWayland(uint32_t name);
+void _glfwFreePendingOutputsWayland(void);
+void _glfwCreateXdgOutputsWayland(void);
 void _glfwWaylandBeforeBufferSwap(_GLFWwindow *window);
 void _glfwWaylandAfterBufferSwap(_GLFWwindow *window);
 void _glfwWaylandSurfaceOutputsChanged(_GLFWwindow *window);
+void _glfwWaylandKeyboardFocusChanged(id_type window_id);
 void _glfwSetupWaylandDataDevice(void);
 void _glfwSetupWaylandPrimarySelectionDevice(void);
 double _glfwWaylandWindowScale(_GLFWwindow *);

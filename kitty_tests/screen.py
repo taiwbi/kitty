@@ -5,9 +5,10 @@ import os
 import re
 import tempfile
 
-from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, VT_PARSER_BUFFER_SIZE, Color, ColorProfile, Cursor
+from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, SCROLL_LINE, VT_PARSER_BUFFER_SIZE, Color, ColorProfile, Cursor
 from kitty.marks import marker_from_function, marker_from_regex, marker_from_text
-from kitty.window import pagerhist
+from kitty.utils import path_from_osc7_url
+from kitty.window import is_conemu_osc9_command, pagerhist
 
 from .base import BaseTest, draw_multicell, parse_bytes
 
@@ -1215,6 +1216,113 @@ class TestScreen(BaseTest):
         self.ae(s.text_for_selection(False, True), ('1234 ', '5'))
         self.ae(s.text_for_selection(True, True), ('1234 ', '5', ''))
 
+    def test_scrollback_anchored_against_new_output(self):
+        # When scrolled back, lines added to the scrollback must not move the
+        # viewport. The anchoring must be applied immediately, not deferred to
+        # the next render, so that synchronized update snapshots and relative
+        # scrolls made before the next render see the correct position.
+
+        def screen(scrollback=50):
+            s = self.create_screen(cols=10, lines=3, scrollback=scrollback, cell_height=20, options={'pixel_scroll': True})
+            for i in range(40):
+                parse_bytes(s, f'row{i:03d}\r\n'.encode())
+            s.update_only_line_graphics_data()
+            return s
+
+        def visible(s):
+            return tuple(str(s.visual_line(y)) for y in range(s.lines))
+
+        # Consecutive synchronized updates before a render
+        for position in (10, 10.5):
+            with self.subTest(position=position):
+                s = screen()
+                s.scroll_to_absolute(position)
+                before = visible(s), s.scrolled_by, s.pixel_scroll_offset_y
+                parse_bytes(s, b'\x1b[?2026hnext\r\n\x1b[?2026l\x1b[?2026hmore\r\n')
+                self.ae(visible(s), before[0])
+                self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (before[1] + 2, before[2]))
+                self.assertTrue(s.pause_rendering(False, 0))
+                s.update_only_line_graphics_data()
+                self.ae(visible(s), before[0])
+                self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (before[1] + 2, before[2]))
+
+        # Relative scrolling with output received since the last render
+        for scroll in ('line', 'pixels'):
+            with self.subTest(scroll=scroll):
+                s = screen()
+                s.scroll_to_absolute(10)
+                top = str(s.visual_line(0))
+                parse_bytes(s, b'a\r\nb\r\nc\r\n')
+                self.ae(str(s.visual_line(0)), top)
+                if scroll == 'line':
+                    s.scroll(SCROLL_LINE, True)
+                else:
+                    s.fractional_scroll(-1)
+                s.update_only_line_graphics_data()
+                self.ae(str(s.visual_line(1)), top)
+
+        # The pixel offset must be cleared when pinned at the top of a full scrollback
+        s = screen(scrollback=5)
+        s.scroll_to_absolute(s.historybuf.count - 0.5)
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (s.historybuf.count - 1, 10))
+        parse_bytes(s, b'a\r\nb\r\n')
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (s.historybuf.count, 0))
+
+        # Lines removed from the scrollback by reverse scrolling must not move the viewport
+        for position in (10, 'top'):
+            with self.subTest(reverse_scroll=position):
+                s = screen()
+                s.scroll_to_absolute(s.historybuf.count if position == 'top' else position)
+                before = visible(s)
+                parse_bytes(s, b'\x1b[3+T')
+                self.assertLessEqual(s.scrolled_by, s.historybuf.count)
+                self.ae(visible(s), before)
+
+        # A smooth scroll animation must follow the anchoring, not jump back to
+        # positions computed from where it started
+        from types import SimpleNamespace
+
+        from kitty.window import ScrollAnimation, Window
+
+        s = screen()
+        s.scroll_to_absolute(10)
+        a = ScrollAnimation()
+        a.start_scrolled_by = a.last_scrolled_by = s.scrolled_by
+        a.total = -1
+        w = SimpleNamespace(screen=s, scroll_animation=a)
+        top = str(s.visual_line(0))
+        Window.scroll_animation_to(w, a.start_scrolled_by - a.total * 0.5)  # type: ignore[arg-type]
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (10, 10))
+        parse_bytes(s, b'a\r\nb\r\nc\r\n')
+        Window.scroll_animation_to(w, a.start_scrolled_by - a.total)  # type: ignore[arg-type]
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (14, 0))
+        self.ae(str(s.visual_line(1)), top)
+
+        # A hard reset clears the scrollback, so it must also reset the scroll position
+        s = screen()
+        s.scroll_to_absolute(10.5)
+        s.reset()
+        self.ae((s.historybuf.count, s.scrolled_by, s.pixel_scroll_offset_y), (0, 0, 0))
+
+        # Rewrapping on resize can shrink the scrollback below the scroll position
+        s = self.create_screen(cols=5, lines=3, scrollback=50, cell_height=20, options={'pixel_scroll': True})
+        for i in range(20):
+            parse_bytes(s, f'wrapped{i:02d}\r\n'.encode())
+        s.scroll_to_absolute(s.historybuf.count - 0.5)
+        self.assertGreater(s.pixel_scroll_offset_y, 0)
+        s.resize(3, 10)
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (s.historybuf.count, 0))
+        self.ae(str(s.visual_line(0)), 'wrapped00')
+
+        # A sub-line scroll offset at the bottom keeps following new output
+        s = screen()
+        s.scroll_to_absolute(0.5)
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (0, 10))
+        parse_bytes(s, b'a\r\nb\r\n')
+        s.update_only_line_graphics_data()
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (0, 10))
+        self.ae(str(s.visual_line(1)), 'b')
+
     def test_apply_selection_with_paused_rendering_and_scrollback(self):
         # Regression test: in 0.46.2 the paused-rendering branch of
         # apply_selection passed the (possibly negative) loop variable y
@@ -1244,6 +1352,248 @@ class TestScreen(BaseTest):
         # The visible portion of the selection must have at least one byte
         # marked (set_mask = 1 for plain selections).
         self.assertIn(1, result)
+
+    def test_rendered_scroll_state_with_paused_rendering(self):
+        # While rendering is paused, everything drawn over the frozen text
+        # (images, cursor, scrollbar) must use the scroll state captured at
+        # pause time, not the live one, which output can change during the pause.
+        def screen(pixel_scroll=False):
+            s = self.create_screen(cols=10, lines=3, scrollback=50, cell_height=20, options={'pixel_scroll': pixel_scroll})
+            for i in range(40):
+                parse_bytes(s, f'row{i:03d}\r\n'.encode())
+            return s
+
+        def live(s):
+            return s.scrolled_by, s.pixel_scroll_offset_y, s.historybuf.count
+
+        # Not paused: the rendered state is the live state
+        s = screen()
+        self.ae(s.rendered_scroll_state(), live(s))
+        s.scroll(5, True)
+        self.ae(s.rendered_scroll_state(), live(s))
+
+        # Output arriving while scrolled back moves the live view to keep it anchored
+        s = screen()
+        s.scroll(5, True)
+        captured = live(s)
+        parse_bytes(s, b'\x1b[?2026h')
+        for i in range(4):
+            parse_bytes(s, f'new{i}\r\n'.encode())
+        self.ae(s.scrolled_by, 9)
+        self.ae(s.rendered_scroll_state(), captured)
+        parse_bytes(s, b'\x1b[?2026l')
+        self.ae(s.rendered_scroll_state(), live(s))
+        self.ae(s.scrolled_by, 9)
+
+        # Filling from the scrollback can bring the live view to the bottom
+        # while the frozen frame still shows the scrollback
+        s = screen()
+        s.scroll(1, True)
+        captured = live(s)
+        parse_bytes(s, b'\x1b[?2026h\x1b[+T')
+        self.ae((s.scrolled_by, s.historybuf.count), (0, captured[2] - 1))
+        self.ae(s.rendered_scroll_state(), captured)
+        self.assertTrue(s.pause_rendering(False))
+        self.ae(s.rendered_scroll_state(), live(s))
+
+        # Clearing the scrollback while at the bottom does not end the pause
+        s = screen()
+        captured = live(s)
+        self.assertGreater(captured[2], 0)
+        parse_bytes(s, b'\x1b[?2026h\x1b[3J')
+        self.ae(s.historybuf.count, 0)
+        self.ae(s.rendered_scroll_state(), captured)
+
+        # Scrolling the view ends the pause, so the rendered state follows it
+        s = screen()
+        parse_bytes(s, b'\x1b[?2026h')
+        s.scroll(3, True)
+        self.ae(s.rendered_scroll_state(), live(s))
+        self.ae(s.scrolled_by, 3)
+
+        # Pausing at the bottom, with output that scrolls the screen
+        s = screen()
+        captured = live(s)
+        parse_bytes(s, b'\x1b[?2026h')
+        for i in range(4):
+            parse_bytes(s, f'new{i}\r\n'.encode())
+        self.ae(s.scrolled_by, 0)
+        self.ae(s.rendered_scroll_state(), captured)
+
+        # The pixel scroll offset is captured with the scroll position
+        s = screen(pixel_scroll=True)
+        s.scroll_to_absolute(10.5)
+        captured = live(s)
+        self.ae(captured[:2], (10, 10))
+        parse_bytes(s, b'\x1b[?2026h')
+        for i in range(3):
+            parse_bytes(s, f'new{i}\r\n'.encode())
+        self.ae((s.scrolled_by, s.pixel_scroll_offset_y), (13, 10))
+        self.ae(s.rendered_scroll_state(), captured)
+        self.assertTrue(s.pause_rendering(False))
+        self.ae(s.rendered_scroll_state(), live(s))
+
+        # Without pixel scroll the rendered pixel offset is always zero
+        s = screen()
+        s.scroll(4, True)
+        parse_bytes(s, b'\x1b[?2026h')
+        self.ae(s.rendered_scroll_state(), (4, 0, s.historybuf.count))
+
+    def test_selection_uses_rendered_scroll_state(self):
+        # A selection rendered during a pause must match the frozen frame even
+        # though output has moved the live view
+        s = self.create_screen(cols=10, lines=3, scrollback=50)
+        for i in range(40):
+            parse_bytes(s, f'row{i:03d}\r\n'.encode())
+        s.scroll(5, True)
+        s.start_selection(0, 0)
+        s.update_selection(2, 1)
+        before = s.current_selections()
+        parse_bytes(s, b'\x1b[?2026h')
+        for i in range(3):
+            parse_bytes(s, f'new{i}\r\n'.encode())
+        self.ae(s.scrolled_by, 8)
+        self.ae(s.current_selections(), before)
+        parse_bytes(s, b'\x1b[?2026l')
+        after = s.current_selections()
+        self.assertFalse(s.is_selection_dirty())
+        self.ae(after, before)
+
+    def test_scrollbar_geometry(self):
+        def screen(pixel_scroll=False, scrollback=50):
+            s = self.create_screen(cols=10, lines=3, scrollback=scrollback, cell_height=20, options={'pixel_scroll': pixel_scroll})
+            for i in range(40):
+                parse_bytes(s, f'row{i:03d}\r\n'.encode())
+            return s
+
+        def expected(scrolled_by, pixel_offset, count, lines=3, cell_height=20):
+            return (scrolled_by + pixel_offset / cell_height) / max(1, count), lines / (lines + count)
+
+        def check(s, scrolled_by, pixel_offset, count, msg=''):
+            actual = s.scrollbar_geometry()
+            exp = expected(scrolled_by, pixel_offset, count)
+            for a, e in zip(actual, exp):
+                self.assertAlmostEqual(a, e, places=5, msg=msg)
+
+        # No scrollback
+        s = self.create_screen(cols=10, lines=3, scrollback=50)
+        self.ae(s.scrollbar_geometry(), (0, 1))
+
+        # Live geometry at the bottom, scrolled back and at the top
+        s = screen()
+        count = s.historybuf.count
+        self.ae(count, 38)
+        check(s, 0, 0, count, 'bottom')
+        s.scroll(5, True)
+        check(s, 5, 0, count, 'scrolled')
+        s.scroll(count, True)
+        check(s, count, 0, count, 'top')
+        self.assertAlmostEqual(s.scrollbar_geometry()[0], 1, places=5)
+
+        # The pixel scroll offset contributes a fraction of a line
+        s = screen(pixel_scroll=True)
+        s.scroll_to_absolute(10.5)
+        check(s, 10, 10, s.historybuf.count, 'pixel scroll')
+
+        # Output arriving during a pause does not move the handle
+        for pixel_scroll in (False, True):
+            with self.subTest(pixel_scroll=pixel_scroll):
+                s = screen(pixel_scroll=pixel_scroll)
+                s.scroll_to_absolute(5.5 if pixel_scroll else 5)
+                before = s.scrollbar_geometry()
+                parse_bytes(s, b'\x1b[?2026h')
+                for i in range(6):
+                    parse_bytes(s, f'new{i}\r\n'.encode())
+                self.assertGreater(s.scrolled_by, 5)
+                self.ae(s.scrollbar_geometry(), before)
+                parse_bytes(s, b'\x1b[?2026l')
+                check(s, s.scrolled_by, s.pixel_scroll_offset_y if pixel_scroll else 0, s.historybuf.count, 'after pause')
+                self.assertNotEqual(s.scrollbar_geometry(), before)
+
+        # Full scrollback: the view stops being anchored once it reaches the top
+        s = screen(scrollback=20)
+        s.scroll(15, True)
+        before = s.scrollbar_geometry()
+        parse_bytes(s, b'\x1b[?2026h')
+        for i in range(10):
+            parse_bytes(s, f'new{i}\r\n'.encode())
+        self.ae(s.scrollbar_geometry(), before)
+
+        # Changes to the scrollback size during a pause
+        s = screen()
+        s.scroll(1, True)
+        before = s.scrollbar_geometry()
+        parse_bytes(s, b'\x1b[?2026h\x1b[+T')
+        self.ae(s.scrolled_by, 0)
+        self.ae(s.scrollbar_geometry(), before)
+        s = screen()
+        before = s.scrollbar_geometry()
+        parse_bytes(s, b'\x1b[?2026h\x1b[3J')
+        self.ae(s.historybuf.count, 0)
+        self.ae(s.scrollbar_geometry(), before)
+        parse_bytes(s, b'\x1b[?2026l')
+        self.ae(s.scrollbar_geometry(), (0, 1))
+
+    def test_scrollbar_visibility(self):
+        def screen(policy, history=True):
+            s = self.create_screen(cols=10, lines=3, scrollback=50, options={'scrollbar': policy})
+            for i in range(40 if history else 1):
+                parse_bytes(s, f'row{i:03d}\r\n'.encode())
+            return s
+
+        def visibility(s):
+            return s.has_scrollbar(False), s.has_scrollbar(True)
+
+        # (not scrolled, scrolled) -> (not hovering, hovering)
+        policies = {
+            'never': ((False, False), (False, False)),
+            'always': ((True, True), (True, True)),
+            'scrolled': ((False, False), (True, True)),
+            'hovered': ((False, True), (False, True)),
+            'scrolled-and-hovered': ((False, False), (False, True)),
+            'scrolled-or-hovered': ((False, True), (True, True)),
+        }
+        for policy, (at_bottom, scrolled) in policies.items():
+            with self.subTest(policy=policy):
+                s = screen(policy)
+                self.ae(visibility(s), at_bottom)
+                s.scroll(3, True)
+                self.ae(visibility(s), scrolled)
+                # No scrollback or the alternate screen: never a scrollbar
+                self.ae(visibility(screen(policy, history=False)), (False, False))
+                s = screen(policy)
+                parse_bytes(s, b'\x1b[?1049h')
+                self.ae(visibility(s), (False, False))
+
+        # Filling from the scrollback during a pause brings the live view to
+        # the bottom, but the frozen frame is still scrolled back
+        s = screen('scrolled')
+        s.scroll(1, True)
+        self.assertTrue(s.has_scrollbar(False))
+        parse_bytes(s, b'\x1b[?2026h\x1b[+T')
+        self.ae(s.scrolled_by, 0)
+        self.assertTrue(s.has_scrollbar(False))
+        parse_bytes(s, b'\x1b[?2026l')
+        self.assertFalse(s.has_scrollbar(False))
+
+        # Clearing the scrollback during a pause
+        s = screen('always')
+        parse_bytes(s, b'\x1b[?2026h\x1b[3J')
+        self.ae(s.historybuf.count, 0)
+        self.assertTrue(s.has_scrollbar(False))
+        parse_bytes(s, b'\x1b[?2026l')
+        self.assertFalse(s.has_scrollbar(False))
+
+        # Switching screens during a pause
+        s = screen('always')
+        parse_bytes(s, b'\x1b[?2026h\x1b[?1049h')
+        self.assertTrue(s.has_scrollbar(False))
+        parse_bytes(s, b'\x1b[?2026l')
+        self.assertFalse(s.has_scrollbar(False))
+        parse_bytes(s, b'\x1b[?2026h\x1b[?1049l')
+        self.assertFalse(s.has_scrollbar(False))
+        parse_bytes(s, b'\x1b[?2026l')
+        self.assertTrue(s.has_scrollbar(False))
 
     def test_selection_not_dirty_after_render(self):
         # Regression test for https://github.com/kovidgoyal/kitty/issues/10714
@@ -1337,6 +1687,43 @@ class TestScreen(BaseTest):
         t('\u25b6', 1, '\ufe0f', 2, '\ufe0e', 2)
         # wide + VS15 + VS16
         t('\U0001f610', 2, '\ufe0e', 1, '\ufe0f', 1)
+        # VS15 attaching to a wide char on the previous, soft wrapped line
+        s = self.create_screen(cols=5, lines=5)
+        parse_bytes(s, 'abc\U0001f610f\r'.encode())
+        self.ae((s.cursor.x, s.cursor.y), (0, 1))
+        parse_bytes(s, '\ufe0e'.encode())
+        self.ae((s.cursor.x, s.cursor.y), (0, 1))
+        self.ae(s.cpu_cells(0, 3)['mcd']['width'], 1)
+        self.assertTrue(s.cpu_cells(0, 4)['next_char_was_wrapped'])
+        parse_bytes(s, b'gh')
+        self.ae((s.cursor.x, s.cursor.y), (2, 1))
+        self.ae(str(s.line(0)), 'abc\U0001f610\ufe0e')
+        self.ae(str(s.line(1)), 'gh')
+        # scaled natural width char narrowed by VS15, on the same line and soft wrapped
+        s = self.create_screen(cols=8, lines=5)
+        parse_bytes(s, b'ab')
+        draw_multicell(s, '\U0001f610', scale=2)
+        self.ae(s.cursor.x, 6)
+        parse_bytes(s, '\ufe0e'.encode())
+        self.ae(s.cursor.x, 4)
+        for y in (0, 1):
+            self.ae(s.cpu_cells(y, 2)['mcd']['width'], 1)
+        s = self.create_screen(cols=6, lines=5)
+        parse_bytes(s, b'ab')
+        draw_multicell(s, '\U0001f610', scale=2)
+        parse_bytes(s, b'f\r')
+        self.ae((s.cursor.x, s.cursor.y), (0, 1))
+        parse_bytes(s, '\ufe0e'.encode())
+        self.ae((s.cursor.x, s.cursor.y), (0, 1))
+        self.ae(s.cpu_cells(0, 2)['mcd']['width'], 1)
+        self.assertTrue(s.cpu_cells(0, 5)['next_char_was_wrapped'])
+        # cursor inside the char is clamped to the end of the narrowed char
+        s = self.create_screen(cols=8, lines=5)
+        parse_bytes(s, b'ab')
+        draw_multicell(s, '\U0001f610', scale=2)
+        parse_bytes(s, b'\x1b[1;6H\xef\xb8\x8e')
+        self.ae(s.cursor.x, 4)
+        s = self.create_screen()
         # large numbers of combining chars
         s.reset()
         s.draw('\N{HEAVY EXCLAMATION MARK SYMBOL}' + 4500 * '\N{VARIATION SELECTOR-16}')
@@ -2004,6 +2391,64 @@ class TestScreen(BaseTest):
         s.draw('a foo')
         ae(s, 'foo', 2)
 
+    def test_scroll_to_prompt_with_short_scrollback(self):
+        for lines_before_prompt in (0, 1):
+            with self.subTest(lines_before_prompt=lines_before_prompt):
+                s = self.create_screen(cols=12, lines=4, scrollback=10)
+                if lines_before_prompt:
+                    parse_bytes(s, b'\x1b]133;C\x07older\r\n')
+                parse_bytes(s, b'\x1b]133;A\x07$ a\r\n')
+                parse_bytes(s, b'\x1b]133;C\x07a0\r\n\r\n\r\n')
+                parse_bytes(s, b'\x1b]133;A\x07$ live')
+                self.ae(s.historybuf.count, lines_before_prompt + 1)
+
+                self.assertTrue(s.scroll_to_prompt(-1, 3))
+                self.ae(s.scrolled_by, s.historybuf.count)
+                s.scroll_to_absolute(0)
+
+                output = []
+                s.cmd_output(2, output.append)
+                self.ae(''.join(output).rstrip(), 'a0')
+                self.assertTrue(s.scroll_to_prompt(0))
+                self.ae(s.scrolled_by, s.historybuf.count)
+                self.ae(str(s.visual_line(lines_before_prompt)), '$ a')
+
+    def test_scroll_to_prompt_offset_tracks_target_command(self):
+        # With a scroll offset the top of the viewport is in the output of the
+        # command above the target, which must not be used as the last visited prompt
+        def create():
+            s = self.create_screen(cols=12, lines=5, scrollback=50)
+            for i in range(4):
+                parse_bytes(s, f'\x1b]133;A\x07$ c{i}\r\n'.encode())
+                parse_bytes(s, f'\x1b]133;C\x07o{i}a\r\no{i}b\r\no{i}c\r\no{i}d\r\n'.encode())
+            parse_bytes(s, b'\x1b]133;A\x07$ live')
+            return s
+
+        def last_visited_output(s):
+            output = []
+            s.cmd_output(2, output.append)
+            return ''.join(output).split()
+
+        expected = ['o3a', 'o3b', 'o3c', 'o3d']
+        for offset in range(5):
+            with self.subTest(offset=offset):
+                s = create()
+                self.assertTrue(s.scroll_to_prompt(-1, offset))
+                self.ae(s.scrolled_by, offset + 1)
+                self.ae(str(s.visual_line(offset)), '$ c3')
+                self.ae(last_visited_output(s), expected)
+                s.scroll_to_absolute(0)
+                self.assertTrue(s.scroll_to_prompt(0))
+                self.ae(s.scrolled_by, offset + 1)
+                self.ae(str(s.visual_line(offset)), '$ c3')
+
+        # Jumping forward with an offset records the prompt jumped to
+        s = create()
+        self.assertTrue(s.scroll_to_prompt(-2, 0))
+        self.assertTrue(s.scroll_to_prompt(1, 2))
+        self.ae(str(s.visual_line(2)), '$ c3')
+        self.ae(last_visited_output(s), expected)
+
     def test_prompt_marking(self):
         # ]]]]]]]]]]]]]]]]}}}}}}}}}}}}}}}}))))))))))))))))))))))
 
@@ -2199,7 +2644,11 @@ class TestScreen(BaseTest):
         self.ae(str(s.visual_line(0)), '$ 4')
         self.ae(lvco(), '0wrapout\n0y\n')
         draw_prompt('end')
+        # new output must not move the scrolled back viewport
+        self.ae(str(s.visual_line(0)), '$ 4')
+        s.scroll_to_prompt(1)
         s.scroll_to_prompt(-1)
+        self.ae(str(s.visual_line(0)), '$ 4')
         self.ae(lvco(), '0wrapout\n0y')
         s.scroll_to_prompt(1)
         self.ae(lvco(), '0wrapout\n0y')
@@ -2335,6 +2784,635 @@ class TestScreen(BaseTest):
         draw_prompt('p1'), draw_output(9), mark_prompt(), s.draw('l1'), s.carriage_return(), s.index(), s.draw('partial')
         s.erase_last_command()
         self.ae('before\nl1\npartial', at().rstrip())
+
+        # erasing while scrolled back must work and keep the viewport anchored
+        # on the same content when the erased lines are below it
+        s = self.create_screen(cols=10, lines=5, scrollback=50)
+        for i in range(20):
+            s.draw(f'h{i}\r\n')
+        draw_prompt('p1'), draw_output(8), mark_prompt(), s.draw('partial')
+        s.scroll(12, True)
+        before = tuple(str(s.visual_line(y)) for y in range(s.lines))
+        self.ae(before[0], 'h13')
+        self.assertTrue(s.erase_last_command())
+        self.ae(tuple(str(s.visual_line(y)) for y in range(s.lines)), before)
+        self.ae(at().rstrip(), '\n'.join(f'h{i}' for i in range(20)) + '\npartial')
+        # when the erased lines include the top of the viewport, go to the bottom
+        s.reset()
+        for i in range(20):
+            s.draw(f'h{i}\r\n')
+        draw_prompt('p1'), draw_output(8), mark_prompt(), s.draw('partial')
+        s.scroll(3, True)
+        self.assertTrue(s.erase_last_command())
+        self.ae(s.scrolled_by, 0)
+        self.ae(str(s.visual_line(s.cursor.y)), 'partial')
+
+        # the last visited prompt must move with the lines that remain after
+        # erasing, both above the erased region (in the scrollback) and below it
+        def erase_with_last_visited(which):
+            nonlocal s
+            s = self.create_screen(cols=10, lines=5, scrollback=50)
+            # filler so that a stale last visited position is still within the scrollback
+            for i in range(20):
+                s.draw(f'h{i}\r\n')
+            draw_prompt('p0'), draw_output(2, 'a')
+            draw_prompt('p1'), draw_output(8)
+            mark_prompt(), s.draw('$ live'), s.carriage_return(), s.index()
+            mark_output(), s.draw('r0')
+            if which == 'below':
+                self.ae(s.cursor.y, 4)
+                s.set_last_visited_prompt(3)
+            else:
+                self.assertTrue(s.scroll_to_prompt(-2 if which == 'above' else -1))
+                s.scroll(s.scrolled_by, False)
+            self.assertTrue(s.erase_last_command())
+            return lvco()
+
+        def visible():
+            return tuple(str(s.visual_line(y)) for y in range(s.lines))
+
+        self.ae(erase_with_last_visited('above'), '0a\n1a')
+        s.scroll(1, True)
+        self.assertTrue(s.scroll_to_prompt(0))
+        self.ae(visible()[0], '$ p0')
+        self.ae(erase_with_last_visited('erased'), '')
+        self.assertFalse(s.scroll_to_prompt(0))
+        self.ae(erase_with_last_visited('below').rstrip(), 'r0')
+        s.scroll(10, True)
+        self.assertTrue(s.scroll_to_prompt(0))
+        self.ae(visible()[3], '$ live')  # the row it was visited at
+
+    def test_last_visited_prompt_tracking(self):
+        # The last visited prompt is stored as a single content row and must
+        # stay on the same content as lines move, whatever the scroll offset
+        # it was visited at.
+        s = None
+
+        def new_screen(lines=6, scrollback=20):
+            nonlocal s
+            s = self.create_screen(cols=10, lines=lines, scrollback=scrollback)
+
+        def mark_prompt():
+            parse_bytes(s, b'\x1b]133;A\a')
+
+        def cmd(name, num_output_lines=1):
+            mark_prompt(), s.draw(f'$ {name}\r\n')
+            parse_bytes(s, b'\x1b]133;C\a')
+            for i in range(num_output_lines):
+                s.draw(f'{name}{i}\r\n')
+
+        def lvco():
+            ans = []
+            s.cmd_output(2, ans.append)
+            return ''.join(ans).rstrip()
+
+        def visible():
+            return tuple(str(s.visual_line(y)) for y in range(s.lines))
+
+        def assert_visited(prompt, at_row, output=None):
+            if output is not None:
+                self.ae(lvco(), output)
+            # jump from both ends of the scrollback so the jump always has to
+            # compute the position rather than happen to already be there
+            for start in (0, s.historybuf.count):
+                s.scroll_to_absolute(start)
+                s.scroll_to_prompt(0)
+                self.ae(visible()[at_row], prompt, f'jumping from scrolled_by={start}')
+            s.scroll_to_absolute(0)
+
+        def assert_unset():
+            self.ae(lvco(), '')
+            for start in (0, s.historybuf.count):
+                s.scroll_to_absolute(start)
+                self.assertFalse(s.scroll_to_prompt(0))
+                self.ae(s.scrolled_by, start)
+            s.scroll_to_absolute(0)
+
+        def visit(prompt):
+            # visit the prompt at the first viewport position it is shown at
+            for sb in range(s.historybuf.count + 1):
+                s.scroll_to_absolute(sb)
+                for y, text in enumerate(visible()):
+                    if text == prompt:
+                        self.assertTrue(s.set_last_visited_prompt(y))
+                        s.scroll_to_absolute(0)
+                        return sb, y
+            raise AssertionError(f'{prompt} not found')
+
+        def set_region_and_scroll(top, bottom, csi):
+            # top and bottom are one based, as in DECSTBM
+            parse_bytes(s, f'\x1b[{top};{bottom}r\x1b[{csi}'.encode())
+            parse_bytes(s, b'\x1b[r')
+
+        # Erasing a command can leave less scrollback than the scroll offset
+        # the prompt was visited at. The prompt must still be reachable, shown
+        # as close to the row it was visited at as the scrollback allows.
+        for remaining_history in (0, 1, 2, 5):
+            for scrolled_by in (0, 2):
+                with self.subTest(remaining_history=remaining_history, scrolled_by=scrolled_by):
+                    new_screen(lines=10)
+                    for i in range(remaining_history):
+                        s.draw(f'h{i}\r\n')
+                    cmd('old', 7)
+                    cmd('live', 1)  # the live prompt, with the cursor below it
+                    s.draw('\r\n\r\n')
+                    self.ae(s.historybuf.count, remaining_history + 3)
+                    s.scroll_to_absolute(scrolled_by)
+                    preferred_y = 5 + scrolled_by
+                    self.ae(str(s.visual_line(preferred_y)), '$ live')
+                    self.assertTrue(s.set_last_visited_prompt(preferred_y))
+                    s.scroll_to_absolute(0)
+                    self.assertTrue(s.erase_last_command())
+                    self.ae(s.historybuf.count, remaining_history)
+                    self.ae(visible()[0], '$ live')
+                    self.ae(lvco(), 'live0')
+                    expected_scrolled_by = min(preferred_y, remaining_history)
+                    for start in sorted({0, remaining_history}):
+                        s.scroll_to_absolute(start)
+                        s.scroll_to_prompt(0)
+                        self.ae(s.scrolled_by, expected_scrolled_by)
+                        self.ae(str(s.visual_line(expected_scrolled_by)), '$ live')
+
+        # Erasing a command keeps prompts in the scrollback above it on the
+        # same content, even though fewer lines are left in the scrollback
+        new_screen(lines=5)
+        cmd('a', 3), cmd('b', 6), cmd('live', 0)
+        self.ae(s.historybuf.count, 8)
+        sb, y = visit('$ a')
+        self.assertTrue(s.erase_last_command())
+        self.ae(s.historybuf.count, 4)
+        assert_visited('$ a', y, 'a0\na1\na2')
+
+        # Scrolling a region with a bottom margin adds the lines scrolled off
+        # its top to the scrollback but must not move lines below the region
+        new_screen()
+        cmd('a', 0), cmd('b', 0), s.draw('x\r\ny\r\n'), mark_prompt(), s.draw('$ c')
+        self.ae(visible()[:5], ('$ a', '$ b', 'x', 'y', '$ c'))
+        self.assertTrue(s.set_last_visited_prompt(4))
+        set_region_and_scroll(1, 4, '2S')
+        self.ae(s.historybuf.count, 2)
+        self.ae(visible()[:5], ('x', 'y', '', '', '$ c'))
+        assert_visited('$ c', 4)
+        self.assertTrue(s.set_last_visited_prompt(0))  # x
+        set_region_and_scroll(1, 4, '1S')
+        assert_visited('x', 0)
+        self.ae(s.historybuf.count, 3)
+
+        # Scrolling a region with a top margin discards the line scrolled off
+        # the top of the region, moves the lines in the region up and leaves
+        # lines above the region alone
+        for visited, expected in ((0, ('$ a', 0)), (1, None), (3, ('$ c', 2))):
+            with self.subTest(top_margin_visited=visited):
+                new_screen(lines=5)
+                cmd('a', 0), cmd('b', 0), s.draw('x\r\n'), cmd('c', 0)
+                self.ae(visible()[:4], ('$ a', '$ b', 'x', '$ c'))
+                self.assertTrue(s.set_last_visited_prompt(visited))
+                set_region_and_scroll(2, 5, '1S')
+                self.ae(s.historybuf.count, 0)
+                self.ae(visible()[:3], ('$ a', 'x', '$ c'))
+                if expected is None:
+                    assert_unset()
+                else:
+                    assert_visited(*expected)
+
+        # Reverse index moves the screen lines down and discards the bottom
+        # line, without touching the scrollback
+        new_screen(lines=4)
+        cmd('a', 0), cmd('b', 0), cmd('c', 0), cmd('d', 0), cmd('e', 0), s.draw('z')
+        self.ae(s.historybuf.count, 2)
+        self.ae(visible(), ('$ c', '$ d', '$ e', 'z'))
+        self.ae(visit('$ a'), (2, 0))
+        s.cursor_position(1, 1), s.reverse_index()
+        self.ae(visible(), ('', '$ c', '$ d', '$ e'))
+        assert_visited('$ a', 0)
+        self.assertTrue(s.set_last_visited_prompt(1))  # $ c
+        s.reverse_index()
+        assert_visited('$ c', 2)
+        self.assertTrue(s.set_last_visited_prompt(3))  # $ d, now on the bottom line
+        s.reverse_index()
+        assert_unset()
+
+        # Reverse scrolling that pulls lines back from the scrollback moves
+        # everything in the scrollback and on screen down
+        new_screen(lines=4)
+        cmd('a', 0), cmd('b', 0), cmd('c', 0), cmd('d', 0), cmd('e', 0), s.draw('z')
+        self.ae(visit('$ a'), (2, 0))
+        s.reverse_scroll(1, True)
+        self.ae(s.historybuf.count, 1)
+        self.ae(visible(), ('$ b', '$ c', '$ d', '$ e'))
+        assert_visited('$ a', 0)
+        s.reverse_scroll(1, True)
+        self.ae(s.historybuf.count, 0)
+        self.ae(visible()[0], '$ a')
+        assert_visited('$ a', 0)
+
+        # With a top margin the scrollback does not adjoin the scroll region,
+        # so reverse scrolling must insert blank lines and leave the lines
+        # above the region and the scrollback alone
+        new_screen(lines=4)
+        cmd('a', 0), cmd('b', 0), cmd('c', 0), cmd('d', 0), cmd('e', 0), s.draw('z')
+        self.assertTrue(s.set_last_visited_prompt(0))  # $ c
+        parse_bytes(s, b'\x1b[2;4r\x1b[1+T\x1b[r')
+        self.ae(s.historybuf.count, 2)
+        self.ae(visible(), ('$ c', '', '$ d', '$ e'))
+        assert_visited('$ c', 0)
+        self.assertTrue(s.set_last_visited_prompt(2))  # $ d
+        parse_bytes(s, b'\x1b[2;4r\x1b[1+T\x1b[r')
+        self.ae(visible(), ('$ c', '', '', '$ d'))
+        assert_visited('$ d', 3)
+
+        # A prompt that falls off the end of the scrollback is forgotten, even
+        # though the scrollback still has as many lines as before
+        new_screen(lines=3, scrollback=2)
+        cmd('a', 0)
+        i = 0
+        while s.historybuf.count < s.historybuf.ynum:  # fill the scrollback with $ a as its oldest line
+            s.draw(f'f{i}\r\n')
+            i += 1
+        self.ae(str(s.historybuf.line(s.historybuf.count - 1)), '$ a')
+        self.ae(visit('$ a'), (s.historybuf.count, 0))
+        assert_visited('$ a', 0)
+        s.draw('last\r\n')
+        self.ae(s.historybuf.count, s.historybuf.ynum)
+        assert_unset()
+
+        # In a full scrollback, prompts that are not the oldest line stay on
+        # their content as old lines are dropped
+        new_screen(lines=3, scrollback=2)
+        s.draw('f\r\n'), cmd('a', 0)
+        while s.historybuf.count < s.historybuf.ynum:
+            s.draw('f\r\n')
+        self.ae(str(s.historybuf.line(s.historybuf.count - 2)), '$ a')
+        self.ae(visit('$ a'), (s.historybuf.count - 1, 0))
+        s.draw('last\r\n')
+        self.ae(str(s.historybuf.line(s.historybuf.count - 1)), '$ a')
+        assert_visited('$ a', 0)
+        s.draw('last\r\n')
+        assert_unset()
+
+        # Inserting and deleting lines moves the lines below the cursor in the
+        # scroll region, discarding lines pushed off its bottom
+        def five_prompts(lines=6):
+            new_screen(lines=lines)
+            for x in 'abcde':
+                cmd(x, 0)
+            self.ae(visible()[:5], ('$ a', '$ b', '$ c', '$ d', '$ e'))
+
+        five_prompts()
+        self.assertTrue(s.set_last_visited_prompt(3))  # $ d
+        parse_bytes(s, b'\x1b[2H\x1b[L')  # insert a line at row 1
+        self.ae(visible()[:6], ('$ a', '', '$ b', '$ c', '$ d', '$ e'))
+        assert_visited('$ d', 4)
+        parse_bytes(s, b'\x1b[2H\x1b[2M')  # delete rows 1 and 2
+        self.ae(visible()[:4], ('$ a', '$ c', '$ d', '$ e'))
+        assert_visited('$ d', 2)
+        self.assertTrue(s.set_last_visited_prompt(0))  # above the cursor
+        parse_bytes(s, b'\x1b[2H\x1b[3L')
+        assert_visited('$ a', 0)
+        five_prompts()
+        self.assertTrue(s.set_last_visited_prompt(3))
+        parse_bytes(s, b'\x1b[2H\x1b[3M')  # deletes the visited line
+        assert_unset()
+        five_prompts()
+        self.assertTrue(s.set_last_visited_prompt(3))
+        parse_bytes(s, b'\x1b[2H\x1b[2L')  # pushes the visited line off the bottom of the screen
+        self.ae(visible()[5], '$ d')
+        parse_bytes(s, b'\x1b[2H\x1b[L')
+        assert_unset()
+        five_prompts()
+        self.assertTrue(s.set_last_visited_prompt(4))  # $ e, below the scroll region
+        parse_bytes(s, b'\x1b[1;4r\x1b[2H\x1b[2L\x1b[r')
+        self.ae(visible()[:5], ('$ a', '', '', '$ b', '$ e'))
+        assert_visited('$ e', 4)
+        self.assertTrue(s.set_last_visited_prompt(3))  # $ b, at the bottom of the scroll region
+        parse_bytes(s, b'\x1b[1;4r\x1b[2H\x1b[L\x1b[r')
+        assert_unset()
+        # inserting a huge number of lines must not overflow
+        five_prompts()
+        self.assertTrue(s.set_last_visited_prompt(3))
+        parse_bytes(s, b'\x1b[2H\x1b[4294967295L')
+        assert_unset()
+
+        # A hard reset forgets the last visited prompt
+        five_prompts()
+        self.assertTrue(s.set_last_visited_prompt(1))
+        s.reset()
+        cmd('x', 0), cmd('y', 0)
+        assert_unset()
+
+        # Erasing a command when the live prompt has itself scrolled into the
+        # scrollback: lines above the erased command move down, the lines of the
+        # live prompt in the scrollback stay where they are
+        def long_live_prompt():
+            new_screen(lines=5)
+            cmd('a', 1), cmd('b', 2)
+            mark_prompt(), s.draw('$ l0')
+            for i in range(1, 7):
+                s.draw(f'\r\nl{i}')
+            self.ae(s.historybuf.count, 7)
+            self.ae(str(s.historybuf.line(1)), '$ l0')
+
+        long_live_prompt()
+        self.ae(visit('$ a'), (7, 0))
+        self.assertTrue(s.erase_last_command())
+        self.ae(s.historybuf.count, 4)
+        self.ae(lvco(), 'a0')
+        assert_visited('$ a', 0)
+        long_live_prompt()
+        self.ae(visit('$ l0'), (2, 0))
+        self.assertTrue(s.erase_last_command())
+        assert_visited('$ l0', 0)
+        self.ae(s.scrolled_by, 0)
+        long_live_prompt()
+        visit('$ b')
+        self.assertTrue(s.erase_last_command())
+        assert_unset()
+
+        # Clearing the scrollback forgets a prompt that was in it
+        new_screen(lines=3)
+        cmd('a', 1), cmd('b', 1)
+        self.assertTrue(s.historybuf.count)
+        visit('$ a')
+        s.clear_scrollback()
+        assert_unset()
+
+        # Output arriving while scrolled back keeps the visited prompt on the
+        # same content and jumping back shows it at the row it was visited at
+        new_screen(lines=5, scrollback=50)
+        cmd('a', 2), cmd('b', 2), cmd('c', 2)
+        sb, y = visit('$ b')
+        for i in range(7):
+            s.draw(f'n{i}\r\n')
+        self.ae(lvco(), 'b0\nb1')
+        self.assertTrue(s.scroll_to_prompt(0))
+        self.ae((s.scrolled_by, str(s.visual_line(y))), (sb + 7, '$ b'))
+
+    def test_erase_last_command_with_live_prompt_in_scrollback(self):
+        # A long live prompt, such as a multi-line command being typed, can
+        # scroll its own first lines into the scrollback. Erasing the last
+        # command must then delete lines from the middle of the scrollback,
+        # leaving the live prompt intact.
+        from kitty.window import as_text
+
+        def new_screen():
+            return self.create_screen(cols=10, lines=5, scrollback=30)
+
+        def mark_prompt():
+            parse_bytes(s, b'\x1b]133;A\a')
+
+        def mark_output():
+            parse_bytes(s, b'\x1b]133;C\a')
+
+        def at():
+            return as_text(s, add_history=True)
+
+        def visible():
+            return tuple(str(s.visual_line(y)) for y in range(s.lines))
+
+        def assert_no_multicell_fragments():
+            # every part of a multicell char must be adjoined by the parts of
+            # the same char above and below it, in the scrollback and on screen
+            for y in range(-s.historybuf.count, s.lines):
+                for x in range(s.columns):
+                    c = s.cpu_cells(y, x)
+                    if c['mcd'] is None:
+                        continue
+                    scale = c['mcd']['scale']
+                    for dy, expected_y in ((-1, c['y'] - 1), (1, c['y'] + 1)):
+                        if 0 <= expected_y < scale:
+                            other = s.cpu_cells(y + dy, x)
+                            msg = f'multicell part at {x=} {y=} is missing its part at y={y + dy}'
+                            self.assertIsNotNone(other['mcd'], msg)
+                            self.ae((other['x'], other['y'], other['mcd']['scale']), (c['x'], expected_y, scale), msg)
+
+        def live_prompt(num_lines=7, x=0):
+            # x is the column at which every line of the prompt is drawn
+            mark_prompt()
+            for i in range(num_lines):
+                if i:
+                    s.draw('\r\n')
+                if x:
+                    parse_bytes(s, f'\x1b[{x + 1}G'.encode())
+                s.draw(f'$ l{i}' if i == 0 else f'l{i}')
+
+        live = '\n'.join(['$ l0'] + [f'l{i}' for i in range(1, 7)])
+        for num_live_lines_in_history in (1, 2, 3):
+            with self.subTest(num_live_lines_in_history=num_live_lines_in_history):
+                s = new_screen()
+                s.draw('before\r\n')
+                mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\no1\r\n')
+                live_prompt(s.lines + num_live_lines_in_history)
+                live_text = '\n'.join(['$ l0'] + [f'l{i}' for i in range(1, s.lines + num_live_lines_in_history)])
+                self.ae(at(), 'before\n$ p1\no0\no1\n' + live_text)
+                self.ae(s.historybuf.count, 4 + num_live_lines_in_history)
+                cursor = s.cursor.x, s.cursor.y
+                screen_before = visible()
+                self.assertTrue(s.erase_last_command())
+                self.ae(at(), 'before\n' + live_text)
+                self.ae(s.historybuf.count, 1 + num_live_lines_in_history)
+                self.ae((s.cursor.x, s.cursor.y), cursor)
+                self.ae(visible(), screen_before)
+                self.assertTrue(s.erase_last_command() is False)  # nothing left to erase
+                self.ae(at(), 'before\n' + live_text)
+
+        with self.subTest('live prompt starting at the top of the screen'):
+            # the erased lines are all in the scrollback, none of the live prompt is
+            s = new_screen()
+            s.draw('before\r\n')
+            mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\no1\r\n')
+            live_prompt(s.lines)
+            self.ae(str(s.visual_line(0)), '$ l0')
+            self.assertTrue(s.erase_last_command())
+            self.ae(at(), 'before\n' + '\n'.join(['$ l0'] + [f'l{i}' for i in range(1, s.lines)]))
+
+        # A scrolled back viewport stays on the same content: lines above the
+        # erased command move down, lines below it do not move, and the viewport
+        # goes to the bottom if its top line was erased
+        def setup():
+            nonlocal s
+            s = new_screen()
+            for i in range(6):
+                s.draw(f'h{i}\r\n')
+            mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\no1\r\n')
+            live_prompt()
+            self.ae(s.historybuf.count, 11)
+            self.ae(str(s.historybuf.line(4)), '$ p1')
+
+        for scrolled_by, expected_scrolled_by in ((11, 8), (7, 4), (6, 3), (5, 0), (3, 0), (2, 2), (1, 1)):
+            with self.subTest(scrolled_by=scrolled_by):
+                setup()
+                s.scroll_to_absolute(scrolled_by)
+                before = visible()
+                self.assertTrue(s.erase_last_command())
+                self.ae(s.scrolled_by, expected_scrolled_by)
+                if expected_scrolled_by:
+                    self.ae(visible()[0], before[0])
+                else:
+                    self.ae(visible()[-1], 'l6')
+                self.ae(at(), '\n'.join(f'h{i}' for i in range(6)) + '\n' + live)
+
+        def indented_live(num_lines=7, x=3):
+            return '\n'.join(' ' * x + ('$ l0' if i == 0 else f'l{i}') for i in range(num_lines))
+
+        with self.subTest('multicell chars cut at both edges'):
+            s = new_screen()
+            s.draw('before\r\n')
+            draw_multicell(s, 'A', scale=2), s.draw('a\r\n')
+            mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\n')
+            draw_multicell(s, 'B', scale=2), s.draw('\r\n')
+            live_prompt(x=3)
+            self.assertIn('A', at())
+            self.assertTrue(s.erase_last_command())
+            self.ae(at(), 'before\n  a\n' + indented_live())
+            assert_no_multicell_fragments()
+        # including large chars that run through the live prompt lines in the
+        # scrollback onto the screen, from the erased lines or from above them
+        for scale, num_live_lines_in_history in ((3, 1), (4, 1), (4, 2), (3, 0)):
+            for from_above in (False, True):
+                with self.subTest(scale=scale, num_live_lines_in_history=num_live_lines_in_history, from_above=from_above):
+                    s = new_screen()
+                    s.draw('before\r\n')
+                    if from_above:  # a char starting above the erased lines, running through them
+                        draw_multicell(s, 'C', scale=scale), s.draw('\r\n')
+                        mark_prompt(), parse_bytes(s, f'\x1b[{scale + 1}G'.encode()), s.draw('$ p1\r\n')
+                    else:
+                        mark_prompt(), s.draw('$ p1\r\n'), mark_output()
+                        draw_multicell(s, 'C', scale=scale), s.draw('\r\n')
+                    live_prompt(s.lines + num_live_lines_in_history, x=scale)
+                    # the char reaches the screen
+                    reaches_screen = num_live_lines_in_history + (2 if from_above else 1) < scale
+                    self.ae(s.cpu_cells(0, 0)['mcd'] is not None, reaches_screen)
+                    assert_no_multicell_fragments()
+                    self.assertTrue(s.erase_last_command())
+                    # a char from above the erased lines leaves its now blank top line
+                    self.ae(at(), 'before\n' + ('\n' if from_above else '') + indented_live(s.lines + num_live_lines_in_history, scale))
+                    assert_no_multicell_fragments()
+
+        # multicell chars that are not cut by the deletion must survive it
+        with self.subTest('wide char at the top of the screen'):
+            # no live prompt lines are left in the scrollback, so the screen
+            # starts right below the deleted lines
+            s = new_screen()
+            s.draw('before\r\n')
+            mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\no1\r\n')
+            mark_prompt(), s.draw('\U0001f600$ l0')
+            for i in range(1, s.lines):
+                s.draw(f'\r\nl{i}')
+            self.ae(str(s.visual_line(0)), '\U0001f600$ l0')
+            self.ae(s.historybuf.count, 4)
+            self.assertTrue(s.erase_last_command())
+            self.ae(s.historybuf.count, 1)
+            self.ae(str(s.visual_line(0)), '\U0001f600$ l0')
+            self.ae((s.cpu_cells(0, 0)['mcd'] is not None, s.cpu_cells(0, 1)['mcd'] is not None), (True, True))
+            assert_no_multicell_fragments()
+        for num_live_lines_in_history in (1, 2):
+            with self.subTest('scaled char in the live prompt running onto the screen', num_live_lines_in_history=num_live_lines_in_history):
+                # a char in the live prompt whose top is in the scrollback and
+                # whose bottom is on screen is not cut by the deletion
+                scale = num_live_lines_in_history + 1
+                s = new_screen()
+                s.draw('before\r\n')
+                mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\n')
+                mark_prompt(), draw_multicell(s, 'D', scale=scale), s.draw('$ l0')
+                for i in range(1, s.lines + num_live_lines_in_history):
+                    s.draw('\r\n'), parse_bytes(s, f'\x1b[{scale + 1}G'.encode()), s.draw(f'l{i}')
+                self.ae(s.historybuf.count, 3 + num_live_lines_in_history)
+                self.ae(s.cpu_cells(0, 0)['y'], scale - 1)  # the bottom of D is on screen
+                self.assertTrue(s.erase_last_command())
+                self.ae(s.historybuf.count, 1 + num_live_lines_in_history)
+                for y in range(-num_live_lines_in_history, 1):
+                    c = s.cpu_cells(y, 0)
+                    self.assertIsNotNone(c['mcd'], f'{y=}')
+                    self.ae((c['y'], c['mcd']['scale']), (y + num_live_lines_in_history, scale))
+                self.ae(str(s.historybuf.line(num_live_lines_in_history - 1)), 'D$ l0')
+                assert_no_multicell_fragments()
+
+        # a wrapped line above the erased command no longer wraps into the live prompt
+        with self.subTest('wrapped line above, live prompt in the scrollback'):
+            s = new_screen()
+            s.draw('x' * (s.columns + 3))  # wraps into the line the erased prompt is on
+            mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\n')
+            live_prompt()
+            self.ae(at(), 'x' * (s.columns + 3) + '$ p1\no0\n' + live)
+            self.assertTrue(s.erase_last_command())
+            self.ae(at(), 'x' * s.columns + '\n' + live)
+        # also when the erased lines are partly or wholly on screen
+        for num_before in (0, 4):
+            with self.subTest(num_before=num_before):
+                s = new_screen()
+                s.draw('h\r\n' * num_before)
+                s.draw('x' * (s.columns + 3))
+                mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\no1\r\no2\r\no3\r\n')
+                live_prompt(1)
+                self.ae(s.historybuf.count, 2 + num_before)  # the erased lines start in the scrollback
+                self.assertTrue(s.erase_last_command())
+                self.ae(at().rstrip(), 'h\n' * num_before + 'x' * s.columns + '\n$ l0')
+
+        # a selection is cleared when lines are deleted from the scrollback
+        # rather than going stale and selecting whatever moved into its rows
+        with self.subTest('selection'):
+            setup()
+            s.scroll_to_absolute(6)
+            s.start_selection(0, 0), s.update_selection(1, 0)
+            self.ae(''.join(s.text_for_selection()), 'h5')
+            self.assertTrue(s.erase_last_command())
+            self.ae(s.text_for_selection(), ())
+
+        # a full scrollback ring that has wrapped around
+        for extra in range(0, 12):
+            with self.subTest(full_ring_extra_lines=extra):
+                s = self.create_screen(cols=10, lines=5, scrollback=5)
+                ynum = s.historybuf.ynum
+                for i in range(ynum + extra):
+                    s.draw(f'h{i}\r\n')
+                mark_prompt(), s.draw('$ p1\r\n'), mark_output(), s.draw('o0\r\no1\r\n')
+                live_prompt()
+                self.ae(s.historybuf.count, ynum)
+                expected = at().replace('$ p1\no0\no1\n', '')
+                self.assertTrue(s.erase_last_command())
+                self.ae(at(), expected)
+                self.ae(s.historybuf.count, ynum - 3)
+                # adding lines afterwards keeps the ring consistent
+                s.draw('\r\nl7\r\nl8\r\nl9\r\nl10')
+                self.ae(at(), expected + '\nl7\nl8\nl9\nl10')
+
+    def test_command_and_alternate_screen_state(self):
+        # Used by custom shaders
+        s = self.create_screen()
+        self.assertFalse(s.command_running)
+        self.ae((s.command_started_at, s.command_finished_at), (0, 0))
+        parse_bytes(s, b'\033]133;A\007')  # a prompt with no running command finishes nothing
+        self.ae(s.command_finished_at, 0)
+        parse_bytes(s, b'\033]133;C\007')
+        self.assertTrue(s.command_running)
+        started = s.command_started_at
+        self.assertGreater(started, 0)
+        self.ae(s.command_finished_at, 0)
+        parse_bytes(s, b'\033]133;A;k=s\007')  # a secondary prompt does not finish the command
+        self.assertTrue(s.command_running)
+        parse_bytes(s, b'\033]133;D;0\007')
+        self.assertFalse(s.command_running)
+        finished = s.command_finished_at
+        self.assertGreaterEqual(finished, started)
+        parse_bytes(s, b'\033]133;A\007')  # the prompt after D does not finish it again
+        self.ae(s.command_finished_at, finished)
+        parse_bytes(s, b'\033]133;C\007')
+        self.assertTrue(s.command_running)
+        parse_bytes(s, b'\033]133;A\007')  # a shell that does not send D
+        self.assertFalse(s.command_running)
+        self.assertGreaterEqual(s.command_finished_at, s.command_started_at)
+
+        self.ae((s.alternate_screen_entered_at, s.alternate_screen_exited_at), (0, 0))
+        parse_bytes(s, b'\033[?1049h')
+        self.assertTrue(s.is_using_alternate_linebuf())
+        entered = s.alternate_screen_entered_at
+        self.assertGreater(entered, 0)
+        self.ae(s.alternate_screen_exited_at, 0)
+        parse_bytes(s, b'\033[?1049h')  # already on the alternate screen
+        self.ae(s.alternate_screen_entered_at, entered)
+        parse_bytes(s, b'\033[?1049l')
+        self.assertFalse(s.is_using_alternate_linebuf())
+        self.assertGreaterEqual(s.alternate_screen_exited_at, entered)
 
     def test_pointer_shapes(self):
         from kitty.window import set_pointer_shape
@@ -2543,8 +3621,9 @@ class TestScreen(BaseTest):
         self.assertNotIn('mark1_background', cp.as_dict())
 
     def test_color_profile(self):
-        from kitty.fast_data_types import patch_color_profiles
+        from kitty.fast_data_types import COLOR_LAYER_WINDOW, NULL_COLOR_VALUE, patch_color_profiles
 
+        self.ae(NULL_COLOR_VALUE, 0xFFFFFFFF)
         opts = self.set_options({'palette_generate': 'fixed'})
         c = ColorProfile(opts)
         for i in range(8):
@@ -2602,6 +3681,11 @@ class TestScreen(BaseTest):
         # the generated colors are re-generated from the new configured colors
         opts.background, opts.foreground = Color(255, 255, 255), Color(0, 0, 0)
         q({'213': '?'}, {'213': ColorProfile(opts).as_color(213 << 8 | 1)})
+        # as_dict() uses the same names as kitty.conf
+        patch_color_profiles({'cursor_text_color': 0x123456, 'cursor': 0xABCDEF}, None, (s.color_profile,), COLOR_LAYER_WINDOW)
+        d = s.color_profile.as_dict()
+        self.ae((d['cursor_text_color'], d['cursor']), (0x123456, 0xABCDEF))
+        self.assertNotIn('cursor_text', d)
 
     def test_color_layers(self):
         from kitty.fast_data_types import COLOR_LAYER_GLOBAL, COLOR_LAYER_OVERRIDE, COLOR_LAYER_WINDOW, patch_color_profiles
@@ -2998,6 +4082,37 @@ class TestScreen(BaseTest):
         self.ae(s.cursor.decoration, before.decoration)
         self.ae(s.cursor.decoration_fg, before.decoration_fg)
 
+    def test_ime_preedit_cursor(self):
+        # The cursor is placed where the IME says it is inside the pre-edit
+        # text (in code points), so that one can see which character is being
+        # edited when moving inside the pre-edit text, as with Chewing. See :iss:`10807`
+        s = self.create_screen(cols=20, lines=3)
+        self.ae(s.test_draw_overlay_line('新酷音', 2, 0), 8)  # no cursor information: after the text
+        self.ae(s.test_draw_overlay_line('新酷音', 2, 0, 0), 2)
+        self.ae(s.test_draw_overlay_line('新酷音', 2, 0, 1), 4)
+        self.ae(s.test_draw_overlay_line('新酷音', 2, 0, 2), 6)
+        self.ae(s.test_draw_overlay_line('新酷音', 2, 0, 3), 8)
+        self.ae(s.test_draw_overlay_line('a新b', 0, 1, 2), 3)
+        self.ae(s.test_draw_overlay_line('ab', 0, 1, 99), 2)  # out of range: after the text
+
+        # The cursor position must be correct as soon as the pre-edit text is
+        # updated, as it is collected for rendering before the overlay is drawn
+        s = self.create_screen(cols=20, lines=3)
+        s.draw('ab')
+        self.ae(s.test_update_overlay_text('官大為'), 8)
+        for cursor, x in ((0, 2), (1, 4), (2, 6), (3, 8), (1, 4)):
+            self.ae(s.test_update_overlay_text('官大為', cursor), x)
+        self.ae(s.test_update_overlay_text('官大ㄨㄟ', 2), 6)
+        # pre-edit text that does not fit after the cursor is shifted left
+        s.cursor.x = 16
+        self.ae(s.test_update_overlay_text('官大為', 1), 16)
+        # pre-edit text wider than the screen is right aligned and clipped on the left
+        s = self.create_screen(cols=6, lines=3)
+        self.ae(s.test_update_overlay_text('官大為好和', 4), 4)
+        self.ae(s.test_update_overlay_text('官大為好和', 2), 0)
+        self.ae(s.test_update_overlay_text('官大為好和', 0), 0)
+        self.ae(s.test_update_overlay_text('官大為好和'), 6)
+
     def test_ime_overlay_line_start(self):
         # The IME is anchored at the start of the pre-edit text as drawn,
         # which is shifted left when it would otherwise not fit on the line
@@ -3063,6 +4178,76 @@ class TestScreen(BaseTest):
         s.draw('cd')
         s.cursor.x = 1
         self.ae(s.ime_text_around_cursor(), ('c', 'd'))
+
+    def test_cwd_change_notification(self):
+        from kitty.window import Watchers, Window
+
+        s = self.create_screen()
+        c = s.callbacks
+        parse_bytes(s, b'\x1b]7;file://host/a/b\x1b\\')
+        self.ae(c.cwd_changes, [b'file://host/a/b'])
+        self.ae(s.last_reported_cwd, b'file://host/a/b')
+        # repeating the same directory does not report a change
+        parse_bytes(s, b'\x1b]7;file://host/a/b\x07')
+        self.ae(c.cwd_changes, [b'file://host/a/b'])
+        parse_bytes(s, b'\x1b]7;file://host/a/c\x07')
+        self.ae(c.cwd_changes, [b'file://host/a/b', b'file://host/a/c'])
+        # OSC 6 is ignored
+        parse_bytes(s, b'\x1b]6;file://host/x\x07')
+        self.ae(c.cwd_changes, [b'file://host/a/b', b'file://host/a/c'])
+        # after a reset the next report is a change
+        s.reset()
+        parse_bytes(s, b'\x1b]7;file://host/a/c\x07')
+        self.ae(c.cwd_changes, [b'file://host/a/b', b'file://host/a/c', b'file://host/a/c'])
+        # ConEmu OSC 9;9 cwd reporting
+        del c.cwd_changes[:]
+        c.notifications = []
+        parse_bytes(s, b'\x1b]9;9;/x/y z\x1b\\')
+        self.ae(s.last_reported_cwd, b'kitty-shell-cwd:///x/y z')
+        parse_bytes(s, b'\x1b]9;9;"/q/r"\x07')
+        self.ae(s.last_reported_cwd, b'kitty-shell-cwd:///q/r')
+        # relative and windows paths are ignored
+        parse_bytes(s, b'\x1b]9;9;C:\\x\x07')
+        parse_bytes(s, b'\x1b]9;9;\x07')
+        self.ae(c.cwd_changes, [b'kitty-shell-cwd:///x/y z', b'kitty-shell-cwd:///q/r'])
+        self.ae(c.notifications, [])
+        # other OSC 9 payloads still go to desktop_notify
+        parse_bytes(s, b'\x1b]9;hello\x07')
+        self.ae(c.notifications, [(9, 'hello')])
+        self.ae(path_from_osc7_url(s.last_reported_cwd), '/q/r')
+        for x in ('1;10', '2;msg', '5', '9;9;/a', '12', '10;1'):
+            self.assertTrue(is_conemu_osc9_command(x), x)
+        for x in ('hello', '13;x', '0;x', '1x', '', '42'):
+            self.assertFalse(is_conemu_osc9_command(x), x)
+
+        delivered = []
+
+        class FakeWindow:
+            def __init__(self):
+                self.watchers = Watchers()
+                self.watchers.on_cwd_change.append(lambda boss, window, data: None)
+
+            def call_watchers(self, which, data):
+                delivered.append(data)
+
+        w = FakeWindow()
+        Window.on_cwd_change(w, b'file://myhost/some%20dir/x')
+        Window.on_cwd_change(w, b'kitty-shell-cwd://otherhost/a b')
+        Window.on_cwd_change(w, b'file:///no/host')
+        Window.on_cwd_change(w, b'file://h/bad\xff')
+        self.ae(
+            delivered,
+            [
+                {'cwd': '/some dir/x', 'host': 'myhost'},
+                {'cwd': '/a b', 'host': 'otherhost'},
+                {'cwd': '/no/host', 'host': ''},
+                {'cwd': '/bad�', 'host': 'h'},
+            ],
+        )
+        del delivered[:]
+        w.watchers.on_cwd_change.clear()
+        Window.on_cwd_change(w, b'file://myhost/y')
+        self.ae(delivered, [])
 
 
 def detect_url(self, scale=1):

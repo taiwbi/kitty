@@ -42,19 +42,17 @@ func ffmpeg_thumbnail_cmd(path, outpath string) *exec.Cmd {
 	)
 }
 
-func ffmpeg_thumbnail(path, tempath string, wg *sync.WaitGroup) (ans *images.ImageData, err error) {
-	defer wg.Done()
+func ffmpeg_thumbnail(path, tempath string) error {
 	cmd := ffmpeg_thumbnail_cmd(path, tempath)
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &unix.SysProcAttr{Setsid: true}
 	var stderr bytes.Buffer
 	cmd.Stdout = nil
 	cmd.Stderr = &stderr
-	if err = cmd.Run(); err != nil {
-		return ans, fmt.Errorf("failed to use ffmpeg to render video from %s with error: %w and stderr: %s", path, err, stderr.String())
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to use ffmpeg to render video from %s with error: %w and stderr: %s", path, err, stderr.String())
 	}
-	ans, err = images.OpenImageFromPath(tempath)
-	return
+	return nil
 }
 
 type FFMpegFormat struct {
@@ -80,8 +78,7 @@ func ffmpeg_metadata_cmd(path string) *exec.Cmd {
 	)
 }
 
-func ffmpeg_metadata(path string, wg *sync.WaitGroup) (ans FFMpegMetadata, err error) {
-	defer wg.Done()
+func ffmpeg_metadata(path string) (ans FFMpegMetadata, err error) {
 	cmd := ffmpeg_metadata_cmd(path)
 	cmd.Stdin = nil
 	cmd.SysProcAttr = &unix.SysProcAttr{Setsid: true}
@@ -104,24 +101,42 @@ func (c ffmpeg_renderer) Render(path string) (m map[string][]byte, mi metadata, 
 		return nil, mi, nil, err
 	}
 	defer func() { _ = os.Remove(tempfile.Name()); tempfile.Close() }()
-	var metadata FFMpegMetadata
+	var info FFMpegMetadata
 	var metadata_error error
-	wg.Add(1)
-	go func() { metadata, metadata_error = ffmpeg_metadata(path, &wg) }()
-	wg.Add(1)
-	go func() { img, err = ffmpeg_thumbnail(path, tempfile.Name(), &wg) }()
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		info, metadata_error = ffmpeg_metadata(path)
+	}()
+	go func() {
+		defer wg.Done()
+		err = ffmpeg_thumbnail(path, tempfile.Name())
+	}()
 	wg.Wait()
 	if metadata_error != nil {
 		return nil, mi, nil, metadata_error
+	}
+	if err != nil {
+		return nil, mi, nil, err
 	}
 	var ip ImagePreviewRenderer
 	if m, mi, img, err = ip.Render(tempfile.Name()); err != nil {
 		return
 	}
-	mi.custom = &metadata
-
+	// Store the metadata so that Unmarshall can restore it from the disk cache.
+	if m[FFMPEG_METADATA_KEY], err = json.Marshal(&info); err != nil {
+		return nil, metadata{}, nil, fmt.Errorf("could not serialize ffprobe metadata for %s: %w", path, err)
+	}
+	mi.custom = &info
 	return
 }
+
+// CacheKeyExtra returns the video_preview settings the thumbnail is rendered with.
+func (c ffmpeg_renderer) CacheKeyExtra(string) string {
+	return fmt.Sprintf("%d:%d:%g:%d", video_width, video_fps, video_duration, video_encoding_quality)
+}
+
+func (c ffmpeg_renderer) NeedsSelectedPath() bool { return false }
 
 func (c ffmpeg_renderer) Unmarshall(m map[string]string) (any, error) {
 	data, err := os.ReadFile(m[FFMPEG_METADATA_KEY])
@@ -141,7 +156,7 @@ func (c ffmpeg_renderer) ShowMetadata(h *Handler, s ShowData) (offset int) {
 			offset += h.render_wrapped_text_in_region(text, s.x, s.y+offset, s.width, s.height-offset, center)
 		}
 	}
-	ext := filepath.Ext(s.abspath)
+	ext := sanitize_name(filepath.Ext(s.abspath))
 	text := fmt.Sprintf("%s: %s", ext, humanize.Bytes(uint64(s.metadata.Size())))
 	r := s.custom_metadata.custom.(*FFMpegMetadata)
 	icon := icons.IconForPath(s.abspath)

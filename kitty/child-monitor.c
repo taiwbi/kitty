@@ -552,7 +552,14 @@ static bool
 do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     ParseData pd = {.dump_callback = self->dump_callback, .now = now};
     const bool had_url_highlight = screen->url_ranges.count > 0;
+    const MouseShape pointer_shape_before = screen_pointer_shape(screen);
     self->parse_func(screen, &pd, flush);
+    // Apply pointer shape changes once per parse and only if the shape
+    // actually changed, so that a program doing a pop followed by a push of
+    // the same shape does not touch the OS pointer, which would restart
+    // animated pointers. This also handles switching to/from the alternate
+    // screen, which has its own pointer shape stack.
+    if (screen_pointer_shape(screen) != pointer_shape_before) update_pointer_shape_for_kitty_window(screen->window_id);
     if (had_url_highlight && !screen->url_ranges.count) link_hover_cleared_by_output(screen);
     if (pd.input_read) {
         if (is_gtk_backend_enabled()) screen_scroll_to_bottom(screen);
@@ -604,6 +611,7 @@ parse_input(ChildMonitor *self) {
     if (UNLIKELY(kill_signal_received || reload_config_signal_received)) {
         if (kill_signal_received) {
             global_state.quit_request = IMPERATIVE_CLOSE_REQUESTED;
+            global_state.quit_cause = QUIT_CAUSE_SIGNAL;
             global_state.has_pending_closes = true;
             if (self->benchmark_wakeup_fd < 0) request_tick_callback();
             kill_signal_received = false;
@@ -669,10 +677,11 @@ parse_input(ChildMonitor *self) {
         if (remove_notify[remove_count].screen && do_parse(self, remove_notify[remove_count].screen, now, true)) input_read = true;
         PyObject *t = PyObject_CallFunction(
             self->death_notify,
-            "kOi",
+            "kOiO",
             remove_notify[remove_count].id,
             remove_notify[remove_count].child_died ? Py_True : Py_False,
-            remove_notify[remove_count].exit_status);
+            remove_notify[remove_count].exit_status,
+            remove_notify[remove_count].close_requested ? Py_True : Py_False);
         if (t == NULL) PyErr_Print();
         else Py_DECREF(t);
         FREE_CHILD(remove_notify[remove_count]);
@@ -830,7 +839,8 @@ collect_cursor_info(CursorRenderInfo *ans, Window *w, monotonic_t now, OSWindow 
     ans->multicursor_count = 0;
     ans->cursor_opacity = 1;
     ans->text_blink_opacity = 1;
-    if (!rd->screen->scrolled_by) {
+    // Use the scroll position of the rendered frame so the cursor matches the frozen text while rendering is paused
+    if (!rendered_scrolled_by(rd->screen)) {
         ans->multicursor_count = screen_multi_cursor_count(rd->screen);
         ans->is_visible = screen_is_cursor_visible(rd->screen);
     }
@@ -937,7 +947,6 @@ prepare_to_render_os_window(
         Window *w = tab->windows + i;
 #define WD w->render_data
         if (w->visible && WD.screen) {
-            os_window->needs_layers = os_window->needs_layers || screen_needs_rendering_in_layers(os_window, w, WD.screen);
             screen_check_pause_rendering(WD.screen, now);
             *num_visible_windows += 1;
             color_type window_bg =
@@ -963,6 +972,26 @@ prepare_to_render_os_window(
                 if (global_state.ime_used && os_window->is_focused) sync_ime_position_with_cursor(os_window, w);
                 set_os_window_title_from_window(w, os_window);
                 *active_window_bg = window_bg;
+                {
+                    // Fire events for shell integration command and alternate screen changes
+                    // in the active window that happened since the last check. This is just
+                    // a few integer comparisons per frame. The check time includes the
+                    // change times seen, as input can be parsed after now was captured.
+                    const Screen *scr = WD.screen;
+                    const monotonic_t since = os_window->screen_state_checked_at;
+                    monotonic_t latest = now;
+#define CHECK(field, event)                                                         \
+    if (scr->field > since) {                                                       \
+        os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_##event); \
+        latest = MAX(latest, scr->field);                                           \
+    }
+                    CHECK(command_state.started_at, COMMAND_START);
+                    CHECK(command_state.finished_at, COMMAND_FINISH);
+                    CHECK(alternate_screen.entered_at, ALTERNATE_SCREEN_ENTER);
+                    CHECK(alternate_screen.exited_at, ALTERNATE_SCREEN_EXIT);
+#undef CHECK
+                    os_window->screen_state_checked_at = MAX(since, latest);
+                }
                 if (OPT(cursor_trail)) {
                     if (os_window->last_active_tab != os_window->active_tab && os_window->last_active_tab < os_window->num_tabs) {
                         tab->cursor_trail = os_window->tabs[os_window->last_active_tab].cursor_trail;
@@ -1008,12 +1037,12 @@ prepare_to_render_os_window(
                 }
             }
             if (send_cell_data_to_gpu(WD.vao_idx, WD.screen, os_window)) needs_render = true;
+            // Must be after send_cell_data_to_gpu() as that updates the graphics layers, which
+            // determine whether there are images that need rendering in layers. Otherwise, a newly
+            // placed image is not drawn until something else causes a re-render, see #10875
+            os_window->needs_layers = os_window->needs_layers || screen_needs_rendering_in_layers(os_window, w, WD.screen);
             if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) needs_render = true;
             if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) needs_render = true;
-            if (WD.screen->start_visual_bell_at && WD.screen->start_visual_bell_at > os_window->last_rendered_at) {
-                os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_BELL_IN_WINDOW);
-                os_window->last_bell_window_id = w->id;
-            }
             // Prepare window title bar screen data for GPU
             WindowRenderData *trd = &w->window_title_render_data;
             if (trd->screen && trd->geometry.bottom > trd->geometry.top && trd->geometry.right > trd->geometry.left) {
@@ -1389,6 +1418,9 @@ python_timer_callback(id_type timer_id, void *data) {
     PyObject *ret = PyObject_CallFunction(callback, "K", id);
     if (ret == NULL) PyErr_Print();
     else Py_DECREF(ret);
+    // Timers are dispatched outside the main loop tick, so ensure any state
+    // changed by the callback is processed and rendered
+    request_tick_callback();
 }
 
 static void
@@ -1402,9 +1434,12 @@ add_python_timer(PyObject *self UNUSED, PyObject *args) {
     double interval;
     int repeats = 1;
     if (!PyArg_ParseTuple(args, "Od|p", &callback, &interval, &repeats)) return NULL;
+    // The timer owns a reference to callback, released by python_timer_cleanup
+    Py_INCREF(callback);
     unsigned long long timer_id =
         add_main_loop_timer(s_double_to_monotonic_t(interval), repeats ? true : false, python_timer_callback, callback, python_timer_cleanup);
-    Py_INCREF(callback);
+    // On failure the cleanup function is never called, so release the reference here
+    if (!timer_id) Py_DECREF(callback);
     return Py_BuildValue("K", timer_id);
 }
 

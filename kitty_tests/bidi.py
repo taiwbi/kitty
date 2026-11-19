@@ -161,9 +161,11 @@ class BidiRendering(FontBaseTest):
         parse_bytes(screen, '\x1b[?1049h\x1b[2;1H\x1b[31mﺱﻼﻣ\x1b[32m ﺪﻨﯾﺍ \x1b[0mtext'.encode())
         before = test_render_screen(screen)[1]
 
-        # Scroll and repaint the text with different highlighting, as Neovim
-        # can do. Make the new italic sprites fail to upload.
-        parse_bytes(screen, '\x1b[S\x1b[H\x1b[3;31mﺱﻼﻣ\x1b[32m ﺪﻨﯾﺍ \x1b[0mtext'.encode())
+        # Scroll and repaint with italics on the Latin text. It uses the main
+        # font, so this requires new sprites even if the Arabic fallback has
+        # no italic face.
+        parse_bytes(screen, '\x1b[S\x1b[H\x1b[31mﺱﻼﻣ\x1b[32m ﺪﻨﯾﺍ \x1b[0;3mtext'.encode())
+        # Pre-render the logical row, then exhaust the sprite atlas during bidi rendering.
         test_render_line(screen.line(0))
         sprite_map_set_limits(1, 1)
         sprite_map_set_layout(1, 1)
@@ -171,7 +173,7 @@ class BidiRendering(FontBaseTest):
             rendered = test_render_screen(screen)[0]
         self.assertIn('Out of texture space for sprites', errors.getvalue())
         self.ae([cell[1] for cell in rendered], [cell[1] for cell in before])
-        self.ae(rendered[9:], before[9:])
+        self.ae(rendered[:9], before[:9])
 
     def test_bidi_cache_eviction(self):
         self.set_options({'bidi_rendering': True})

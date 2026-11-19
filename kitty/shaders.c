@@ -63,12 +63,6 @@ row_offset_for_screen(const Screen *screen) {
     return -1.f + (float)(rendered_pixel_scroll_offset_y(screen) / (double)screen->cell_size.height);
 }
 
-static inline float
-scroll_offset_lines_for_screen(const Screen *screen) {
-    if (!pixel_scroll_enabled(screen) || !screen->cell_size.height) return 0.f;
-    return (float)(rendered_pixel_scroll_offset_y(screen) / (double)screen->cell_size.height);
-}
-
 // Sprites {{{
 typedef struct {
     int xnum, ynum, x, y, z, last_num_of_layers, last_ynum;
@@ -829,7 +823,7 @@ init_custom_programs(void) {
         // animations triggered by os-window-focus-in start on the first render
         // after shader compilation (the focus-in event fired before shaders were
         // compiled and was consumed without being processed).
-        if (osw->is_focused) { osw->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_OS_WINDOW_FOCUS_IN) | (1u << SHADER_ANIM_EVENT_WINDOW_FOCUS_IN); }
+        if (osw->is_focused) record_os_window_focus_change_for_shaders(osw, true);
     }
     debug_rendering(
         "Custom shaders: %zu program(s), %zu group(s), textures_mask=0x%x, initially_active=%d\n",
@@ -883,6 +877,10 @@ shader_anim_event_mask_str(ShaderAnimEventMask mask) {
         {1u << SHADER_ANIM_EVENT_USER_IDLE, "user-idle"},
         {1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE, "cursor-trail-move"},
         {1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP, "cursor-trail-stop"},
+        {1u << SHADER_ANIM_EVENT_COMMAND_START, "command-start"},
+        {1u << SHADER_ANIM_EVENT_COMMAND_FINISH, "command-finish"},
+        {1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_ENTER, "alternate-screen-enter"},
+        {1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_EXIT, "alternate-screen-exit"},
     };
     bool first = true;
     for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); i++) {
@@ -1250,7 +1248,7 @@ cell_update_uniform_block(
     }
     rd->use_cell_for_selection_bg = IS_SPECIAL_COLOR(highlight_bg) ? 1. : 0.;
     // Cursor position
-    Line *line_for_cursor = NULL;
+    Line *line_for_cursor = NULL, overlay_line_for_cursor;
     rd->cursor_opacity = MAX(0, MIN(cursor->cursor_opacity, 1));
     rd->blink_opacity = MAX(0, MIN(cursor->text_blink_opacity, 1));
     // The extra cursors inherit the colors of the main cursor and, optionally,
@@ -1275,6 +1273,15 @@ cell_update_uniform_block(
             } else {
                 linebuf_init_line(screen->linebuf, cursor->y);
                 line_for_cursor = screen->linebuf->line;
+                if (screen_is_overlay_active(screen) && cursor->y == screen->overlay_line.ynum) {
+                    // The linebuf holds the original line, the pre-edit text is
+                    // drawn over it only in the overlay cells, so use those to size
+                    // and color the cursor, for example when it is over a wide character.
+                    overlay_line_for_cursor = *line_for_cursor;
+                    overlay_line_for_cursor.cpu_cells = screen->overlay_line.cpu_cells;
+                    overlay_line_for_cursor.gpu_cells = screen->overlay_line.gpu_cells;
+                    line_for_cursor = &overlay_line_for_cursor;
+                }
             }
         }
         if (line_for_cursor) {
@@ -1407,31 +1414,17 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
         changed = true;                                                                     \
     }
 
-#define update_graphics_data(grman)             \
-    grman_update_layers(                        \
-        grman,                                  \
-        screen->scrolled_by,                    \
-        scroll_offset_lines_for_screen(screen), \
-        -1.f,                                   \
-        1.f,                                    \
-        2.f / screen->columns,                  \
-        2.f / screen->lines,                    \
-        screen->columns,                        \
-        screen->lines,                          \
-        screen->cell_size)
-
     if (screen->paused_rendering.expires_at) {
         if (!screen->paused_rendering.cell_data_updated) {
             update_selection_data;
-            update_graphics_data(screen->paused_rendering.grman);
+            screen_update_graphics_layers(screen);
         }
         screen->paused_rendering.cell_data_updated = true;
-        screen->last_rendered.scrolled_by = screen->paused_rendering.scrolled_by;
     } else {
         if (screen->reload_all_gpu_data || screen_resized || screen_is_selection_dirty(screen)) update_selection_data;
-        if (update_graphics_data(screen->grman)) changed = true;
-        screen->last_rendered.scrolled_by = screen->scrolled_by;
+        if (screen_update_graphics_layers(screen)) changed = true;
     }
+    screen->last_rendered.scrolled_by = rendered_scrolled_by(screen);
 #undef update_selection_data
 #undef update_cell_data
     screen->last_rendered.columns = screen->columns;
@@ -1644,16 +1637,7 @@ draw_drag_preview_overlay(const UIRenderData *ui) {
 
 static bool
 has_scrollbar(Window *w, Screen *screen) {
-    if (screen->linebuf != screen->main_linebuf || !screen->historybuf->count) return false;
-    switch (OPT(scrollbar)) {
-        case SCROLLBAR_NEVER: return false;
-        case SCROLLBAR_ALWAYS: return true;
-        case SCROLLBAR_ON_SCROLLED: return screen->scrolled_by > 0;
-        case SCROLLBAR_ON_HOVERED: return w->scrollbar.is_hovering;
-        case SCROLLBAR_ON_SCROLL_AND_HOVER: return screen->scrolled_by > 0 && w->scrollbar.is_hovering;
-        case SCROLLBAR_ON_SCROLL_OR_HOVER: return screen->scrolled_by > 0 || w->scrollbar.is_hovering;
-    }
-    return false;
+    return screen_has_scrollbar(screen, w->scrollbar.is_hovering);
 }
 
 static unsigned
@@ -1924,9 +1908,8 @@ draw_scrollbar(const UIRenderData *ui) {
     if (!window || !screen || !has_scrollbar(window, screen)) return;
 
     color_type bar_color = scrollbar_color(screen, OPT(scrollbar_handle_color)), track_color = scrollbar_color(screen, OPT(scrollbar_track_color));
-    double cell_frac = (double)screen->pixel_scroll_offset_y / screen->cell_size.height;
-    if (!OPT(pixel_scroll)) cell_frac = 0;
-    float bar_frac = (float)(screen->scrolled_by + cell_frac) / MAX(1u, (float)screen->historybuf->count);
+    float bar_frac, visible_fraction;
+    screen_scrollbar_geometry(screen, &bar_frac, &visible_fraction);
     float opacity = OPT(scrollbar_handle_opacity);
     float track_opacity = window->scrollbar.is_hovering ? OPT(scrollbar_track_hover_opacity) : OPT(scrollbar_track_opacity);
     GLsizei scrollbar_width_px = (GLsizei)(OPT(scrollbar_width) * ui->cell_width);
@@ -1945,7 +1928,6 @@ draw_scrollbar(const UIRenderData *ui) {
     GLsizei scrollbar_height = window_height - 2 * scrollbar_gap_px;
 
     // Calculate thumb size and position
-    float visible_fraction = (float)screen->lines / (float)(screen->lines + screen->historybuf->count);
     float min_thumb_height_fraction = (OPT(scrollbar_min_handle_height) * ui->cell_height) / (float)window_height;
     float thumb_height_fraction = MAX(min_thumb_height_fraction, visible_fraction);
 
@@ -3158,6 +3140,10 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         float timestamp_fraction;
         float time_since_last_render;
         float cursor_trail_age;
+        float active_window_alternate_screen;
+        float active_window_command_running;
+        float active_window_alternate_screen_age;
+        float active_window_command_state_age;
     };
     // This struct is a hand written mirror of the std140 layout of
     // KittyCustomShaderData in types.slang, so check that they match once.
@@ -3192,6 +3178,8 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
     color_type cursor_color = OPT(foreground);
     float cursor_opacity = 0.f;
     WindowGeometry active_win_geom = {0};
+    d->active_window_alternate_screen_age = -1.f;
+    d->active_window_command_state_age = -1.f;
     if (os_window->num_tabs > 0) {
         Tab *t = os_window->tabs + os_window->active_tab;
         if (t->num_windows) {
@@ -3222,6 +3210,12 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
                 active_bg = colorprofile_to_color(s->color_profile, s->color_profile->overridden.default_bg, s->color_profile->configured.default_bg).rgb;
                 cursor_color = s->last_rendered.cursor_bg;
                 cursor_opacity = MAX(0.f, MIN(s->cursor_render_info.cursor_opacity, 1.f));
+                d->active_window_alternate_screen = s->linebuf == s->alt_linebuf ? 1.f : 0.f;
+                d->active_window_command_running = s->command_state.running ? 1.f : 0.f;
+                const monotonic_t alt_changed_at = MAX(s->alternate_screen.entered_at, s->alternate_screen.exited_at);
+                if (alt_changed_at) d->active_window_alternate_screen_age = (float)monotonic_t_to_s_double(now - alt_changed_at);
+                const monotonic_t cmd_changed_at = MAX(s->command_state.started_at, s->command_state.finished_at);
+                if (cmd_changed_at) d->active_window_command_state_age = (float)monotonic_t_to_s_double(now - cmd_changed_at);
             }
         }
     }
@@ -3660,6 +3654,10 @@ shader_anim_event_bit(const char *s, CustomShaderPipeline *p) {
     if (strcmp(s, "user-idle") == 0) return 1u << SHADER_ANIM_EVENT_USER_IDLE;
     if (strcmp(s, "cursor-trail-move") == 0) return 1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE;
     if (strcmp(s, "cursor-trail-stop") == 0) return 1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP;
+    if (strcmp(s, "command-start") == 0) return 1u << SHADER_ANIM_EVENT_COMMAND_START;
+    if (strcmp(s, "command-finish") == 0) return 1u << SHADER_ANIM_EVENT_COMMAND_FINISH;
+    if (strcmp(s, "alternate-screen-enter") == 0) return 1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_ENTER;
+    if (strcmp(s, "alternate-screen-exit") == 0) return 1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_EXIT;
     static const char user_prefix[] = "user:";
     if (strncmp(s, user_prefix, sizeof(user_prefix) - 1) == 0) {
         const char *name = s + sizeof(user_prefix) - 1;
@@ -4025,7 +4023,27 @@ pysimulate_custom_shader_animation(PyObject *self UNUSED, PyObject *args) {
                 Py_CLEAR(ans);
                 break;
             }
-            update_custom_shader_animations(parse_anim_event_sequence(names, &custom_shaders.end), now, osw);
+            // focus:in and focus:out change OS window focus, as the GLFW focus
+            // callback does, before the tick's events are consumed, the way
+            // prepare_to_render_os_window() does
+            for (Py_ssize_t n = 0; n < PySequence_Fast_GET_SIZE(names); n++) {
+                PyObject *item = PySequence_Fast_GET_ITEM(names, n);
+                if (!PyUnicode_Check(item)) continue;
+                const char *name = PyUnicode_AsUTF8(item);
+                if (!name) {
+                    Py_CLEAR(ans);
+                    break;
+                }
+                const bool focus_in = strcmp(name, "focus:in") == 0;
+                if (focus_in || strcmp(name, "focus:out") == 0) {
+                    const bool focused = focus_in;
+                    if (osw->is_focused != focused) record_os_window_focus_change_for_shaders(osw, focused);
+                    osw->is_focused = focused;
+                }
+            }
+            if (!ans) break;
+            update_custom_shader_animations(parse_anim_event_sequence(names, &custom_shaders.end) | osw->shader_anim_event_registry, now, osw);
+            osw->shader_anim_event_registry = 0;
             RAII_PyObject(states, PyTuple_New(custom_shaders.end.num_groups));
             if (!states) {
                 Py_CLEAR(ans);

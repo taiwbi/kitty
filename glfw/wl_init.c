@@ -400,9 +400,17 @@ touchHandleDown(
     void *data UNUSED, struct wl_touch *wl_touch UNUSED, uint32_t serial, uint32_t time, struct wl_surface *surface, int32_t id, wl_fixed_t sx, wl_fixed_t sy) {
     // A finger landing stops any scroll that is coasting, as on every touch system
     glfw_cancel_momentum_scroll();
+    csd_drop_stale_touch(id);
     _GLFWwindow *window = get_window_from_surface(surface);
-    // A touch on a client-side decoration is not reported
-    if (!window || surface != window->wl.surface) return;
+    if (!window) return;
+    if (surface != window->wl.surface) {
+        if (csd_handle_touch_down(window, surface, id, serial, wl_fixed_to_double(sx), wl_fixed_to_double(sy))) {
+            _glfw.wl.serial = serial;
+            _glfw.wl.input_serial = serial;
+            _glfw.wl.pointer_serial = serial;
+        }
+        return;
+    }
     if (touch.count >= arraysz(touch.points) || touch_point_index(id) > -1) return;
     _glfw.wl.serial = serial;
     _glfw.wl.input_serial = serial;
@@ -422,6 +430,13 @@ touchHandleDown(
 
 static void
 touchHandleUp(void *data UNUSED, struct wl_touch *wl_touch UNUSED, uint32_t serial, uint32_t time, int32_t id) {
+    if (csd_is_tracking_touch(id)) {
+        _glfw.wl.serial = serial;
+        _glfw.wl.input_serial = serial;
+        _glfw.wl.pointer_serial = serial;
+        csd_handle_touch_up(id);
+        return;
+    }
     const ssize_t i = touch_point_index(id);
     if (i < 0) return;
     _glfw.wl.serial = serial;
@@ -433,6 +448,7 @@ touchHandleUp(void *data UNUSED, struct wl_touch *wl_touch UNUSED, uint32_t seri
 
 static void
 touchHandleMotion(void *data UNUSED, struct wl_touch *wl_touch UNUSED, uint32_t time, int32_t id, wl_fixed_t sx, wl_fixed_t sy) {
+    csd_handle_touch_motion(id, wl_fixed_to_double(sx), wl_fixed_to_double(sy));
     const ssize_t i = touch_point_index(id);
     if (i < 0) return;
     touch_record_time(time);
@@ -488,6 +504,7 @@ touchHandleFrame(void *data UNUSED, struct wl_touch *wl_touch UNUSED) {
 // window hears of it only if it was told the sequence began
 static void
 touchHandleCancel(void *data UNUSED, struct wl_touch *wl_touch UNUSED) {
+    csd_handle_touch_cancel();
     const monotonic_t timestamp = monotonic();
     GLFWid done[arraysz(touch.points)];
     size_t num_done = 0;
@@ -594,7 +611,9 @@ keyboardHandleEnter(void *data UNUSED, struct wl_keyboard *keyboard UNUSED, uint
     _glfw.wl.keyboard_enter_serial = serial;
     _glfw.wl.keyboardFocusId = window->id;
     _glfw.wl.lastKeyboardFocusId = window->id;
+    const id_type window_id = window->id;
     _glfwInputWindowFocus(window, true);
+    _glfwWaylandKeyboardFocusChanged(window_id);
     uint32_t *key;
     if (keys && _glfw.wl.keyRepeatInfo.key) {
         wl_array_for_each(key, keys) {
@@ -614,7 +633,9 @@ keyboardHandleLeave(void *data UNUSED, struct wl_keyboard *keyboard UNUSED, uint
 
     _glfw.wl.serial = serial;
     _glfw.wl.keyboardFocusId = 0;
+    const id_type window_id = window->id;
     _glfwInputWindowFocus(window, false);
+    _glfwWaylandKeyboardFocusChanged(window_id);
     stop_key_repeat_timer();
 }
 
@@ -861,7 +882,7 @@ registryHandleGlobal(void *data UNUSED, struct wl_registry *registry, uint32_t n
         _glfw.wl.xdg_toplevel_drag_manager_v1 = wl_registry_bind(registry, name, &xdg_toplevel_drag_manager_v1_interface, 1);
     } else if (is(zxdg_output_manager_v1)) {
         _glfw.wl.xdg_output_manager = wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, MIN(version, 3u));
-        for (int i = 0; i < _glfw.monitorCount; i++) _glfwCreateXdgOutputWayland(_glfw.monitors[i]);
+        _glfwCreateXdgOutputsWayland();
     } else if (is(zwlr_virtual_pointer_manager_v1)) {
         _glfw.wl.virtual_pointer_manager = wl_registry_bind(registry, name, &zwlr_virtual_pointer_manager_v1_interface, 1);
     } else if (is(zwp_virtual_keyboard_manager_v1)) {
@@ -872,25 +893,7 @@ registryHandleGlobal(void *data UNUSED, struct wl_registry *registry, uint32_t n
 
 static void
 registryHandleGlobalRemove(void *data UNUSED, struct wl_registry *registry UNUSED, uint32_t name) {
-    _GLFWmonitor *monitor;
-
-    for (int i = 0; i < _glfw.monitorCount; ++i) {
-        monitor = _glfw.monitors[i];
-        if (monitor->wl.name == name) {
-            for (_GLFWwindow *window = _glfw.windowListHead; window; window = window->next) {
-                bool was_on_monitor = false;
-                for (int m = window->wl.monitorsCount - 1; m >= 0; m--) {
-                    if (window->wl.monitors[m] == monitor) {
-                        remove_i_from_array(window->wl.monitors, m, window->wl.monitorsCount);
-                        was_on_monitor = true;
-                    }
-                }
-                if (was_on_monitor) _glfwWaylandSurfaceOutputsChanged(window);
-            }
-            _glfwInputMonitor(monitor, GLFW_DISCONNECTED, 0);
-            return;
-        }
-    }
+    _glfwRemoveOutputWayland(name);
 }
 
 
@@ -1100,6 +1103,7 @@ _glfwPlatformTerminate(void) {
         }
         free(_glfw.wl.activation_requests.array);
     }
+    _glfwFreePendingOutputsWayland();
     glfw_xkb_release(&_glfw.wl.xkb);
     glfw_dbus_terminate(&_glfw.wl.dbus);
 

@@ -2,7 +2,6 @@
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import fcntl
-import math
 import os
 import re
 import string
@@ -151,10 +150,6 @@ def suppress_error_logging() -> Generator[None, None, None]:
             delattr(log_error, 'redirect')
         else:
             setattr(log_error, 'redirect', before)
-
-
-def ceil_int(x: float) -> int:
-    return int(math.ceil(x))
 
 
 def sanitize_title(x: str) -> str:
@@ -710,6 +705,12 @@ def func_name(f: Any) -> str:
     return str(f)
 
 
+@lru_cache(maxsize=2)
+def report_invalid_shell(shell: str, err: str) -> None:
+    # Report only once per value, as the shell is resolved for every new window
+    log_error(f'The shell option {shell!r} is invalid with error: {err}, using {shell_path} instead')
+
+
 def resolved_shell(opts: Options | None = None) -> list[str]:
     q: str = getattr(opts, 'shell', '.')
     if q == '.':
@@ -730,7 +731,11 @@ def resolved_shell(opts: Options | None = None) -> list[str]:
         def expand(x: str) -> str:
             return expandvars(x, env)
 
-        ans = list(map(expand, shlex_split(q)))
+        try:
+            ans = list(map(expand, shlex_split(q)))
+        except ValueError as e:
+            report_invalid_shell(q, str(e))
+            ans = [shell_path]
     return ans
 
 

@@ -508,6 +508,34 @@ detach_window(id_type os_window_id, id_type tab_id, id_type id) {
 }
 
 
+static bool
+move_window_to_tab(id_type os_window_id, id_type src_tab_id, id_type dest_tab_id, id_type id) {
+    // Move a window between two tabs of the same OS window. Unlike detach_window() and
+    // attach_window() this keeps the GPU resources of the window, as both tabs share the
+    // OpenGL context of the OS window.
+    OSWindow *osw = os_window_for_id(os_window_id);
+    if (!osw || src_tab_id == dest_tab_id) return false;
+    Tab *src = NULL, *dest = NULL;
+    for (size_t t = 0; t < osw->num_tabs; t++) {
+        if (osw->tabs[t].id == src_tab_id) src = osw->tabs + t;
+        else if (osw->tabs[t].id == dest_tab_id) dest = osw->tabs + t;
+    }
+    if (!src || !dest) return false;
+    for (size_t i = 0; i < src->num_windows; i++) {
+        if (src->windows[i].id == id) {
+            ensure_space_for(dest, windows, Window, dest->num_windows + 1, capacity, 1, true);
+            memcpy(dest->windows + dest->num_windows++, src->windows + i, sizeof(Window));
+            zero_at_i(src->windows, i);
+            remove_i_from_array(src->windows, i, src->num_windows);
+            if (src->active_window > i) src->active_window--;
+            else if (src->active_window >= src->num_windows) src->active_window = src->num_windows ? src->num_windows - 1 : 0;
+            osw->needs_render = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void
 resize_screen(OSWindow *os_window, Screen *screen, bool has_graphics) {
     if (screen) {
@@ -893,7 +921,7 @@ make_window_context_current(id_type window_id) {
 
 void
 dispatch_pending_clicks(id_type timer_id UNUSED, void *data UNUSED) {
-    bool dispatched = false;
+    bool dispatched = false, any_dispatched = false;
     do { // dispatching a click can cause windows/tabs/etc to close so do it one at a time.
         const monotonic_t now = monotonic();
         dispatched = false;
@@ -912,7 +940,11 @@ dispatch_pending_clicks(id_type timer_id UNUSED, void *data UNUSED) {
                 }
             }
         }
+        any_dispatched |= dispatched;
     } while (dispatched);
+    // This runs from a timer, outside the main loop tick, so ensure any state
+    // changed by the click actions is processed and rendered
+    if (any_dispatched) request_tick_callback();
 }
 
 void
@@ -1292,15 +1324,21 @@ PYWRAP1(mark_os_window_for_close) {
 
 PYWRAP1(set_application_quit_request) {
     CloseRequest cr = IMPERATIVE_CLOSE_REQUESTED;
-    PA("|i", &cr);
+    int cause = -1;
+    PA("|ii", &cr, &cause);
     global_state.quit_request = cr;
-    if (cr == NO_CLOSE_REQUESTED) global_state.logout_quit.requested = false;
+    if (cr == NO_CLOSE_REQUESTED) {
+        global_state.logout_quit.requested = false;
+        global_state.quit_cause = QUIT_CAUSE_NONE;
+    } else if (cause >= QUIT_CAUSE_NONE && cause <= QUIT_CAUSE_FATAL_ERROR) global_state.quit_cause = cause;
     global_state.has_pending_closes = true;
     request_tick_callback();
     Py_RETURN_NONE;
 }
 
 PYWRAP0(current_application_quit_request) { return Py_BuildValue("i", global_state.quit_request); }
+
+PYWRAP0(current_application_quit_cause) { return Py_BuildValue("i", global_state.quit_cause); }
 
 PYWRAP0(application_logout_requested_at) {
     // The monotonic time at which the OS asked kitty to quit for a logout, restart or shutdown, or -1 if it has not done so since
@@ -1360,6 +1398,8 @@ PYWRAP1(mark_tab_bar_dirty) {
     WITH_OS_WINDOW(os_window_id)
     os_window->has_too_few_tabs = !should_be_shown;
     os_window->tab_bar_data_updated = false;
+    // This can be called outside the main loop tick, so ensure the tab bar is redrawn
+    request_tick_callback();
     END_WITH_OS_WINDOW
     Py_RETURN_NONE;
 }
@@ -1687,30 +1727,37 @@ PYWRAP1(patch_global_colors) {
     PyObject *spec;
     int configured;
     if (!PyArg_ParseTuple(args, "Op", &spec, &configured)) return NULL;
-#define P(name)                                                         \
-    {                                                                   \
-        PyObject *val = PyDict_GetItemString(spec, #name);              \
-        if (val) {                                                      \
-            if (val == Py_None) OPT(name) = 0;                          \
-            else if (PyLong_Check(val)) OPT(name) = PyLong_AsLong(val); \
-        }                                                               \
+#define P(name, convert)                                                 \
+    {                                                                    \
+        PyObject *val = PyDict_GetItemString(spec, #name);               \
+        if (val) {                                                       \
+            if (val == Py_None) OPT(name) = 0;                           \
+            else if (PyLong_Check(val)) {                                \
+                const __typeof__(convert(val)) converted = convert(val); \
+                if (PyErr_Occurred()) return NULL;                       \
+                OPT(name) = converted;                                   \
+            }                                                            \
+        }                                                                \
     }
-    P(active_border_color);
-    P(inactive_border_color);
-    P(bell_border_color);
-    P(tab_bar_background);
-    P(tab_bar_margin_color);
-    P(macos_titlebar_color);
-    P(wayland_titlebar_color);
-    P(scrollbar_handle_color);
-    P(scrollbar_track_color);
+    P(active_border_color, PyLong_AsLong);
+    P(inactive_border_color, PyLong_AsLong);
+    P(bell_border_color, PyLong_AsLong);
+    P(tab_bar_background, PyLong_AsLong);
+    P(tab_bar_margin_color, PyLong_AsLong);
+    // Signed because of the negative light/dark sentinels. An RGB payload with
+    // bit 31 set would overflow a 32-bit long, but macOS is 64-bit only.
+    P(macos_titlebar_color, PyLong_AsLong);
+    // The RGB payload of these options can set bit 31.
+    P(wayland_titlebar_color, PyLong_AsUnsignedLong);
+    P(scrollbar_handle_color, PyLong_AsUnsignedLong);
+    P(scrollbar_track_color, PyLong_AsUnsignedLong);
     if (configured) {
-        P(background);
+        P(background, PyLong_AsLong);
         const color_type prev_url_color = OPT(url_color);
-        P(url_color);
+        P(url_color, PyLong_AsLong);
         if (OPT(url_color) != prev_url_color) mark_all_color_profiles_dirty();
     }
-    if (PyErr_Occurred()) return NULL;
+#undef P
     Py_RETURN_NONE;
 }
 
@@ -1916,17 +1963,14 @@ move_cursor_to_mouse_if_in_prompt(id_type os_window_id, id_type tab_id, id_type 
     return moved;
 }
 
-static PyObject *
-pyupdate_pointer_shape(PyObject *self UNUSED, PyObject *args) {
-    id_type os_window_id;
-    PA("K", &os_window_id);
-    WITH_OS_WINDOW(os_window_id);
+void
+update_pointer_shape_for_kitty_window(id_type kitty_window_id) {
+    OSWindow *os_window = os_window_for_kitty_window(kitty_window_id);
+    if (!os_window || !os_window->is_focused) return;
     OSWindow *orig = global_state.callback_os_window;
     global_state.callback_os_window = os_window;
     update_mouse_pointer_shape();
     global_state.callback_os_window = orig;
-    END_WITH_OS_WINDOW;
-    Py_RETURN_NONE;
 }
 
 static PyObject *
@@ -2021,6 +2065,12 @@ THREE_ID_OBJ(update_window_title)
 THREE_ID(remove_window)
 THREE_ID(detach_window)
 THREE_ID(attach_window)
+PYWRAP1(move_window_to_tab) {
+    id_type os_window_id, src_tab_id, dest_tab_id, window_id;
+    PA("KKKK", &os_window_id, &src_tab_id, &dest_tab_id, &window_id);
+    if (move_window_to_tab(os_window_id, src_tab_id, dest_tab_id, window_id)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
 PYWRAP1(add_tab) { return PyLong_FromUnsignedLongLong(add_tab(PyLong_AsUnsignedLongLong(args))); }
 PYWRAP1(add_window) {
     PyObject *title;
@@ -2132,7 +2182,6 @@ static PyMethodDef module_methods[] = {
     M(get_tab_being_dragged, METH_NOARGS),
     M(set_window_being_dragged, METH_VARARGS),
     M(get_window_being_dragged, METH_NOARGS),
-    MW(update_pointer_shape, METH_VARARGS),
     MW(current_os_window, METH_NOARGS),
     MW(next_window_id, METH_NOARGS),
     MW(last_focused_os_window_id, METH_NOARGS),
@@ -2157,6 +2206,7 @@ static PyMethodDef module_methods[] = {
     MW(remove_window, METH_VARARGS),
     MW(detach_window, METH_VARARGS),
     MW(attach_window, METH_VARARGS),
+    MW(move_window_to_tab, METH_VARARGS),
     MW(set_active_tab, METH_VARARGS),
     MW(mark_os_window_dirty, METH_VARARGS),
     MW(set_redirect_keys_to_overlay, METH_VARARGS),
@@ -2176,6 +2226,7 @@ static PyMethodDef module_methods[] = {
     MW(mark_os_window_for_close, METH_VARARGS),
     MW(set_application_quit_request, METH_VARARGS),
     MW(current_application_quit_request, METH_NOARGS),
+    MW(current_application_quit_cause, METH_NOARGS),
     MW(application_logout_requested_at, METH_NOARGS),
     MW(set_os_window_chrome, METH_VARARGS),
     MW(focus_os_window, METH_VARARGS),
@@ -2270,6 +2321,12 @@ init_state(PyObject *module) {
     Py_INCREF((PyObject *)&RegionType);
     PyModule_AddObject(module, "Region", (PyObject *)&RegionType);
     PyModule_AddIntConstant(module, "IMPERATIVE_CLOSE_REQUESTED", IMPERATIVE_CLOSE_REQUESTED);
+    PyModule_AddIntConstant(module, "QUIT_CAUSE_NONE", QUIT_CAUSE_NONE);
+    PyModule_AddIntConstant(module, "QUIT_CAUSE_ACTION", QUIT_CAUSE_ACTION);
+    PyModule_AddIntConstant(module, "QUIT_CAUSE_OS_REQUEST", QUIT_CAUSE_OS_REQUEST);
+    PyModule_AddIntConstant(module, "QUIT_CAUSE_LOGOUT", QUIT_CAUSE_LOGOUT);
+    PyModule_AddIntConstant(module, "QUIT_CAUSE_SIGNAL", QUIT_CAUSE_SIGNAL);
+    PyModule_AddIntConstant(module, "QUIT_CAUSE_FATAL_ERROR", QUIT_CAUSE_FATAL_ERROR);
     PyModule_AddIntConstant(module, "NO_CLOSE_REQUESTED", NO_CLOSE_REQUESTED);
     PyModule_AddIntConstant(module, "CLOSE_BEING_CONFIRMED", CLOSE_BEING_CONFIRMED);
     PyModule_AddIntMacro(module, WINDOW_NORMAL);

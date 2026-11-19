@@ -513,6 +513,92 @@ class Rendering(FontBaseTest):
         _, rw, rh = without_matrix.render_codepoint(0x1F40D)
         self.assertGreater(mh, 0.5 * rh, f'color emoji shrunk by FC_MATRIX: {mh}px vs {rh}px (#10144)')
 
+    def test_concat_cells(self):
+        from kitty.fast_data_types import concat_cells
+
+        # sprite pixels are 0xRRGGBBAA and the result is opaque RGBA bytes
+        cell = array.array('I', (0xFF000080, 0xFFFFFF00, 0x00FF00FF)).tobytes()
+        self.ae(concat_cells(3, 1, True, (cell,)), bytes((0x80, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0xFF, 0, 0xFF)))
+        self.ae(concat_cells(1, 1, True, (cell[:4], cell[4:8])), bytes((0x80, 0, 0, 0xFF, 0, 0, 0, 0xFF)))
+        self.ae(concat_cells(2, 1, True, (cell[:8],), 0x0000FF), bytes((0x80, 0, 0x7F, 0xFF, 0, 0, 0xFF, 0xFF)))
+        # alpha mask pixels are white text and the result is RGBA bytes, as above
+        self.ae(concat_cells(2, 1, False, (bytes((0xFF, 0)),), 0x0000FF), bytes((0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0xFF, 0xFF)))
+        self.ae(concat_cells(1, 1, False, (bytes((0x80,)),), 0x102030), bytes((0x87, 0x8F, 0x97, 0xFF)))
+        self.ae(concat_cells(0, 1, True, (b'',)), b'')
+
+    def cell_alpha(self, font_name, text, ppem):
+        "The alpha of the pixels of the first cell of text, and the cell width and height"
+        with setup_for_testing(size=ppem, dpi=72.0, main_face_path=self.path_for_font(font_name)) as (sprites, cell_width, cell_height):
+            s = Screen(None, 1, 4)
+            s.draw(text)
+            line = s.line(0)
+            test_render_line(line)
+            pos = sprite_idx_to_pos(line.sprite_at(0) & 0x7FFFFFFF, setup_for_testing.xnum, setup_for_testing.ynum)
+            # the low byte of each pixel is its alpha, the color bits are set even for empty pixels on macOS
+            return bytes(p & 0xFF for p in array.array('I', sprites[pos])), cell_width, cell_height
+
+    def glyph_ink(self, font_name, char, ppem):
+        "The number of pixel rows and columns char occupies when drawn in a single cell, and the cell width"
+        alpha, cell_width, cell_height = self.cell_alpha(font_name, char, ppem)
+        rows = [y for y in range(cell_height) if any(alpha[y * cell_width : (y + 1) * cell_width])]
+        cols = [x for x in range(cell_width) if any(alpha[x::cell_width])]
+        height = rows[-1] - rows[0] + 1 if rows else 0
+        width = cols[-1] - cols[0] + 1 if cols else 0
+        return height, width, cell_width
+
+    def test_small_glyph_overhang_is_not_rescaled(self):
+        # Fonts have glyphs whose outlines overhang their advance a little, such
+        # as the texture healing alternates of Monaspace and 0xProto. These must
+        # be drawn at full size, not shrunk to fit the cell, and cropped to
+        # it, which they then fill. The expected height is the height of the
+        # glyph's bounding box in font units, times ppem / units per em,
+        # rounded down. Cropping removes ink, so it is only done for glyphs
+        # at most 2/10 wider than the cell.
+        for font_name, char, ppem, full_height in (
+            ('CascadiaCode-Regular.otf', 'ď', 40, 31),  # 1588 * 40 / 2048, outline is 7% wider than the cell
+            ('LiberationMono-Regular.ttf', 'Ƴ', 32, 21),  # 1370 * 32 / 2048, 10% wider
+            ('FiraCode-Medium.otf', 'œ', 64, 36),  # 1111 * 64 / 1950, 3% wider
+            # 935 * 120 / 1000, 15% wider, like the widest texture healing alternates of Monaspace
+            ('iosevka-regular.ttf', 'ꭦ', 120, 112),
+        ):
+            with self.subTest(font=font_name, char=char):
+                height, width, cell_width = self.glyph_ink(font_name, char, ppem)
+                self.assertGreaterEqual(height, full_height)
+                self.assertEqual(width, cell_width)
+
+    def test_large_glyph_overhang_is_rescaled(self):
+        # Ὦ has its breathing mark and accent to the left of the letter, outside
+        # its cell, so cropping would cut them off. Its outline is 1594 units
+        # wide and 1766 tall with an advance of 1229, so scaled to fit the cell
+        # it is at most 1766 * (1229 / 1594) * 32 / 2048 = 21.3 pixels tall,
+        # which, depending on where it falls relative to the pixel grid, covers
+        # at most 23 rows. Drawn at full size it covers at least 27.
+        height, width, cell_width = self.glyph_ink('LiberationMono-Regular.ttf', 'Ὦ', 32)
+        self.assertLessEqual(height, 23)
+        # The rescaled glyph is moved into the cell so that the marks are
+        # not cut off and it spans the whole cell.
+        self.assertGreaterEqual(width, cell_width - 1)
+
+    def test_marks_move_with_rescaled_glyph(self):
+        # When Ὦ is rescaled and moved into its cell, a combining dot below it
+        # must move with it, so that it stays centered under the letter
+        font = 'LiberationMono-Regular.ttf'
+        base, cell_width, cell_height = self.cell_alpha(font, 'Ὦ', 32)
+        combined = self.cell_alpha(font, 'Ὦ\u0323', 32)[0]
+
+        def ink_columns(alpha, rows):
+            return [x for x in range(cell_width) if any(alpha[y * cell_width + x] for y in rows)]
+
+        def center(cols):
+            return (cols[0] + cols[-1]) / 2
+
+        rows_with_ink = [y for y in range(cell_height) if any(base[y * cell_width : (y + 1) * cell_width])]
+        # the bottom row of Ω spans its width
+        letter = ink_columns(base, rows_with_ink[-1:])
+        dot = ink_columns(combined, range(rows_with_ink[-1] + 1, cell_height))
+        self.assertTrue(dot)
+        self.assertLessEqual(abs(center(dot) - center(letter)), cell_width / 8, f'dot: {dot} letter: {letter}')
+
     def test_shaping(self):
 
         def ss(text, font=None):
